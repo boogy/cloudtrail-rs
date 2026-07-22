@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-08
+last-dispatched: task-11
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -16,10 +16,10 @@ last-dispatched: task-08
 | 05 | Rule engine, linear | 03, 04 | done | ab784b7 | reuses REGEX_SIZE_LIMIT; within-rule matches sorted most-selective-first (AND order-independent). evaluate_linear is the permanent oracle for task-06 |
 | 06 | Rule index | 05 | pending | — | |
 | 07 | Settings | 02 | done | 0ebf734 | env-override via injected closure (no env mutation). `SETTINGS_URI` resolves `file://` only in core; s3/ssm deferred to task-16 (see SHARED note). `rules.uri` default is the example literal |
-| 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | dispatched | — | |
+| 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | done | 9b32336 | store.rs verified generic (no RuleSet/Engine refs). NOTE: persistent version() failure retries every get() (no backoff) — acceptable v1, fail-open serves cached rules. StaticConfigSource now in testing.rs |
 | 09 | Metrics and EMF | 02 | done | fecaeef | MetricSnapshot extended with 9 counters; increment API + EMF N+1-line-for-RuleDrops convention pinned in SHARED. testing.rs holds only RecordingSink (InMemoryStore/StaticConfigSource still owed by task-08/14) |
 | 10 | S3 and SNS decoders | 02 | done | 5397de1 | +percent-encoding dep. Part D `+`→space mutation spot-check PASSED (removed handling → test failed). shared S3 parse helper gated for both features so sns-only build carries no S3EventDecoder |
-| 11 | SQS and EventBridge decoders | 02, 07 | pending | — | |
+| 11 | SQS and EventBridge decoders | 02, 07 | dispatched | — | |
 | 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | pending | — | |
 | 13 | Stream processor | 12 | pending | — | |
 | 14 | Pipeline | 08, 11, 13 | pending | — | |
