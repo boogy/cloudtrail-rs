@@ -1,0 +1,8 @@
+[package]
+name = "lambda-s3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cloudtrail-rs-core = { path = "../core", features = ["decode-s3"] }
+cloudtrail-rs-aws = { path = "../aws" }
