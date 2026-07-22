@@ -3,5 +3,10 @@
 //! caching `ConfigStore`.
 
 pub mod rules;
+pub mod settings;
 
 pub use rules::{Match, Rule, RuleSet};
+pub use settings::{
+    Behavior, Destination, MetricsMode, Observability, OnConfigError, OnMissingObject,
+    OnUnrecognizedObject, Processing, ProcessingMode, Rules, Settings, Source, Sqs, SqsBodyFormat,
+};
