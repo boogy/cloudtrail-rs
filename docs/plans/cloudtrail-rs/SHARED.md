@@ -76,6 +76,15 @@ pub trait MetricsSink: Send + Sync { fn emit(&self, snapshot: &MetricSnapshot); 
 // core/src/error.rs — StoreError MUST carry a distinct NotFound variant (on_missing_object depends on it)
 pub enum StoreError { NotFound { bucket: String, key: String }, /* ... */ }
 
+// core/src/error.rs — CoreError is the pipeline/process error type used by the
+// buffer_run / stream_run / Pipeline::handle signatures below. Task 02 does NOT
+// define it (it has no consumers yet and its variants depend on gzip/json errors
+// that only arrive with the processors). **Task 12 defines it**, in the same
+// error.rs, and it MUST be able to carry a StoreError and a ConfigError without
+// losing the NotFound distinction — Task 14 dispatches on_missing_object off it:
+//   pub enum CoreError { Store(StoreError), Config(ConfigError), /* ... */ }
+// Tasks 13 and 14 consume it as-is and must not redefine or shadow it.
+
 // core/src/filter/
 pub fn resolve<'a>(v: &'a serde_json::Value, path: &str) -> Option<std::borrow::Cow<'a, str>>;
 pub enum Decision { Keep, Drop { rule_idx: usize } }
