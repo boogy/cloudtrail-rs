@@ -4,12 +4,12 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: none
+last-dispatched: task-01
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
-| 00 | Split this plan | none | done | (this commit) | |
-| 01 | Toolchain and workspace | 00 | pending | — | |
+| 00 | Split this plan | none | done | ffdac64 | |
+| 01 | Toolchain and workspace | 00 | dispatched | — | |
 | 02 | Errors, model, ports | 01 | pending | — | |
 | 03 | Rules: parse and validate | 02 | pending | — | |
 | 04 | Field path resolution | 02 | pending | — | |
