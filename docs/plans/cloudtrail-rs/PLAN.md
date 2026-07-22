@@ -133,7 +133,7 @@ Note 15 (AWS adapters) depends only on the ports from 02 — it is pure adapter 
 
 ## Global constraints
 
-- **Rust, latest stable, edition 2024.** `rust-toolchain.toml` pins `channel = "stable"`; setup runs `rustup update stable` (currently 1.97.0).
+- **Rust, latest stable, edition 2024.** `rust-toolchain.toml` pins `channel = "stable"`; setup runs `rustup update stable` (currently 1.97.1).
 - **Lambda target:** `aarch64-unknown-linux-musl`, runtime `provided.al2023`, built with `cargo lambda` (needs `cargo install cargo-lambda`).
 - **Four fully independent entrypoints.** Each binary compiles in exactly one decoder via a Cargo feature (`decode-s3` | `decode-sqs` | `decode-sns` | `decode-eventbridge`, all `default = []`). No runtime source sniffing, no decoder registry, no dead decoders in the artifact.
 - **Filter semantics:** exclusion only. Within one rule **ALL** `matches[]` must match (AND). Across rules **ANY** match drops the record (OR).

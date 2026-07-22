@@ -1,5 +1,5 @@
 [package]
-name = "lambda-s3"
+name = "cloudtrail-rs-lambda-s3"
 version = "0.1.0"
 edition = "2024"
 

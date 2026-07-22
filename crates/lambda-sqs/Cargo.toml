@@ -1,5 +1,5 @@
 [package]
-name = "lambda-sqs"
+name = "cloudtrail-rs-lambda-sqs"
 version = "0.1.0"
 edition = "2024"
 
