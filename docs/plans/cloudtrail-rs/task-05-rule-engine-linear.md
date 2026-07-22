@@ -8,7 +8,7 @@
 
 ## Brief
 
-**Consumes:** `RuleSet`, `resolve`. **Produces:** `Decision`, `Engine::new(RuleSet) -> Result<Engine, ConfigError>` (compiles all regexes with `RegexBuilder::size_limit`, no index yet), `Engine::rule_name(idx)`, `Engine::evaluate_linear`.
+**Consumes:** `RuleSet`, `resolve`. **Produces:** `Decision`, `Engine::new(RuleSet) -> Result<Engine, ConfigError>` (compiles all regexes with `RegexBuilder::size_limit(crate::config::rules::REGEX_SIZE_LIMIT)` — reuse that existing `pub(crate)` constant from Task 03, do not define your own value; no index yet), `Engine::rule_name(idx)`, `Engine::evaluate_linear`.
 AND across `matches`, OR across `rules`, short-circuit on first failing condition, returns the first matching rule index. Conditions ordered most-selective-first (exact literals before `.*`-prefixed patterns).
 **Tests from real records:** EKS KMS `Decrypt` drops via "EKS KMS Operations"; the same record with a different `sourceIPAddress` is KEPT; a `ConsoleLogin` record survives all 25 rules; a record missing `userIdentity.invokedBy` is KEPT by "AWS Config Recorder".
 

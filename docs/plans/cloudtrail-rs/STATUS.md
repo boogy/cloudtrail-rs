@@ -4,18 +4,18 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: none (batch aborted on session usage limit 2026-07-22 ~22:30 UTC)
+last-dispatched: task-07
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
 | 00 | Split this plan | none | done | ffdac64 | |
 | 01 | Toolchain and workspace | 00 | done | 37d5349 | rustc 1.97.1; lambda pkgs renamed to cloudtrail-rs-lambda-* by orchestrator |
 | 02 | Errors, model, ports | 01 | done | f708c67 | `CoreError` deferred to task-12 by design; recorded in SHARED.md. `MetricSnapshot` carries only the fields SHARED names; task-09 extends it |
-| 03 | Rules: parse and validate | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
+| 03 | Rules: parse and validate | 02 | done | 96006f9 | canonical ruleset is **25** rules not 24 (plan error, corrected in 5c02999). `REGEX_SIZE_LIMIT` is `pub(crate)` in config/rules.rs; task-05 must reuse it |
 | 04 | Field path resolution | 02 | done | a5ad6e7 | |
 | 05 | Rule engine, linear | 03, 04 | pending | — | |
 | 06 | Rule index | 05 | pending | — | |
-| 07 | Settings | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch (its worktree held only uncommitted Cargo.toml dep lines, no source; discarded in cleanup) |
+| 07 | Settings | 02 | dispatched | — | |
 | 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | pending | — | |
 | 09 | Metrics and EMF | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
 | 10 | S3 and SNS decoders | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |

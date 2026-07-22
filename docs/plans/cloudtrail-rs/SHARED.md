@@ -90,6 +90,10 @@ pub fn resolve<'a>(v: &'a serde_json::Value, path: &str) -> Option<std::borrow::
 pub enum Decision { Keep, Drop { rule_idx: usize } }
 impl Engine {
     // ALL compilation happens here: regexes + rule index. Called once, at config load.
+    // MUST compile with RegexBuilder::size_limit(crate::config::rules::REGEX_SIZE_LIMIT)
+    // — the same 1 MiB constant RuleSet::parse validates against. A different limit here
+    // lets a ruleset pass validation and then fail to build, which at runtime degrades to
+    // on_config_error instead of being caught at load. Do not redefine the value locally.
     pub fn new(rules: RuleSet) -> Result<Engine, ConfigError>;
     pub fn rule_name(&self, idx: usize) -> &str;                           // for RuleDrops dimension
     pub fn evaluate(&self, record: &serde_json::Value) -> Decision;        // indexed
