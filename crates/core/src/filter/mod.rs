@@ -2,6 +2,7 @@
 //! evaluation engine.
 
 pub mod engine;
+mod index;
 pub mod path;
 
 pub use engine::{Decision, Engine};
