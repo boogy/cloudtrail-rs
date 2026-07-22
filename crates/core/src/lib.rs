@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+#[cfg(any(feature = "decode-s3", feature = "decode-sns"))]
+pub mod decode;
 pub mod error;
 pub mod filter;
 pub mod metrics;

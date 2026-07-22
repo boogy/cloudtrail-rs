@@ -1,0 +1,22 @@
+{
+  "Records": [
+    {
+      "EventSource": "aws:sns",
+      "EventVersion": "1.0",
+      "EventSubscriptionArn": "arn:aws:sns:us-east-2:123456789012:sns-lambda:21be56ed-a058-49f5-8c98-aedd2564c486",
+      "Sns": {
+        "Type": "Notification",
+        "MessageId": "6f2b2c3b-9c1a-4b8e-9c2a-1e6a2c9b7f31",
+        "TopicArn": "arn:aws:sns:us-east-2:123456789012:sns-lambda",
+        "Subject": "Amazon S3 Notification",
+        "Message": "{\"Service\":\"Amazon S3\",\"Event\":\"s3:TestEvent\",\"Time\":\"2014-10-13T15:57:02.089Z\",\"Bucket\":\"bucketname\",\"RequestId\":\"5582815E1AEA5ADF\",\"HostId\":\"8cLeGAmw098X5cv4Zkwcmw1TItRi/tW5w6nlD+U5mv/S9s7Y+RGoIWMBrCJTLd0MO/ihJqNIJgU=\"}",
+        "Timestamp": "2014-10-13T15:57:02.202Z",
+        "SignatureVersion": "1",
+        "Signature": "tE4RTsMWXQC4mmnjbLgd0Wexample==",
+        "SigningCertUrl": "https://sns.us-east-2.amazonaws.com/SimpleNotificationService-example.pem",
+        "UnsubscribeUrl": "https://sns.us-east-2.amazonaws.com/?Action=Unsubscribe&SubscriptionArn=arn:aws:sns:us-east-2:123456789012:sns-lambda:21be56ed-a058-49f5-8c98-aedd2564c486",
+        "MessageAttributes": {}
+      }
+    }
+  ]
+}
