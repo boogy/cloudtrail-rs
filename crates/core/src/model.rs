@@ -38,6 +38,15 @@ pub enum VersionTag {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MetricSnapshot {
     pub cold_start: bool,
+    pub objects_processed: u64,
+    pub objects_skipped: u64,
+    pub unrecognized_objects: u64,
+    pub records_in: u64,
+    pub records_kept: u64,
+    pub records_dropped: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
     pub config_load_errors: u64,
+    pub parse_errors: u64,
     pub rule_drops: Vec<(String, u64)>,
 }
