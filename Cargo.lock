@@ -22,7 +22,7 @@ name = "cloudtrail-rs-core"
 version = "0.1.0"
 
 [[package]]
-name = "lambda-eventbridge"
+name = "cloudtrail-rs-lambda-eventbridge"
 version = "0.1.0"
 dependencies = [
  "cloudtrail-rs-aws",
@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lambda-s3"
+name = "cloudtrail-rs-lambda-s3"
 version = "0.1.0"
 dependencies = [
  "cloudtrail-rs-aws",
@@ -38,7 +38,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lambda-sns"
+name = "cloudtrail-rs-lambda-sns"
 version = "0.1.0"
 dependencies = [
  "cloudtrail-rs-aws",
@@ -46,7 +46,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lambda-sqs"
+name = "cloudtrail-rs-lambda-sqs"
 version = "0.1.0"
 dependencies = [
  "cloudtrail-rs-aws",
