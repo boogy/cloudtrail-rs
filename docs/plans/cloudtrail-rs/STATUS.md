@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-07
+last-dispatched: task-09
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -15,9 +15,9 @@ last-dispatched: task-07
 | 04 | Field path resolution | 02 | done | a5ad6e7 | |
 | 05 | Rule engine, linear | 03, 04 | pending | — | |
 | 06 | Rule index | 05 | pending | — | |
-| 07 | Settings | 02 | dispatched | — | |
+| 07 | Settings | 02 | done | 0ebf734 | env-override via injected closure (no env mutation). `SETTINGS_URI` resolves `file://` only in core; s3/ssm deferred to task-16 (see SHARED note). `rules.uri` default is the example literal |
 | 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | pending | — | |
-| 09 | Metrics and EMF | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
+| 09 | Metrics and EMF | 02 | dispatched | — | |
 | 10 | S3 and SNS decoders | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
 | 11 | SQS and EventBridge decoders | 02, 07 | pending | — | |
 | 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | pending | — | |

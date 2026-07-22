@@ -185,6 +185,16 @@ observability:
 
 Env overrides (env always wins): `CT_DEST_BUCKET`, `CT_KEY_PREFIX`, `CT_SOURCE_INCLUDE_KEY_REGEX`, `CT_SOURCE_EXCLUDE_KEY_REGEX`, `CT_PROCESSING_MODE`, `CT_STREAM_THRESHOLD_BYTES`, `CT_MAX_OBJECT_BYTES`, `CT_MULTIPART_PART_BYTES`, `CT_GZIP_LEVEL`, `CT_DRY_RUN`, `CT_ON_CONFIG_ERROR`, `CT_ON_MISSING_OBJECT`, `CT_ON_UNRECOGNIZED_OBJECT`, `CT_PARTIAL_BATCH_FAILURES`, `CT_SQS_BODY_FORMAT`, `CT_RULES_URI`, `CT_RULES_TTL_SECONDS`, `CT_METRICS`, `CT_METRICS_NAMESPACE`, `CT_LOG_LEVEL`. Bootstrap: `SETTINGS_URI` (optional — an env-only deployment is valid).
 
+> **`SETTINGS_URI` scheme resolution (Task 07 → Task 16 contract).** `Settings::load()`
+> lives in `core`, which has no `aws-sdk-*` dependency, so it resolves **`file://` only**;
+> an `s3://`/`ssm://` `SETTINGS_URI` returns `Err(ConfigError::Source(_))`. The composition
+> root (Task 16 bins / Task 17 CLI, which do link `aws`) is responsible for the AWS schemes:
+> fetch the settings bytes itself and hand them to a bytes-accepting entry point. Task 07
+> exposes the parse/override/validate logic as a private `Settings::from_parts(Option<&[u8]>,
+> &dyn Fn(&str)->Option<String>)`; **Task 16 must request it be made `pub` (or a thin public
+> wrapper added)** rather than duplicating the env-merge. The `Settings::load()` signature in
+> the `main()` skeleton is unchanged for the `file://`/env-only path.
+
 ## Rules schema
 
 Exactly the user's example: `version` (semver), `meta`, `rules[].name`, `rules[].matches[].{field_name, regex}`.
