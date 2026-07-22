@@ -15,7 +15,13 @@ use crate::error::ConfigError;
 /// Upper bound on a single compiled regex's internal size, well below the
 /// `regex` crate's own default (10 MiB): a pathological pattern is rejected
 /// at config load, not left to blow up memory on the first match.
-const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+/// Compiled-size ceiling for a single rule pattern, 1 MiB.
+///
+/// `RuleSet::parse` uses this to reject a pattern that cannot be compiled within
+/// budget. `Engine::new` performs the *real* compile later and MUST use this same
+/// constant — a smaller limit there would let a ruleset pass validation and then
+/// fail to build, which at runtime means falling back to `on_config_error`.
+pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// One exclusion rule: fires (drops the record) only if *all* of its
 /// `matches` match (AND). Across rules, `Engine` ORs the result.
