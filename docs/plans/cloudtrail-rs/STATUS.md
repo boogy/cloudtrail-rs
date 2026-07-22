@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-10
+last-dispatched: task-15
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -18,12 +18,12 @@ last-dispatched: task-10
 | 07 | Settings | 02 | done | 0ebf734 | env-override via injected closure (no env mutation). `SETTINGS_URI` resolves `file://` only in core; s3/ssm deferred to task-16 (see SHARED note). `rules.uri` default is the example literal |
 | 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | pending | — | |
 | 09 | Metrics and EMF | 02 | done | fecaeef | MetricSnapshot extended with 9 counters; increment API + EMF N+1-line-for-RuleDrops convention pinned in SHARED. testing.rs holds only RecordingSink (InMemoryStore/StaticConfigSource still owed by task-08/14) |
-| 10 | S3 and SNS decoders | 02 | dispatched | — | |
+| 10 | S3 and SNS decoders | 02 | done | 5397de1 | +percent-encoding dep. Part D `+`→space mutation spot-check PASSED (removed handling → test failed). shared S3 parse helper gated for both features so sns-only build carries no S3EventDecoder |
 | 11 | SQS and EventBridge decoders | 02, 07 | pending | — | |
 | 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | pending | — | |
 | 13 | Stream processor | 12 | pending | — | |
 | 14 | Pipeline | 08, 11, 13 | pending | — | |
-| 15 | AWS adapters | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
+| 15 | AWS adapters | 02 | dispatched | — | |
 | 16 | Four Lambda binaries | 14, 15 | pending | — | |
 | 17 | CLI | 14, 15 | pending | — | |
 | 18 | MiniStack integration tests | 16 | pending | — | |
