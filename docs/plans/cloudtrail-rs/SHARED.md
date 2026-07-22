@@ -107,9 +107,26 @@ impl Engine {
 impl Default for Metrics { /* all counters zero, cold_start flag unset */ }
 impl Metrics {
     pub fn snapshot_and_reset(&self) -> MetricSnapshot;
+    // Increment API (Task 09; consumed verbatim by Tasks 12/13/14 — do NOT invent new names).
+    // Each add_* takes a count; record_rule_drop adds 1 for the named rule per call.
+    pub fn add_objects_processed(&self, n: u64);
+    pub fn add_objects_skipped(&self, n: u64);
+    pub fn add_unrecognized_objects(&self, n: u64);
+    pub fn add_records_in(&self, n: u64);
+    pub fn add_records_kept(&self, n: u64);
+    pub fn add_records_dropped(&self, n: u64);
+    pub fn add_bytes_in(&self, n: u64);
+    pub fn add_bytes_out(&self, n: u64);
+    pub fn add_config_load_errors(&self, n: u64);
+    pub fn add_parse_errors(&self, n: u64);
+    pub fn record_rule_drop(&self, rule_name: &str);
 }
 // EmfMetricsSink takes plain values, NOT &Settings — Task 09 runs in parallel with Task 07 and
 // must not depend on it. The binary maps settings.observability onto these arguments.
+// EMF line count: ONE aggregate line per invocation (all counters except RuleDrops) PLUS one
+// extra line per distinct rule that dropped records — a flat EMF document holds only one value
+// per `Rule` dimension, so 2+ dropping rules cannot share a line without losing per-rule data.
+// With 0–1 dropping rules (the common case) this is the single line the plan describes.
 impl EmfMetricsSink { pub fn new(namespace: String) -> Self; }
 pub struct NoopMetricsSink;   // used when observability.metrics == none
 
