@@ -15,7 +15,7 @@ last-dispatched: none (batch aborted on session usage limit 2026-07-22 ~22:30 UT
 | 04 | Field path resolution | 02 | done | a5ad6e7 | |
 | 05 | Rule engine, linear | 03, 04 | pending | — | |
 | 06 | Rule index | 05 | pending | — | |
-| 07 | Settings | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch. Stale worktree agent-ac2b29adff428d1ff holds only uncommitted Cargo.toml dep lines (serde, serde_yaml_ng, tokio fs) - no source; safe to ignore or discard |
+| 07 | Settings | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch (its worktree held only uncommitted Cargo.toml dep lines, no source; discarded in cleanup) |
 | 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | pending | — | |
 | 09 | Metrics and EMF | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
 | 10 | S3 and SNS decoders | 02 | pending | — | aborted by session usage limit before producing code; re-dispatch |
@@ -40,9 +40,17 @@ tasks 00-02 entirely. Every worktree brief must therefore start with: run
 `git log --oneline -1`, and if it is not at the expected base, `git merge --ff-only <sha>`
 to sync. That fast-forward is authorized and is NOT one of the forbidden undo commands.
 
-**Stale worktrees.** `git worktree list` may show leftovers from the aborted batch.
-They are all at or behind `main` with no commits ahead. Do not `git worktree remove`
-anything holding uncommitted work without reading the diff first.
+**Stale worktrees: cleaned up 2026-07-23.** All six leftovers from the aborted batch
+were removed along with their `worktree-agent-*` branches; each was verified to be at or
+behind `main` with zero commits ahead first. `main` is now the only tree. If you ever
+remove a worktree again, read the diff before forcing — do not discard uncommitted work
+sight-unseen.
+
+**Dispatch mode: sequential, in the main tree.** The parallel-worktree experiment cost
+more than it bought (base-commit hazard above, plus six concurrent cold-start compiles
+that exhausted the session budget). Dispatch one task at a time into `/Users/bogdan/github.com/cloudtrail-rs`
+on `main`, verify, update this file, then dispatch the next. Tell each agent to stage
+only its own paths (`git add <explicit paths>`, never `git add -A`).
 
 
 Parallelisable batches: **{02}** → **{03, 04, 07, 09, 10, 15}** → **{05, 08, 11}**
