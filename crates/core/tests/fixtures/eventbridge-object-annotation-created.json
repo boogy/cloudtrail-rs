@@ -1,0 +1,34 @@
+{
+  "version": "0",
+  "id": "8c2bfa57-4a67-b2ea-c4e0-6d420ea3b3a6",
+  "detail-type": "Object Annotation Created",
+  "source": "aws.s3",
+  "account": "111122223333",
+  "time": "2025-03-15T00:00:00Z",
+  "region": "us-east-1",
+  "resources": [
+    "arn:aws:s3:::amzn-s3-demo-bucket1"
+  ],
+  "detail": {
+    "version": "0",
+    "event-version": "1.1",
+    "bucket": {
+      "name": "amzn-s3-demo-bucket1"
+    },
+    "object": {
+      "key": "example-key",
+      "etag": "b1946ac92492d2347c6235b4d2611184",
+      "version-id": "IYV3p45BT0ac8hjHg1houSdS1a.Mro8e",
+      "sequencer": "617f08299329d189"
+    },
+    "request-id": "4B4NGD358NMKJ12R",
+    "requester": "123456789012",
+    "source-ip-address": "1.2.3.4",
+    "reason": "PutObjectAnnotation",
+    "object-annotation": {
+      "name": "my-annotation",
+      "size": 24,
+      "etag": "05df351ea190dffc26f55c74425b9d7a"
+    }
+  }
+}
