@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/aws",
+    "crates/lambda-s3",
+    "crates/lambda-sqs",
+    "crates/lambda-sns",
+    "crates/lambda-eventbridge",
+    "crates/cli",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
