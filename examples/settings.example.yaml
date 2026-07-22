@@ -1,0 +1,28 @@
+version: 1                        # integer, must equal 1 (NOT semver — the rules file uses semver, this does not)
+source:
+  include_key_regex: "\\.json\\.gz$"
+  exclude_key_regex: "(/CloudTrail-Digest/|/CloudTrail-Insight/|/$)"
+destination:
+  bucket: ct-siem-sync            # required (or CT_DEST_BUCKET)
+  key_prefix: ""                  # "" => key identical to source
+processing:
+  mode: auto                      # auto | buffer | stream
+  stream_threshold_bytes: 8388608
+  max_object_bytes: 134217728     # BUFFER MODE ONLY — decompressed guard
+  multipart_part_bytes: 8388608   # stream mode
+  gzip_level: 6
+behavior:
+  dry_run: false                  # evaluate + count, forward everything
+  on_config_error: open           # open | closed   (DEFAULT: open)
+  on_missing_object: error        # error | skip
+  on_unrecognized_object: copy    # copy | skip | error
+  partial_batch_failures: true    # SQS only
+sqs:
+  body_format: auto               # auto | s3 | sns — set explicitly to skip the sniff
+rules:
+  uri: s3://sec-config/cloudtrail/rules.yaml
+  ttl_seconds: 300
+observability:
+  metrics: emf                    # emf | none
+  namespace: cloudtrail-rs
+  log_level: info
