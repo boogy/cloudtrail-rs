@@ -328,8 +328,8 @@ Enforced in `Pipeline`, each with a dedicated test:
 
 1. **Zero re-serialization.** Buffer mode parses into `{"Records": Vec<&RawValue>}`; survivors are written as their **original byte slices** joined with `,`. No `Value` is ever re-serialized.
 2. **Parse lazily.** Each record is first read into a borrowed `RecordPeek` (`eventSource` only — serde_json skips other fields without building a tree). A full `Value` parse happens only if the rule index yields candidates.
-   **Honest limit:** this only pays when the `always` bucket is **empty**. The example ruleset puts ~3 of 24 rules in `always`, so every record gets fully parsed anyway and (2) currently buys nothing there. It is kept because it costs almost nothing and becomes a large win for a ruleset where every rule anchors `eventSource`. Do not claim it as a headline optimization, and have `cloudtrail-rs validate` **warn** for each rule that lands in `always`, naming it — that warning is the user's lever to actually get the speedup.
-3. **Rule index.** Extract literal alternations from each rule's `eventSource` pattern (`^kms\.amazonaws\.com$` → one literal; `^(cloudwatch|logs|ec2)\.amazonaws\.com$` → three) into `HashMap<String, Vec<usize>>` plus an `always` bucket. Candidates = `index[eventSource] ∪ always`. **Extraction must be conservative** — inline flags like `(?i)`, character classes, quantifiers, nested groups, non-anchored patterns, or no `eventSource` condition all fall into `always`. Over-inclusion is safe; over-exclusion is a silent correctness bug. In the example ruleset ~3 of 24 rules land in `always`.
+   **Honest limit:** this only pays when the `always` bucket is **empty**. The example ruleset puts ~3 of 25 rules in `always`, so every record gets fully parsed anyway and (2) currently buys nothing there. It is kept because it costs almost nothing and becomes a large win for a ruleset where every rule anchors `eventSource`. Do not claim it as a headline optimization, and have `cloudtrail-rs validate` **warn** for each rule that lands in `always`, naming it — that warning is the user's lever to actually get the speedup.
+3. **Rule index.** Extract literal alternations from each rule's `eventSource` pattern (`^kms\.amazonaws\.com$` → one literal; `^(cloudwatch|logs|ec2)\.amazonaws\.com$` → three) into `HashMap<String, Vec<usize>>` plus an `always` bucket. Candidates = `index[eventSource] ∪ always`. **Extraction must be conservative** — inline flags like `(?i)`, character classes, quantifiers, nested groups, non-anchored patterns, or no `eventSource` condition all fall into `always`. Over-inclusion is safe; over-exclusion is a silent correctness bug. In the example ruleset ~3 of 25 rules land in `always`.
 4. Conditions inside a rule short-circuit on first failure, most-selective-first (exact literals before `.*`-prefixed patterns).
 5. Use `MultiGzDecoder`, never `GzDecoder` — concatenated gzip members are otherwise silently truncated.
 
@@ -449,8 +449,8 @@ Each brief lists **Consumes** (what already exists) and **Produces** (what later
 
 - [ ] **Task 03 — Rules: parse and validate** · deps: 02 · ∥ with 04, 07, 09
       **Consumes:** `ConfigError`. **Produces:** `RuleSet`, `Rule`, `Match`, `RuleSet::parse(&[u8]) -> Result<RuleSet, ConfigError>`. **This task does not compile regexes** — that is `Engine::new` in Task 05/06. It parses and structurally validates only; regex *compilability* is checked here by a throwaway compile in the validator, but no compiled artifact is produced or stored.
-      Commit the user's 24-rule example verbatim to **both** `crates/core/tests/fixtures/rules.example.yaml` **and** `examples/rules.example.yaml` — Task 17's CLI tests reference the `examples/` path and run before the docs task. `deny_unknown_fields` on `RuleSet`/`Rule`/`Match`; `meta` free-form.
-      **Tests:** parses to 24 rules with expected `matches` counts; **`created_at: 2024-01-01` does not break parsing**; rejects `field_names:` typo, `regexp:` typo, `version: 2.0.0`, uncompilable regex, oversized regex (`size_limit`), duplicate `name`, empty `matches`, empty `name`; accepts `rules: []`.
+      Commit the user's 25-rule example verbatim to **both** `crates/core/tests/fixtures/rules.example.yaml` **and** `examples/rules.example.yaml` — Task 17's CLI tests reference the `examples/` path and run before the docs task. `deny_unknown_fields` on `RuleSet`/`Rule`/`Match`; `meta` free-form.
+      **Tests:** parses to 25 rules with expected `matches` counts; **`created_at: 2024-01-01` does not break parsing**; rejects `field_names:` typo, `regexp:` typo, `version: 2.0.0`, uncompilable regex, oversized regex (`size_limit`), duplicate `name`, empty `matches`, empty `name`; accepts `rules: []`.
 
 - [ ] **Task 04 — Field path resolution** · deps: 02 · ∥ with 03, 07, 09
       **Produces:** `pub fn resolve<'a>(v: &'a Value, path: &str) -> Option<Cow<'a, str>>`.
@@ -459,7 +459,7 @@ Each brief lists **Consumes** (what already exists) and **Produces** (what later
 - [ ] **Task 05 — Rule engine, linear** · deps: 03, 04
       **Consumes:** `RuleSet`, `resolve`. **Produces:** `Decision`, `Engine::new(RuleSet) -> Result<Engine, ConfigError>` (compiles all regexes with `RegexBuilder::size_limit`, no index yet), `Engine::rule_name(idx)`, `Engine::evaluate_linear`.
       AND across `matches`, OR across `rules`, short-circuit on first failing condition, returns the first matching rule index. Conditions ordered most-selective-first (exact literals before `.*`-prefixed patterns).
-      **Tests from real records:** EKS KMS `Decrypt` drops via "EKS KMS Operations"; the same record with a different `sourceIPAddress` is KEPT; a `ConsoleLogin` record survives all 24 rules; a record missing `userIdentity.invokedBy` is KEPT by "AWS Config Recorder".
+      **Tests from real records:** EKS KMS `Decrypt` drops via "EKS KMS Operations"; the same record with a different `sourceIPAddress` is KEPT; a `ConsoleLogin` record survives all 25 rules; a record missing `userIdentity.invokedBy` is KEPT by "AWS Config Recorder".
 
 - [ ] **Task 06 — Rule index** · deps: 05
       **Consumes:** `Engine::new`, `Engine::evaluate_linear`. **Produces:** `RuleIndex` built inside `Engine::new` (so it is paid at config load, never per invocation), `Engine::evaluate` (indexed) with semantics identical to `evaluate_linear`, and `Engine::always_rules() -> &[usize]` for the CLI warning in Task 17.
@@ -576,7 +576,7 @@ cargo run -p cloudtrail-rs -- validate file://$PWD/examples/rules.example.yaml
 cargo run -p cloudtrail-rs -- test examples/rules.example.yaml crates/core/tests/fixtures/sample.json.gz
 ```
 
-Expect `ok: 24 rules, N patterns compiled`, non-zero exit on a deliberately broken copy, and a KEEP/DROP breakdown with rule names.
+Expect `ok: 25 rules, N patterns compiled`, non-zero exit on a deliberately broken copy, and a KEEP/DROP breakdown with rule names.
 
 **End-to-end against real AWS APIs:**
 

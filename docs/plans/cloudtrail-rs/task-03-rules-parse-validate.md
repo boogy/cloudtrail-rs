@@ -9,8 +9,8 @@
 ## Brief
 
 **Consumes:** `ConfigError`. **Produces:** `RuleSet`, `Rule`, `Match`, `RuleSet::parse(&[u8]) -> Result<RuleSet, ConfigError>`. **This task does not compile regexes** — that is `Engine::new` in Task 05/06. It parses and structurally validates only; regex *compilability* is checked here by a throwaway compile in the validator, but no compiled artifact is produced or stored.
-Commit the user's 24-rule example verbatim to **both** `crates/core/tests/fixtures/rules.example.yaml` **and** `examples/rules.example.yaml` — Task 17's CLI tests reference the `examples/` path and run before the docs task. `deny_unknown_fields` on `RuleSet`/`Rule`/`Match`; `meta` free-form.
-**Tests:** parses to 24 rules with expected `matches` counts; **`created_at: 2024-01-01` does not break parsing**; rejects `field_names:` typo, `regexp:` typo, `version: 2.0.0`, uncompilable regex, oversized regex (`size_limit`), duplicate `name`, empty `matches`, empty `name`; accepts `rules: []`.
+Commit the user's 25-rule example verbatim to **both** `crates/core/tests/fixtures/rules.example.yaml` **and** `examples/rules.example.yaml` — Task 17's CLI tests reference the `examples/` path and run before the docs task. `deny_unknown_fields` on `RuleSet`/`Rule`/`Match`; `meta` free-form.
+**Tests:** parses to 25 rules with expected `matches` counts; **`created_at: 2024-01-01` does not break parsing**; rejects `field_names:` typo, `regexp:` typo, `version: 2.0.0`, uncompilable regex, oversized regex (`size_limit`), duplicate `name`, empty `matches`, empty `name`; accepts `rules: []`.
 
 ---
 
