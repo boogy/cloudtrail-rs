@@ -52,4 +52,25 @@ pub enum CoreError {
          keep reading rather than risk OOM on an oversized or bomb-like object"
     )]
     ObjectTooLarge { limit: u64 },
+    /// Failure decoding the raw Lambda event payload itself (`Pipeline::handle`'s
+    /// first step) — distinct from a per-object data error, since it means no
+    /// `SourceItem`s could be extracted at all.
+    #[error("failed to decode event payload: {0}")]
+    Decode(#[from] DecodeError),
+    /// Safety invariant (`SHARED.md` #1): the computed destination
+    /// `(bucket, key)` equals the source `(bucket, key)`. Refusing to write
+    /// here is what stops an infinite self-triggering loop that would
+    /// otherwise bill until someone notices.
+    #[error(
+        "destination ({dest_bucket}/{dest_key}) equals source: refusing to process to avoid an infinite self-triggering loop"
+    )]
+    SelfTrigger {
+        dest_bucket: String,
+        dest_key: String,
+    },
+    /// `behavior.on_unrecognized_object == error`: the object parsed as JSON
+    /// but had no `Records` array, and the configured policy is to fail
+    /// rather than copy or skip it.
+    #[error("unrecognized object shape ({bucket}/{key}): on_unrecognized_object is 'error'")]
+    UnrecognizedObject { bucket: String, key: String },
 }

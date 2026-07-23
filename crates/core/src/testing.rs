@@ -164,6 +164,7 @@ impl MetricsSink for RecordingSink {
 pub struct InMemoryStore {
     objects: Mutex<HashMap<(String, String), Bytes>>,
     put_stream_progress: AtomicU64,
+    read_calls: AtomicUsize,
 }
 
 impl InMemoryStore {
@@ -200,11 +201,19 @@ impl InMemoryStore {
     pub fn put_stream_progress(&self) -> u64 {
         self.put_stream_progress.load(Ordering::SeqCst)
     }
+
+    /// Number of `get()` calls made so far — including the internal `get()`
+    /// that `get_stream()`'s default-ish implementation delegates to here,
+    /// so e.g. "one `get_stream()` plus one re-fetch `get()`" reads as 2.
+    pub fn read_calls(&self) -> usize {
+        self.read_calls.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl ObjectStore for InMemoryStore {
     async fn get(&self, b: &str, k: &str) -> Result<Bytes, StoreError> {
+        self.read_calls.fetch_add(1, Ordering::SeqCst);
         self.object(b, k).ok_or_else(|| StoreError::NotFound {
             bucket: b.to_string(),
             key: k.to_string(),
