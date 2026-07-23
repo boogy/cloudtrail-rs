@@ -1,7 +1,7 @@
 //! SSM Parameter Store-backed `ConfigSource`. Unlike S3, SSM has no cheap
 //! metadata-only check: both `version` and `fetch` issue a full
 //! `GetParameter` call, but `version` alone is enough to skip the parse/
-//! recompile when `Version` is unchanged (see `SHARED.md`'s caching design).
+//! recompile when `Version` is unchanged (the caching design).
 
 use async_trait::async_trait;
 use aws_config::SdkConfig;

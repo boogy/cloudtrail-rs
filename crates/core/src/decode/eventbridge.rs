@@ -7,7 +7,7 @@
 //! this pipeline acts on.
 //!
 //! Unlike S3 bucket notifications, EventBridge object keys are **not**
-//! form-urlencoded (SHARED safety invariant 4) — `decode_form_urlencoded_key`
+//! form-urlencoded (safety invariant 4) — `decode_form_urlencoded_key`
 //! from `s3.rs` must never be applied here, or a key containing `+` or `%`
 //! is corrupted.
 

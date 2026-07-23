@@ -1,5 +1,5 @@
 //! Parsing and structural validation for the exclusion rules YAML document
-//! (fetched from `rules.uri`, see `SHARED.md`).
+//! (fetched from `rules.uri`).
 //!
 //! This module parses and validates *shape* only. Regex *compilability* is
 //! checked here (a throwaway `Regex` build per `match`), but no compiled

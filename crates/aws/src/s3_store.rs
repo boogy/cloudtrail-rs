@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 use crate::http_client::ring_http_client;
 
 /// Default multipart part size, matching `processing.multipart_part_bytes`'s
-/// documented default in `SHARED.md`. Override with `with_multipart_part_bytes`.
+/// documented default. Override with `with_multipart_part_bytes`.
 pub const DEFAULT_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct S3ObjectStore {

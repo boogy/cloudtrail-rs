@@ -1,6 +1,6 @@
 //! Composition root for the SQS-triggered Lambda (`decode-sqs`).
 //!
-//! Per `docs/plans/cloudtrail-rs/SHARED.md` ("Cold start and init-once"),
+//! Following the cold-start init-once design,
 //! every port is constructed exactly once here, in `main`, before
 //! `lambda_runtime::run`; the handler closure captures only an
 //! `Arc<Pipeline>` clone and never constructs an adapter.
@@ -9,7 +9,7 @@
 //! `{"batchItemFailures":[{"itemIdentifier": id}, ...]}` document built from
 //! `BatchOutcome::failed_ack_ids`, so the event source mapping re-drives only
 //! the failed messages. **This requires `ReportBatchItemFailures` to be
-//! enabled on the mapping** — see the SQS data-loss warning in SHARED.md.
+//! enabled on the mapping**; otherwise failed messages are silently deleted.
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
@@ -33,7 +33,7 @@ fn init_tracing() {
 }
 
 /// Picks the `ConfigSource` adapter for `settings.rules.uri`'s scheme
-/// (`ssm://` | `s3://` | `file://`, per `SHARED.md`'s Rules schema).
+/// (`ssm://` | `s3://` | `file://`).
 fn build_config_source(
     settings: &Settings,
     sdk_conf: &aws_config::SdkConfig,

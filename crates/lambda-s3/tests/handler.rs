@@ -1,5 +1,5 @@
 //! Integration tests for the S3 Lambda's composition: the init-once
-//! guarantee (SHARED "Cold start and init-once") and a golden-payload run
+//! guarantee (cold start and init-once) and a golden-payload run
 //! of a real `S3EventDecoder` through the `Pipeline` to its destination.
 //!
 //! These build the same `Pipeline` the binary's `main` builds, but wire
@@ -64,7 +64,7 @@ fn s3_payload() -> Vec<u8> {
 /// `Pipeline` must compile the ruleset exactly once (in `prime`) and fetch
 /// config exactly once. A regression that moves compilation into the
 /// per-invocation path makes this fail. `Compile<T>`'s injected closure is
-/// what makes the count observable (SHARED task-16 rationale).
+/// what makes the count observable (the init-once rationale).
 #[tokio::test]
 async fn ruleset_compiles_once_across_three_invocations() {
     let compiles = Arc::new(AtomicUsize::new(0));

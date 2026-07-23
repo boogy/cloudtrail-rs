@@ -1,8 +1,8 @@
-//! Buffer-mode processing (`SHARED.md`): decompress the whole object into
+//! Buffer-mode processing: decompress the whole object into
 //! memory, filter record-by-record, and gzip the survivors back out as one
 //! buffer.
 //!
-//! "Zero re-serialization" (`SHARED.md`, Performance design #1): the
+//! "Zero re-serialization" (performance design #1): the
 //! `Records` array is parsed straight into `Vec<&RawValue>`, so a surviving
 //! record's **original byte slice** is what gets written out — no
 //! `serde_json::Value` is ever re-serialized.
@@ -29,7 +29,7 @@ pub enum Outcome {
     /// written via `put_stream`.
     Written(Option<Bytes>),
     /// Every record was dropped (or `Records` was empty): the caller writes
-    /// nothing — "zero empty writes" (`SHARED.md`).
+    /// nothing — "zero empty writes".
     NothingKept,
     /// Parsed as JSON but has no `Records` array: the caller applies its
     /// `on_unrecognized_object` policy. Never DLQ'd on an unanticipated
@@ -79,7 +79,7 @@ fn gzip_compress(body: &[u8], level: u32) -> Result<Vec<u8>, CoreError> {
 /// `eventSource` (via `Engine::evaluate`) → write surviving raw slices →
 /// gzip out as `Outcome::Written(Some(bytes))`.
 ///
-/// `max_object_bytes` (buffer mode only, `SHARED.md`) bounds the decompressed
+/// `max_object_bytes` (buffer mode only) bounds the decompressed
 /// size; exceeding it is an `Err`, not an out-of-memory buffer growth.
 pub fn buffer_run(
     input: &[u8],
@@ -118,7 +118,7 @@ pub fn buffer_run(
             },
             Err(_) => {
                 // Unparseable individual record: never dropped, only
-                // counted (`SHARED.md`: "Unparseable individual record ⇒
+                // counted ("Unparseable individual record ⇒
                 // KEPT, never dropped"). Reachable even though the raw span
                 // was itself syntactically well-formed enough to capture —
                 // e.g. a lone UTF-16 surrogate escape parses as a span but
@@ -338,7 +338,7 @@ rules:
         // A lone (unpaired) UTF-16 high-surrogate escape is syntactically
         // well-formed enough for the raw-value scan to capture a span for
         // it, but fails when that span is later parsed into a real `Value`
-        // — exactly the "unparseable individual record" SHARED.md guards
+        // — exactly the "unparseable individual record" case guards
         // against.
         let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"broken":"\uD800"}]}"#;
         let input = gzip_bytes(body);

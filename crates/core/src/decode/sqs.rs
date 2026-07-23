@@ -57,7 +57,7 @@ impl EventDecoder for SqsEventDecoder {
         let mut items = Vec::with_capacity(event.records.len());
         for record in event.records {
             // A single message's body failing to decode must not sink the
-            // whole batch (SHARED partial-batch foundation) — drop just
+            // whole batch (the partial-batch foundation) — drop just
             // this one and keep going.
             if let Ok(objects) = decode_body(&record.body, self.body_format) {
                 items.push(SourceItem {

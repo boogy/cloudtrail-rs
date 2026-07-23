@@ -1,5 +1,5 @@
 //! Parses the `ssm://` / `s3://` / `file://` scheme strings used for both
-//! `rules.uri` and (indirectly) `SETTINGS_URI` (see `SHARED.md`). Resolving
+//! `rules.uri` and (indirectly) `SETTINGS_URI`. Resolving
 //! `Ssm`/`S3` into bytes needs an AWS SDK, which `core` does not depend on —
 //! that is `cloudtrail-rs-aws`'s job. `File` is resolved right here, by
 //! `FileConfigSource`.
