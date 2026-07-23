@@ -85,6 +85,10 @@ pub enum StoreError { NotFound { bucket: String, key: String }, /* ... */ }
 // losing the NotFound distinction — Task 14 dispatches on_missing_object off it:
 //   pub enum CoreError { Store(StoreError), Config(ConfigError), /* ... */ }
 // Tasks 13 and 14 consume it as-is and must not redefine or shadow it.
+// Variants present after task-14 (additive only; task 16/17 propagate these,
+// they do not construct them): Store(StoreError), Config(ConfigError),
+// Gzip(String), Json(String), ObjectTooLarge{limit}, Decode(#[from] DecodeError),
+// SelfTrigger{dest_bucket, dest_key}, UnrecognizedObject{bucket, key}.
 
 // core/src/filter/
 pub fn resolve<'a>(v: &'a serde_json::Value, path: &str) -> Option<std::borrow::Cow<'a, str>>;

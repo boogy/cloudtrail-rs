@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-14
+last-dispatched: task-16
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -22,7 +22,7 @@ last-dispatched: task-14
 | 11 | SQS and EventBridge decoders | 02, 07 | done | 196235d | reuses task-10 parse_s3_notification; SQS SNS-envelope unwrap self-contained (bare Notification, not Records[].Sns). EB field is `detail.event-version`. Part D verbatim-key mutation check PASSED |
 | 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | done | 67185e3 | `CoreError` added here (Store/Config/Gzip/Json/ObjectTooLarge{limit}), as SHARED deferred. MultiGzDecoder verified; verbatim raw-slice output (no re-serialize); decompress cap via take(max+1). Part D check PASSED: GzDecoder swap broke concatenated-member test. +flate2 (rust_backend), serde_json raw_value |
 | 13 | Stream processor | 12 | done | 18723ad | line-by-line reviewed. Box<RawValue> from reader-backed deserializer worked (no Value fallback). Byte-for-byte equivalence with buffer_run verified; abort-via-fail-the-reader for Unrecognized/NothingKept; never flushes (drains sink via mem::take). **Interface fix:** subagent hardcoded PutMeta content_type `application/json`; orchestrator changed to `application/x-gzip` to match task-15 adapter + pinned canonical output PutMeta in SHARED. Part D check PASSED: completing (not aborting) the upload broke the unrecognized-abort test |
-| 14 | Pipeline | 08, 11, 13 | dispatched | — | high design risk — orchestrator reviews diff line-by-line |
+| 14 | Pipeline | 08, 11, 13 | done | d24f987 | line-by-line reviewed. handle→handle_inner; snapshot_and_reset emitted once per handle even on failure (delta). Key filter before get; self-trigger guard returns Err (not partial-batch). CANONICAL_META (application/x-gzip) at all 4 put sites. Fail-open raw_copy bypasses decompress/parse; stream Unrecognized re-fetches (2nd get) + raw-copies. Additive CoreError variants (Decode/SelfTrigger/UnrecognizedObject) recorded in SHARED. Part D PASSED: neutralizing self-trigger broke loop test; swap→load in snapshot_and_reset broke delta test |
 | 15 | AWS adapters | 02 | done | 5c4c679 | ring-only verified (no aws-lc in tree); core still aws-free. Adapters: prod `new(&SdkConfig)`, test `from_client(Client)`; S3ObjectStore `with_multipart_part_bytes` override |
 | 16 | Four Lambda binaries | 14, 15 | pending | — | |
 | 17 | CLI | 14, 15 | pending | — | |
