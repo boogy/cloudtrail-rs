@@ -1,5 +1,5 @@
 //! Rule evaluation: compiles a `RuleSet` into a set of regexes and evaluates
-//! records against it. See `SHARED.md` for the AND/OR semantics.
+//! records against it. AND within a rule, OR across rules.
 //!
 //! `evaluate_linear` walks `rules` in order and, within a rule, `matches` in
 //! order — no rule index yet (that is a later task; `evaluate` does not

@@ -1,6 +1,6 @@
 //! S3-backed `ConfigSource`: the ruleset lives at a fixed bucket/key, and
-//! `version` is a cheap `HeadObject` ETag check (no body transfer) per
-//! `SHARED.md`'s caching design.
+//! `version` is a cheap `HeadObject` ETag check (no body transfer), the
+//! caching design.
 
 use async_trait::async_trait;
 use aws_config::SdkConfig;

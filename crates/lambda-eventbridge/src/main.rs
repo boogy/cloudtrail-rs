@@ -1,7 +1,7 @@
 //! Composition root for the EventBridge-notification Lambda
 //! (`decode-eventbridge`).
 //!
-//! Per `docs/plans/cloudtrail-rs/SHARED.md` ("Cold start and init-once"),
+//! Following the cold-start init-once design,
 //! every port is constructed exactly once here, in `main`, before
 //! `lambda_runtime::run`; the handler closure captures only an
 //! `Arc<Pipeline>` clone and never constructs an adapter.
@@ -28,7 +28,7 @@ fn init_tracing() {
 }
 
 /// Picks the `ConfigSource` adapter for `settings.rules.uri`'s scheme
-/// (`ssm://` | `s3://` | `file://`, per `SHARED.md`'s Rules schema).
+/// (`ssm://` | `s3://` | `file://`).
 fn build_config_source(
     settings: &Settings,
     sdk_conf: &aws_config::SdkConfig,

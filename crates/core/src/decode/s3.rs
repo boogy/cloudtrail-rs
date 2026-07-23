@@ -111,7 +111,7 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<SourceItem>, D
 /// S3 notification object keys are form-urlencoded
 /// (`application/x-www-form-urlencoded`): `+` decodes to a space, in
 /// addition to ordinary `%XX` escapes. Percent-decoding alone leaves a
-/// literal `+` in the key and every such `GetObject` 404s (SHARED safety
+/// literal `+` in the key and every such `GetObject` 404s (safety
 /// invariant 4). EventBridge keys are NOT encoded — this function must
 /// never be reused for that decoder.
 pub(crate) fn decode_form_urlencoded_key(key: &str) -> Result<String, DecodeError> {

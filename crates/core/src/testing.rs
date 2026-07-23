@@ -148,7 +148,7 @@ impl MetricsSink for RecordingSink {
 /// key — including "nothing", when the upload was aborted.
 ///
 /// `put_stream` treats an `Err` from the body reader as the abort signal
-/// (`SHARED.md`, "How the abort is triggered without a new port method"):
+/// (how the abort is triggered without a new port method):
 /// on `Err`, it returns `Err` itself *without* inserting into `objects`, so
 /// the destination key is left holding whatever it held before the call
 /// (nothing, for a fresh key) — simulating `AbortMultipartUpload` leaving no
@@ -383,8 +383,8 @@ mod tests {
     }
 
     /// An `AsyncRead` whose one and only `poll_read` call reports an error —
-    /// the abort-triggering shape `stream_run` needs (SHARED.md: "How the
-    /// abort is triggered without a new port method").
+    /// the abort-triggering shape `stream_run` needs (how the
+    /// abort is triggered without a new port method).
     struct FailingReader;
 
     impl tokio::io::AsyncRead for FailingReader {

@@ -1,5 +1,5 @@
 //! `Pipeline`: wires the four ports together and owns the whole policy
-//! matrix (`SHARED.md` "Safety invariants" + the `behavior.*` knobs) on top
+//! matrix (the safety invariants + the `behavior.*` knobs) on top
 //! of the pure `process::{buffer_run, stream_run}` functions.
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::model::{ObjectRef, PutMeta, SourceItem};
 use crate::ports::{EventDecoder, MetricsSink, ObjectStore};
 use crate::process::{Outcome, buffer_run, stream_run};
 
-/// Canonical output metadata (`SHARED.md` "Canonical output PutMeta"): every
+/// Canonical output metadata: every
 /// write this module performs — filtered output, a fail-open raw copy, or an
 /// `on_unrecognized_object: copy` raw copy — uses exactly this, so the
 /// destination bucket is uniform regardless of which path wrote a given
@@ -39,7 +39,7 @@ pub struct BatchOutcome {
 
 /// Which processing strategy an object is routed through, decided by
 /// `processing.mode` and (for `auto`) `ObjectRef.size` vs.
-/// `stream_threshold_bytes` (`SHARED.md` safety invariant 5: missing size
+/// `stream_threshold_bytes` (safety invariant 5: missing size
 /// picks buffer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectMode {
@@ -203,7 +203,7 @@ impl Pipeline {
     }
 
     /// `behavior.on_config_error == open` with no cached ruleset
-    /// (`SHARED.md` "Fail-open scope"): a raw byte copy, no decompress, no
+    /// (fail-open scope): a raw byte copy, no decompress, no
     /// parse, no size check.
     async fn raw_copy(
         &self,
@@ -309,7 +309,7 @@ impl Pipeline {
                     .await?;
             }
             Outcome::NothingKept => {
-                // Zero empty writes (SHARED.md): nothing to put.
+                // Zero empty writes: nothing to put.
             }
             Outcome::Unrecognized => {
                 self.metrics.add_unrecognized_objects(1);
@@ -368,7 +368,7 @@ impl Pipeline {
             Outcome::Unrecognized => {
                 self.metrics.add_unrecognized_objects(1);
                 // stream_run already aborted the in-flight upload
-                // (SHARED.md "Unrecognized objects in stream mode"); apply
+                // (unrecognized objects in stream mode); apply
                 // the policy by re-fetching (a second `get`) and raw-copying.
                 let Some(bytes) = self
                     .fetch_with_missing_policy(&object.bucket, &object.key)

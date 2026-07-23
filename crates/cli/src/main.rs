@@ -1,5 +1,5 @@
 //! `cloudtrail-rs` — local/offline CLI companion to the Lambda binaries
-//! (task 17, `docs/plans/cloudtrail-rs/SHARED.md`).
+//! (task 17).
 //!
 //! Depends on `cloudtrail-rs-core` **and** `cloudtrail-rs-aws` so a rules
 //! `uri` may be `ssm://`, `s3://`, `file://`, or a bare local path.
@@ -37,7 +37,7 @@ use cloudtrail_rs_core::process::{Outcome, buffer_run};
 use flate2::read::MultiGzDecoder;
 
 /// Object metadata for every gzip object this CLI writes to S3, matching the
-/// canonical `PutMeta` the Lambda pipeline uses (`SHARED.md`).
+/// canonical `PutMeta` the Lambda pipeline uses.
 const GZIP_META: PutMeta = PutMeta {
     content_type: "application/x-gzip",
     content_encoding: "gzip",
@@ -169,7 +169,7 @@ async fn load_engine(uri: &str) -> anyhow::Result<(Engine, RuleSet)> {
 /// could not narrow it to a fixed set of `eventSource` literals — either it
 /// has no `eventSource` condition at all, or that condition's pattern is not
 /// one of the two conservative shapes `Engine::new`'s index extraction
-/// accepts (see `SHARED.md`, "Rule index").
+/// accepts (the rule index).
 fn explain_always_rule(rule_set: &RuleSet, rule_idx: usize) -> String {
     let rule = &rule_set.rules[rule_idx];
     match rule.matches.iter().find(|m| m.field_name == "eventSource") {
@@ -458,7 +458,7 @@ async fn cmd_filter(source: &str, dest: &str, rules_uri: &str) -> anyhow::Result
                 Outcome::NothingKept => println!("all records dropped; no output written"),
                 Outcome::Unrecognized => {
                     // No `Records` array: default `on_unrecognized_object` is
-                    // `copy` (SHARED.md) — forward verbatim, never discard.
+                    // `copy` — forward verbatim, never discard.
                     let at = write_single(&dst, &input, &s3).await?;
                     println!(
                         "object shape not recognized (no Records array); copied verbatim to {at}"

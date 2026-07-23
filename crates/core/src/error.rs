@@ -35,7 +35,7 @@ pub enum ConfigError {
 /// `Pipeline::handle` return on failure. Carries a `StoreError` and a
 /// `ConfigError` without losing the `NotFound` distinction (Task 14
 /// dispatches `on_missing_object` off `CoreError::Store(StoreError::NotFound
-/// { .. })`), plus the data-error cases (`SHARED.md`: bad gzip, bad JSON, an
+/// { .. })`), plus the data-error cases (bad gzip, bad JSON, an
 /// object too large to buffer) that only arrive with the processors.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -57,7 +57,7 @@ pub enum CoreError {
     /// `SourceItem`s could be extracted at all.
     #[error("failed to decode event payload: {0}")]
     Decode(#[from] DecodeError),
-    /// Safety invariant (`SHARED.md` #1): the computed destination
+    /// Safety invariant #1: the computed destination
     /// `(bucket, key)` equals the source `(bucket, key)`. Refusing to write
     /// here is what stops an infinite self-triggering loop that would
     /// otherwise bill until someone notices.

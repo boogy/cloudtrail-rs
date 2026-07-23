@@ -1,5 +1,5 @@
 //! Parsing, defaults, and environment overrides for the settings document
-//! (fetched from `SETTINGS_URI`, see `SHARED.md`).
+//! (fetched from `SETTINGS_URI`).
 //!
 //! Env wins over file, always. To keep that logic testable without touching
 //! process-global `std::env` state (`cargo test` runs in parallel, and
@@ -195,8 +195,7 @@ fn default_version() -> i64 {
     1
 }
 
-/// Source-key filtering, applied before any `GetObject` (safety invariant 2
-/// in `SHARED.md`).
+/// Source-key filtering, applied before any `GetObject` (safety invariant 2).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -487,7 +486,7 @@ impl Settings {
     ///
     /// `SETTINGS_URI` is optional (an env-only deployment is valid). If set,
     /// only `file://` is resolved here — `core` has no `aws-sdk-*`
-    /// dependency (`SHARED.md`), so an `s3://`/`ssm://` settings URI needs a
+    /// dependency, so an `s3://`/`ssm://` settings URI needs a
     /// composition root that can reach those services and hand this
     /// function the fetched bytes instead.
     pub async fn load() -> Result<Settings, ConfigError> {

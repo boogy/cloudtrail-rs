@@ -4,8 +4,8 @@
 //! oracle, still does the latter).
 //!
 //! Built once, in `Engine::new`, from each rule's `eventSource` pattern (or
-//! `None` if the rule has no `eventSource` condition). See `SHARED.md`
-//! "Rule index" — over-inclusion (a rule landing in `always` when it didn't
+//! `None` if the rule has no `eventSource` condition).
+//! Over-inclusion (a rule landing in `always` when it didn't
 //! need to) is safe; over-exclusion is a silent correctness bug, so
 //! extraction is deliberately conservative.
 

@@ -1,4 +1,4 @@
-//! Stream-mode processing (`SHARED.md`): decompress and filter the object
+//! Stream-mode processing: decompress and filter the object
 //! body incrementally, writing survivors straight to the destination via
 //! `ObjectStore::put_stream` instead of buffering the whole object in memory.
 //!
@@ -29,8 +29,8 @@
 //!      write; draining the sink `Vec` instead doesn't touch encoder state,
 //!      so the compressed byte stream stays identical to buffer mode's.
 //!
-//! Unrecognized objects and "every record dropped" (`SHARED.md`, "Unrecognized
-//! objects in stream mode"): stream mode has already started `put_stream`
+//! Unrecognized objects and "every record dropped" (unrecognized objects in
+//! stream mode): stream mode has already started `put_stream`
 //! before it can know either of these, so it can't simply skip the call. It
 //! aborts the upload instead by failing the *reader* `put_stream` is reading
 //! from (delivering an `Err` instead of a clean EOF) — no new `ObjectStore`
@@ -135,7 +135,7 @@ impl Read for ChannelSyncRead {
 /// `mpsc::Receiver<ByteMsg>`, used to hand `store.put_stream` a body that
 /// the processing block feeds incrementally. An `Err` message is delivered
 /// as a genuine read error rather than a clean EOF — the "fail the reader"
-/// abort signal from `SHARED.md`.
+/// abort signal.
 struct ChannelAsyncRead {
     rx: mpsc::Receiver<ByteMsg>,
     pending: Bytes,
@@ -358,7 +358,7 @@ fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
     let _ = tx.blocking_send(StreamMsg::Finished(finish));
 }
 
-/// Stream-mode entry point (`SHARED.md`): decompress and filter `input`
+/// Stream-mode entry point: decompress and filter `input`
 /// incrementally, writing survivors directly to `dest_bucket`/`dest_key` via
 /// `store.put_stream` rather than buffering the whole object.
 ///
@@ -383,7 +383,7 @@ pub async fn stream_run(
     let blocking =
         tokio::task::spawn_blocking(move || extract_records(ChannelSyncRead::new(in_rx), raw_tx));
 
-    // Canonical output metadata (SHARED.md): gzipped CloudTrail JSON is
+    // Canonical output metadata: gzipped CloudTrail JSON is
     // labelled exactly as the buffer path's `put` and the S3 adapter's tests
     // expect — `application/x-gzip` + `gzip` — so the destination bucket is
     // uniform regardless of which mode wrote a given object.
@@ -499,8 +499,8 @@ pub async fn stream_run(
             FinishKind::RecordsFound => {
                 // Every record was dropped, or `Records` was empty: stream
                 // mode must never leave a zero-record object at the
-                // destination ("never leave a zero-record object",
-                // SHARED.md) — abort the upload instead of committing one.
+                // destination ("never leave a zero-record object") —
+                // abort the upload instead of committing one.
                 metrics.add_records_dropped(records_in);
                 let _ = out_tx
                     .send(Err(io::Error::other("aborting: all records dropped")))
@@ -542,8 +542,8 @@ pub async fn stream_run(
         Outcome::NothingKept | Outcome::Unrecognized => {
             // We deliberately failed the reader `put_stream` was reading
             // from; the `Err` it returns after aborting is expected, not a
-            // real failure — swallow it (SHARED.md, "How the abort is
-            // triggered without a new port method").
+            // real failure — swallow it (how the abort is
+            // triggered without a new port method).
         }
         Outcome::Written(Some(_)) => {
             unreachable!("stream_run never returns Outcome::Written(Some(_))")

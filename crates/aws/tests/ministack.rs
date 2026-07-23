@@ -4,7 +4,7 @@
 //! `GetObject`/`PutObject`/multipart, real SSM `GetParameter` for the ruleset.
 //!
 //! Every test is `#[ignore]` so `cargo test --workspace` skips this suite (it
-//! must still *compile*, per SHARED.md); run it with the container up via
+//! must still *compile*); run it with the container up via
 //! `cargo test --workspace -- --ignored`.
 //!
 //! Bring the container up with `docker compose -f docker-compose.test.yml up -d`.
@@ -191,7 +191,7 @@ fn cloudtrail_body(count: usize) -> (Vec<u8>, Vec<u8>) {
 
 /// The S3 bucket-notification JSON payload `S3EventDecoder` expects, naming
 /// exactly one object. `size` drives `Pipeline`'s auto buffer/stream
-/// decision (`SHARED.md` safety invariant 5) — it need not equal the
+/// decision (safety invariant 5) — it need not equal the
 /// object's real byte count (S3 always sends the true size; here we control
 /// it directly to deterministically select a processing mode).
 fn s3_event_payload(bucket: &str, key: &str, size: u64) -> Vec<u8> {
