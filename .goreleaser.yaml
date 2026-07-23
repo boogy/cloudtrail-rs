@@ -1,0 +1,222 @@
+# GoReleaser — https://goreleaser.com  (schema v2, Rust builder v2.5+)
+#
+# One config drives: cross-compiled binaries — musl (arm64 + amd64) for the four
+# Lambda `bootstrap` binaries, plus musl + darwin for the CLI — zip/tar.gz
+# archives, checksums, the GitHub Release, minimal multi-arch container images
+# for the four Lambdas pushed to GHCR + Docker Hub, a Homebrew cask for the CLI,
+# and cosign keyless signatures. The Rust builder auto-runs `rustup target add`
+# for each declared target.
+#
+# Validate:   goreleaser check          (make release-check)
+# Local run:  goreleaser release --snapshot --clean   (make release-snapshot)
+version: 2
+
+project_name: cloudtrail-rs
+
+env:
+  # Registry namespaces. Override by exporting these before `goreleaser release`.
+  - GHCR_NAMESPACE={{ if index .Env "GHCR_NAMESPACE" }}{{ .Env.GHCR_NAMESPACE }}{{ else }}boogy{{ end }}
+  - DOCKERHUB_NAMESPACE={{ if index .Env "DOCKERHUB_NAMESPACE" }}{{ .Env.DOCKERHUB_NAMESPACE }}{{ else }}boogy{{ end }}
+
+# All binaries are static musl; the 4 lambdas rename to `bootstrap`, the CLI
+# keeps its name. `-p=<package>` selects the workspace member.
+builds:
+  - id: lambda-s3
+    builder: rust
+    binary: bootstrap
+    tool: cargo
+    command: zigbuild
+    targets: &musl_targets
+      - aarch64-unknown-linux-musl
+      - x86_64-unknown-linux-musl
+    flags:
+      - --release
+      - -p=cloudtrail-rs-lambda-s3
+
+  - id: lambda-sns
+    builder: rust
+    binary: bootstrap
+    tool: cargo
+    command: zigbuild
+    targets: *musl_targets
+    flags:
+      - --release
+      - -p=cloudtrail-rs-lambda-sns
+
+  - id: lambda-sqs
+    builder: rust
+    binary: bootstrap
+    tool: cargo
+    command: zigbuild
+    targets: *musl_targets
+    flags:
+      - --release
+      - -p=cloudtrail-rs-lambda-sqs
+
+  - id: lambda-eventbridge
+    builder: rust
+    binary: bootstrap
+    tool: cargo
+    command: zigbuild
+    targets: *musl_targets
+    flags:
+      - --release
+      - -p=cloudtrail-rs-lambda-eventbridge
+
+  # The CLI also ships an Apple Silicon (arm64) binary for the Homebrew cask
+  # (casks are macOS-only; Intel Macs are not targeted). zigbuild cross-compiles
+  # the darwin target from Linux CI without an Xcode SDK — zig bundles the
+  # libSystem stubs.
+  - id: cli
+    builder: rust
+    binary: cloudtrail-rs
+    tool: cargo
+    command: zigbuild
+    targets:
+      - aarch64-unknown-linux-musl
+      - x86_64-unknown-linux-musl
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - -p=cloudtrail-rs
+
+# Lambda zip-deploy wants a root `bootstrap`; the CLI ships as a tar.gz.
+archives:
+  - id: lambda-s3
+    ids: [lambda-s3]
+    formats: [zip]
+    name_template: "lambda-s3-{{ .Version }}-{{ .Arch }}"
+  - id: lambda-sns
+    ids: [lambda-sns]
+    formats: [zip]
+    name_template: "lambda-sns-{{ .Version }}-{{ .Arch }}"
+  - id: lambda-sqs
+    ids: [lambda-sqs]
+    formats: [zip]
+    name_template: "lambda-sqs-{{ .Version }}-{{ .Arch }}"
+  - id: lambda-eventbridge
+    ids: [lambda-eventbridge]
+    formats: [zip]
+    name_template: "lambda-eventbridge-{{ .Version }}-{{ .Arch }}"
+  - id: cli
+    ids: [cli]
+    formats: [tar.gz]
+    # CLI spans linux + darwin, so the OS must be in the name or arm64/amd64
+    # archives would collide across platforms.
+    name_template: "cli-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ---- container images (dockers_v2) ------------------------------------------
+# One entry per module. dockers_v2 drives buildx to build BOTH arches and stitch
+# the multi-arch manifest automatically — no separate dockers/docker_manifests
+# blocks, no QEMU (COPY-only Dockerfiles). GoReleaser lays the pre-built musl
+# binaries out per platform (linux/amd64/<bin>, linux/arm64/<bin>); the
+# Dockerfiles COPY via $TARGETPLATFORM. All modules share one repo on each
+# registry and are told apart by module-prefixed tags. A `-latest` tag renders
+# empty on a prerelease (a "-" in the tag), so GoReleaser skips it.
+dockers_v2:
+  - id: lambda-s3
+    ids: [lambda-s3]
+    dockerfile: docker/Dockerfile.lambda
+    images: &images
+      - "ghcr.io/{{ .Env.GHCR_NAMESPACE }}/cloudtrail-rs"
+      - "docker.io/{{ .Env.DOCKERHUB_NAMESPACE }}/cloudtrail-rs"
+    platforms: &platforms
+      - linux/amd64
+      - linux/arm64
+    labels: &labels
+      org.opencontainers.image.source: "https://github.com/boogy/cloudtrail-rs"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.licenses: "Apache-2.0"
+    tags:
+      - "lambda-s3-{{ .Version }}"
+      - "{{ if not .Prerelease }}lambda-s3-latest{{ end }}"
+
+  - id: lambda-sns
+    ids: [lambda-sns]
+    dockerfile: docker/Dockerfile.lambda
+    images: *images
+    platforms: *platforms
+    labels: *labels
+    tags:
+      - "lambda-sns-{{ .Version }}"
+      - "{{ if not .Prerelease }}lambda-sns-latest{{ end }}"
+
+  - id: lambda-sqs
+    ids: [lambda-sqs]
+    dockerfile: docker/Dockerfile.lambda
+    images: *images
+    platforms: *platforms
+    labels: *labels
+    tags:
+      - "lambda-sqs-{{ .Version }}"
+      - "{{ if not .Prerelease }}lambda-sqs-latest{{ end }}"
+
+  - id: lambda-eventbridge
+    ids: [lambda-eventbridge]
+    dockerfile: docker/Dockerfile.lambda
+    images: *images
+    platforms: *platforms
+    labels: *labels
+    tags:
+      - "lambda-eventbridge-{{ .Version }}"
+      - "{{ if not .Prerelease }}lambda-eventbridge-latest{{ end }}"
+
+# ---- Homebrew tap (CLI only) ------------------------------------------------
+# The CLI ships as a Homebrew cask, not a container. Casks are macOS-only, so
+# this relies on the darwin binaries built in the `cli` build above. Publishes
+# to github.com/boogy/homebrew-tap, enabling:
+#   brew install boogy/tap/cloudtrail-rs
+# Pushing to a *different* repo needs a PAT (repo scope on the tap) exposed as
+# HOMEBREW_TAP_TOKEN — the workflow's default GITHUB_TOKEN can't. The binary
+# name defaults to the cask name (cloudtrail-rs), which is correct here.
+homebrew_casks:
+  - name: cloudtrail-rs
+    ids: [cli]
+    repository:
+      owner: boogy
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/boogy/cloudtrail-rs"
+    description: "Local tooling for cloudtrail-rs exclusion rules"
+    license: "Apache-2.0"
+
+# ---- signing (cosign keyless; needs id-token: write in the workflow) --------
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    args:
+      - sign
+      - "${artifact}"
+      - --yes
+    output: true
+
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "--yes"
+    output: true
+
+release:
+  prerelease: auto  # a "-" in the tag (v1.2.3-rc.1) marks the GH release prerelease
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"

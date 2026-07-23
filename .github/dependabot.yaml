@@ -1,0 +1,34 @@
+# Dependabot — https://docs.github.com/code-security/dependabot/dependabot-version-updates
+# Keeps this repo's pins current: Cargo deps, GitHub Actions commit SHAs (updates
+# the pin AND the `# vX.Y.Z` comment), and the distroless base-image digest.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      aws-sdk:
+        patterns:
+          - "aws-*"
+      dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  # Docker base images — bumps the pinned digest on gcr.io/distroless/static-debian13.
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      docker:
+        patterns:
+          - "*"
