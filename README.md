@@ -2,8 +2,6 @@
   <img src="assets/banner.svg" alt="cloudtrail-rs — filter AWS CloudTrail logs in flight before they reach your SIEM" width="100%">
 </p>
 
-<h1 align="center">cloudtrail-rs</h1>
-
 <p align="center">
   <a href="https://github.com/boogy/cloudtrail-rs/actions/workflows/ci.yml"><img src="https://github.com/boogy/cloudtrail-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/boogy/cloudtrail-rs/actions/workflows/release.yml"><img src="https://github.com/boogy/cloudtrail-rs/actions/workflows/release.yml/badge.svg" alt="Release"></a>
