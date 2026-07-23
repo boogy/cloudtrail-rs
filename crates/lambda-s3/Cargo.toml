@@ -3,6 +3,13 @@ name = "cloudtrail-rs-lambda-s3"
 version = "0.1.0"
 edition = "2024"
 
+# AWS Lambda's custom runtime requires the executable be named `bootstrap`.
+# Without this, cargo names the binary after the package and GoReleaser's
+# `binary: bootstrap` lookup fails.
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
 [dependencies]
 cloudtrail-rs-core = { path = "../core", features = ["decode-s3"] }
 cloudtrail-rs-aws = { path = "../aws" }
