@@ -12,7 +12,10 @@ members = [
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+# thin LTO + parallel codegen: ~95% of fat-LTO runtime perf at a fraction of the
+# link time. With 11 build×target combos in the release pipeline, fat LTO +
+# codegen-units=1 was the dominant cost. Slightly larger binaries.
+lto = "thin"
+codegen-units = 16
 panic = "abort"
 strip = "symbols"
