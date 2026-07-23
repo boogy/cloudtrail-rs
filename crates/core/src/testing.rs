@@ -1,16 +1,19 @@
 //! Test doubles for the ports in `ports.rs`, gated behind the `testing`
-//! feature so they never ship in a Lambda binary. `InMemoryStore` arrives
-//! with the task that needs it; this task adds `StaticConfigSource` and
-//! `RecordingSink`.
+//! feature so they never ship in a Lambda binary. `StaticConfigSource` and
+//! `RecordingSink` arrived with task-12; `InMemoryStore` arrives here
+//! (task-13), needed to assert what `stream_run` leaves at a destination key.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::io::AsyncReadExt;
 
-use crate::error::ConfigError;
-use crate::model::{MetricSnapshot, VersionTag};
-use crate::ports::{ConfigSource, MetricsSink};
+use crate::error::{ConfigError, StoreError};
+use crate::model::{MetricSnapshot, PutMeta, VersionTag};
+use crate::ports::{ConfigSource, MetricsSink, ObjectStore};
 
 /// A `ConfigSource` double whose content, version, and failures are all
 /// controlled by the test. Counts calls to `version()`/`fetch()` so a
@@ -139,6 +142,129 @@ impl MetricsSink for RecordingSink {
     }
 }
 
+/// An in-memory `ObjectStore`: `get`/`put` against a `Mutex<HashMap>` keyed
+/// by `(bucket, key)`, plus `put_stream` accumulating the body it is handed
+/// so a `stream_run` test can assert exactly what landed at a destination
+/// key — including "nothing", when the upload was aborted.
+///
+/// `put_stream` treats an `Err` from the body reader as the abort signal
+/// (`SHARED.md`, "How the abort is triggered without a new port method"):
+/// on `Err`, it returns `Err` itself *without* inserting into `objects`, so
+/// the destination key is left holding whatever it held before the call
+/// (nothing, for a fresh key) — simulating `AbortMultipartUpload` leaving no
+/// object behind.
+///
+/// `put_stream_progress()` reports cumulative bytes read so far by the
+/// *most recent* `put_stream` call (reset to 0 at the start of each call) —
+/// a live progress counter a concurrently-polling test can sample to prove
+/// the store started receiving bytes before the producer finished, i.e.
+/// that the two sides are actually pipelined rather than "buffer everything,
+/// then write everything".
+#[derive(Default)]
+pub struct InMemoryStore {
+    objects: Mutex<HashMap<(String, String), Bytes>>,
+    put_stream_progress: AtomicU64,
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seeds `bucket`/`key` with `bytes`, as if a prior `put` had written it.
+    pub fn seed(&self, bucket: &str, key: &str, bytes: impl Into<Bytes>) {
+        self.objects
+            .lock()
+            .expect("InMemoryStore mutex poisoned")
+            .insert((bucket.to_string(), key.to_string()), bytes.into());
+    }
+
+    /// The bytes currently held at `bucket`/`key`, if any.
+    pub fn object(&self, bucket: &str, key: &str) -> Option<Bytes> {
+        self.objects
+            .lock()
+            .expect("InMemoryStore mutex poisoned")
+            .get(&(bucket.to_string(), key.to_string()))
+            .cloned()
+    }
+
+    /// Whether `bucket`/`key` holds anything at all.
+    pub fn contains(&self, bucket: &str, key: &str) -> bool {
+        self.objects
+            .lock()
+            .expect("InMemoryStore mutex poisoned")
+            .contains_key(&(bucket.to_string(), key.to_string()))
+    }
+
+    /// Cumulative bytes read so far by the most recent `put_stream` call.
+    pub fn put_stream_progress(&self) -> u64 {
+        self.put_stream_progress.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for InMemoryStore {
+    async fn get(&self, b: &str, k: &str) -> Result<Bytes, StoreError> {
+        self.object(b, k).ok_or_else(|| StoreError::NotFound {
+            bucket: b.to_string(),
+            key: k.to_string(),
+        })
+    }
+
+    async fn get_stream(
+        &self,
+        b: &str,
+        k: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+        let bytes = self.get(b, k).await?;
+        Ok(Box::new(std::io::Cursor::new(bytes)))
+    }
+
+    async fn put(&self, b: &str, k: &str, body: Bytes, _meta: PutMeta) -> Result<(), StoreError> {
+        self.objects
+            .lock()
+            .expect("InMemoryStore mutex poisoned")
+            .insert((b.to_string(), k.to_string()), body);
+        Ok(())
+    }
+
+    async fn put_stream(
+        &self,
+        b: &str,
+        k: &str,
+        mut body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        _meta: PutMeta,
+    ) -> Result<(), StoreError> {
+        self.put_stream_progress.store(0, Ordering::SeqCst);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match body.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    self.put_stream_progress
+                        .fetch_add(n as u64, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    // The reader failed mid-stream: simulate
+                    // AbortMultipartUpload by leaving the destination
+                    // untouched instead of committing a partial object.
+                    return Err(StoreError::Backend(format!(
+                        "put_stream aborted after {} bytes: {e}",
+                        buf.len()
+                    )));
+                }
+            }
+        }
+        self.objects
+            .lock()
+            .expect("InMemoryStore mutex poisoned")
+            .insert((b.to_string(), k.to_string()), Bytes::from(buf));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +332,74 @@ mod tests {
         sink.emit(&b);
 
         assert_eq!(sink.snapshots(), vec![a, b]);
+    }
+
+    fn no_meta() -> PutMeta {
+        PutMeta {
+            content_type: "application/json",
+            content_encoding: "gzip",
+        }
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_the_exact_bytes() {
+        let store = InMemoryStore::new();
+        store
+            .put("bucket", "key", Bytes::from_static(b"hello"), no_meta())
+            .await
+            .unwrap();
+        assert_eq!(store.get("bucket", "key").await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn get_on_a_missing_key_is_not_found() {
+        let store = InMemoryStore::new();
+        let err = store.get("bucket", "missing").await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn put_stream_captures_the_full_body_at_the_destination_key() {
+        let store = InMemoryStore::new();
+        let body: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+            Box::new(std::io::Cursor::new(Bytes::from_static(b"streamed body")));
+        store
+            .put_stream("bucket", "dest", body, no_meta())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.object("bucket", "dest"),
+            Some(Bytes::from_static(b"streamed body"))
+        );
+    }
+
+    /// An `AsyncRead` whose one and only `poll_read` call reports an error —
+    /// the abort-triggering shape `stream_run` needs (SHARED.md: "How the
+    /// abort is triggered without a new port method").
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("simulated abort")))
+        }
+    }
+
+    #[tokio::test]
+    async fn put_stream_leaves_the_destination_key_empty_when_the_reader_fails() {
+        let store = InMemoryStore::new();
+        let body: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(FailingReader);
+        let err = store
+            .put_stream("bucket", "dest", body, no_meta())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "got {err:?}");
+        assert!(
+            !store.contains("bucket", "dest"),
+            "an aborted put_stream must leave the destination key holding nothing"
+        );
     }
 }

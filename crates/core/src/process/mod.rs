@@ -3,5 +3,7 @@
 //! write) the survivors.
 
 mod buffer;
+mod stream;
 
 pub use buffer::{Outcome, buffer_run};
+pub use stream::stream_run;
