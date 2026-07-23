@@ -13,6 +13,7 @@ report the deviation to the orchestrator instead of changing it silently.**
 - **Filter semantics:** exclusion only. Within one rule **ALL** `matches[]` must match (AND). Across rules **ANY** match drops the record (OR).
 - **Missing field ⇒ condition FALSE** (rule does not fire, record KEPT). Never fail-open on a typo'd `field_name`.
 - **Output:** gzip of `{"Records":[<survivors>]}` — identical envelope to input. Destination key = `key_prefix + source key`.
+- **Canonical output `PutMeta`:** every write (buffer `put` and stream `put_stream`) uses `PutMeta { content_type: "application/x-gzip", content_encoding: "gzip" }` — the value the S3 adapter's tests assert. The destination bucket must be uniform regardless of which mode wrote a given object; no path may substitute `application/json`.
 - **Zero empty writes:** all records dropped ⇒ write nothing.
 - **Unparseable individual record ⇒ KEPT**, never dropped.
 - **Data errors** (S3 failure, bad gzip, bad JSON) ⇒ `Err` ⇒ Lambda retry ⇒ DLQ. Source is untouched, so replay is lossless.
