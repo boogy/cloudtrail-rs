@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-16
+last-dispatched: task-17
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -24,8 +24,8 @@ last-dispatched: task-16
 | 13 | Stream processor | 12 | done | 18723ad | line-by-line reviewed. Box<RawValue> from reader-backed deserializer worked (no Value fallback). Byte-for-byte equivalence with buffer_run verified; abort-via-fail-the-reader for Unrecognized/NothingKept; never flushes (drains sink via mem::take). **Interface fix:** subagent hardcoded PutMeta content_type `application/json`; orchestrator changed to `application/x-gzip` to match task-15 adapter + pinned canonical output PutMeta in SHARED. Part D check PASSED: completing (not aborting) the upload broke the unrecognized-abort test |
 | 14 | Pipeline | 08, 11, 13 | done | d24f987 | line-by-line reviewed. handle→handle_inner; snapshot_and_reset emitted once per handle even on failure (delta). Key filter before get; self-trigger guard returns Err (not partial-batch). CANONICAL_META (application/x-gzip) at all 4 put sites. Fail-open raw_copy bypasses decompress/parse; stream Unrecognized re-fetches (2nd get) + raw-copies. Additive CoreError variants (Decode/SelfTrigger/UnrecognizedObject) recorded in SHARED. Part D PASSED: neutralizing self-trigger broke loop test; swap→load in snapshot_and_reset broke delta test |
 | 15 | AWS adapters | 02 | done | 5c4c679 | ring-only verified (no aws-lc in tree); core still aws-free. Adapters: prod `new(&SdkConfig)`, test `from_client(Client)`; S3ObjectStore `with_multipart_part_bytes` override |
-| 16 | Four Lambda binaries | 14, 15 | pending | — | |
-| 17 | CLI | 14, 15 | pending | — | |
+| 16 | Four Lambda binaries | 14, 15 | done | 463e8cf | line-by-line reviewed (orchestrator wrote it after the dispatched subagent hit a session limit with only lambda-s3 partial). All four bins strict init→run skeleton; s3/sns/eb return () + propagate Err, sqs returns batchItemFailures from BatchOutcome. Init-once deliverable test: 3× handle ⇒ compile once + fetch once. Golden-payload handler test per bin via real decoder. Feature isolation verified (lambda-s3 tree: 0 decode-sqs/sns/eb). Part D PASSED: forcing per-invocation recompile in ConfigStore broke init-once test (4 vs 1), reverted |
+| 17 | CLI | 14, 15 | dispatched | — | |
 | 18 | MiniStack integration tests | 16 | pending | — | |
 | 19 | Docs and examples | 18 | pending | — | |
 
