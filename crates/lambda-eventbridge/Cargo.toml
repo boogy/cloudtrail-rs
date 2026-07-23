@@ -6,3 +6,14 @@ edition = "2024"
 [dependencies]
 cloudtrail-rs-core = { path = "../core", features = ["decode-eventbridge"] }
 cloudtrail-rs-aws = { path = "../aws" }
+anyhow = "1"
+aws-config = { version = "1", default-features = false }
+lambda_runtime = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+cloudtrail-rs-core = { path = "../core", features = ["decode-eventbridge", "testing"] }
+flate2 = "1"
