@@ -12,6 +12,7 @@ pub mod error;
 pub mod filter;
 pub mod metrics;
 pub mod model;
+pub mod pipeline;
 pub mod ports;
 pub mod process;
 
