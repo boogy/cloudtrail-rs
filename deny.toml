@@ -1,0 +1,51 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+# Run: cargo deny check   (or: make deny)
+
+[graph]
+all-features = true
+
+[advisories]
+# RUSTSEC advisory database checks. Unmaintained/unsound are warnings so a
+# transitive dep going unmaintained does not block a release on its own.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Permissive licenses expected across the AWS SDK / tokio / rustls stack.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# ring bundles a BoringSSL-derived license blob; standard for the ring crate.
+name = "ring"
+allow = ["OpenSSL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Guard the hexagonal boundary at the dependency level: aws-lc-rs must never
+# reappear (we standardize on rustls + ring — see crates/aws/src/http_client.rs).
+deny = [
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

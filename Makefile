@@ -58,7 +58,39 @@ check: ## Fast type-check without producing binaries
 	$(CARGO) check $(LINT_FLAGS)
 
 .PHONY: ci
-ci: fmt-check clippy test ## Everything CI enforces: fmt + clippy + tests
+ci: fmt-check clippy test audit ## Everything CI enforces: fmt + clippy + tests + audit
+
+# ---- security & coverage ----------------------------------------------
+.PHONY: audit
+audit: ## Scan dependencies for RUSTSEC advisories (needs cargo-audit)
+	$(CARGO) audit
+
+.PHONY: deny
+deny: ## Check licenses, bans, advisories, sources (needs cargo-deny + deny.toml)
+	$(CARGO) deny check
+
+.PHONY: coverage
+coverage: ## Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-preview)
+	$(CARGO) llvm-cov $(TEST_FLAGS) --no-report
+	$(CARGO) llvm-cov report --html
+	$(CARGO) llvm-cov report --lcov --output-path lcov.info
+
+# ---- release (GoReleaser) ---------------------------------------------
+.PHONY: release-check
+release-check: ## Validate .goreleaser.yaml (needs goreleaser)
+	goreleaser check
+
+.PHONY: release-snapshot
+release-snapshot: ## Fast local dry-run: linux musl (arm64+amd64) + macOS (arm64) CLI binaries + archives, no images/signing
+	goreleaser release --snapshot --clean --skip=docker,sign
+
+# ---- toolchain ---------------------------------------------------------
+.PHONY: install-tools
+install-tools: ## Install every dev/release tool + rustup targets and components
+	$(CARGO) install cargo-lambda cargo-zigbuild cargo-audit cargo-deny cargo-llvm-cov cargo-edit cargo-outdated
+	go install github.com/goreleaser/goreleaser/v2@latest || echo "install goreleaser manually: https://goreleaser.com/install/"
+	rustup component add llvm-tools-preview
+	rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
 # ---- CLI convenience ---------------------------------------------------
 .PHONY: validate
