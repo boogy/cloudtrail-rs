@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-18
+last-dispatched: task-19
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -27,7 +27,7 @@ last-dispatched: task-18
 | 16 | Four Lambda binaries | 14, 15 | done | 463e8cf | line-by-line reviewed (orchestrator wrote it after the dispatched subagent hit a session limit with only lambda-s3 partial). All four bins strict init→run skeleton; s3/sns/eb return () + propagate Err, sqs returns batchItemFailures from BatchOutcome. Init-once deliverable test: 3× handle ⇒ compile once + fetch once. Golden-payload handler test per bin via real decoder. Feature isolation verified (lambda-s3 tree: 0 decode-sqs/sns/eb). Part D PASSED: forcing per-invocation recompile in ConfigStore broke init-once test (4 vs 1), reverted |
 | 17 | CLI | 14, 15 | done | 3bdbeb1 (base) + follow-on | base CLI (validate/test/filter single-file) via subagent. FOLLOW-ON done (orchestrator): `filter <source> <dest>` now auto-detects local-file / local-dir / `s3://` prefix on each side; single local file = one object, dir or s3:// prefix = batch with relative-path mirroring; gzip-faithful `.json.gz` output (canonical GZIP_META); zero-empty-writes preserved; +`S3ObjectStore::list_keys` (paginated, inherent method not on port) with mock test; +6th cli test `filter_directory_mirrors_relative_paths_and_skips_all_dropped`. Verified: full workspace tests green, clippy -D warnings clean, fmt clean |
 | 18 | MiniStack integration tests | 16 | done | c5677e6 | Sonnet subagent, orchestrator-verified. docker-compose.test.yml (ministack :4566) + crates/aws/tests/ministack.rs (2 #[ignore] tests: small→buffer, large 20k-rec→stream/multipart). Drives real Pipeline::handle via real S3ObjectStore/SsmConfigSource; path-style S3 via public from_client escape hatch (no src/ touched); exact decompressed-survivor byte assertions. +dev-deps: core[decode-s3], flate2. Verified: compiles + 2 ignored/0 run, clippy -D + fmt clean. NOT executed against a live container here (needs `docker compose -f docker-compose.test.yml up -d` then `cargo test --workspace -- --ignored`) |
-| 19 | Docs and examples | 18 | pending | — | |
+| 19 | Docs and examples | 18 | dispatched | — | Sonnet subagent: README (arch, 4 topologies, env table, IAM, cargo lambda build, dry-run rollout, SQS batch-failure warning, cold-start section, always-bucket note, YAML quoting trap) + document new `filter` folder/s3:// batch mode |
 
 `state` ∈ `pending` | `dispatched` | `done` | `blocked`.
 
