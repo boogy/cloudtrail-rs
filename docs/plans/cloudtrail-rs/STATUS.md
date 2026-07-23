@@ -4,7 +4,7 @@ Orchestrator state. See PLAN.md > "Durable state" for the resume protocol.
 Git is the authority: every task commits with subject `task-NN: `, so
 `git log --grep '^task-'` reconstructs progress if this file is stale.
 
-last-dispatched: task-06
+last-dispatched: task-12
 
 | task | name | deps | state | commit | note |
 |------|------|------|-------|--------|------|
@@ -14,13 +14,13 @@ last-dispatched: task-06
 | 03 | Rules: parse and validate | 02 | done | 96006f9 | canonical ruleset is **25** rules not 24 (plan error, corrected in 5c02999). `REGEX_SIZE_LIMIT` is `pub(crate)` in config/rules.rs; task-05 must reuse it |
 | 04 | Field path resolution | 02 | done | a5ad6e7 | |
 | 05 | Rule engine, linear | 03, 04 | done | ab784b7 | reuses REGEX_SIZE_LIMIT; within-rule matches sorted most-selective-first (AND order-independent). evaluate_linear is the permanent oracle for task-06 |
-| 06 | Rule index | 05 | dispatched | — | high design risk — orchestrator reviews diff line-by-line |
+| 06 | Rule index | 05 | done | 4563d68 | line-by-line reviewed: extraction conservative (bails on `(?`, requires `^…$`, one flat alt group max, `\w`/`\d` → always); 3/25 in always (AWS Config Recorder, IAM Session Renewals, Automated Tool Describe Ops). Part D check PASSED: dropping always-bucket broke corpus equivalence + always tests |
 | 07 | Settings | 02 | done | 0ebf734 | env-override via injected closure (no env mutation). `SETTINGS_URI` resolves `file://` only in core; s3/ssm deferred to task-16 (see SHARED note). `rules.uri` default is the example literal |
 | 08 | URI, FileConfigSource, ConfigStore, `prime()` | 07, 09 | done | 9b32336 | store.rs verified generic (no RuleSet/Engine refs). NOTE: persistent version() failure retries every get() (no backoff) — acceptable v1, fail-open serves cached rules. StaticConfigSource now in testing.rs |
 | 09 | Metrics and EMF | 02 | done | fecaeef | MetricSnapshot extended with 9 counters; increment API + EMF N+1-line-for-RuleDrops convention pinned in SHARED. testing.rs holds only RecordingSink (InMemoryStore/StaticConfigSource still owed by task-08/14) |
 | 10 | S3 and SNS decoders | 02 | done | 5397de1 | +percent-encoding dep. Part D `+`→space mutation spot-check PASSED (removed handling → test failed). shared S3 parse helper gated for both features so sns-only build carries no S3EventDecoder |
 | 11 | SQS and EventBridge decoders | 02, 07 | done | 196235d | reuses task-10 parse_s3_notification; SQS SNS-envelope unwrap self-contained (bare Notification, not Records[].Sns). EB field is `detail.event-version`. Part D verbatim-key mutation check PASSED |
-| 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | pending | — | |
+| 12 | Buffer processor | 06, 07, 09 (07 for the `Processing` settings struct) | dispatched | — | |
 | 13 | Stream processor | 12 | pending | — | |
 | 14 | Pipeline | 08, 11, 13 | pending | — | |
 | 15 | AWS adapters | 02 | done | 5c4c679 | ring-only verified (no aws-lc in tree); core still aws-free. Adapters: prod `new(&SdkConfig)`, test `from_client(Client)`; S3ObjectStore `with_multipart_part_bytes` override |
