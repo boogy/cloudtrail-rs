@@ -30,3 +30,26 @@ pub enum ConfigError {
     #[error("failed to parse config: {0}")]
     Parse(String),
 }
+
+/// The pipeline/process error type: what `buffer_run`/`stream_run`/
+/// `Pipeline::handle` return on failure. Carries a `StoreError` and a
+/// `ConfigError` without losing the `NotFound` distinction (Task 14
+/// dispatches `on_missing_object` off `CoreError::Store(StoreError::NotFound
+/// { .. })`), plus the data-error cases (`SHARED.md`: bad gzip, bad JSON, an
+/// object too large to buffer) that only arrive with the processors.
+#[derive(Debug, Error)]
+pub enum CoreError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error("failed to decompress gzip: {0}")]
+    Gzip(String),
+    #[error("failed to parse JSON: {0}")]
+    Json(String),
+    #[error(
+        "decompressed object exceeds max_object_bytes ({limit} bytes): buffer mode refuses to \
+         keep reading rather than risk OOM on an oversized or bomb-like object"
+    )]
+    ObjectTooLarge { limit: u64 },
+}

@@ -1,0 +1,7 @@
+//! Object-body record processing: decompress the source object, filter its
+//! records through the `Engine`, and produce (or, in stream mode, directly
+//! write) the survivors.
+
+mod buffer;
+
+pub use buffer::{Outcome, buffer_run};

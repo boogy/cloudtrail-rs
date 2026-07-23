@@ -13,6 +13,7 @@ pub mod filter;
 pub mod metrics;
 pub mod model;
 pub mod ports;
+pub mod process;
 
 #[cfg(feature = "testing")]
 pub mod testing;
