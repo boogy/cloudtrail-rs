@@ -835,6 +835,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "cloudtrail-rs-core",
+ "flate2",
  "tokio",
  "tracing",
 ]
