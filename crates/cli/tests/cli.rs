@@ -209,6 +209,80 @@ rules:
 }
 
 #[test]
+fn filter_directory_mirrors_relative_paths_and_skips_all_dropped() {
+    let rules_path = temp_path("filter-dir-rules");
+    std::fs::write(
+        &rules_path,
+        br#"
+version: 1.0.0
+rules:
+  - name: Drop Decrypt
+    matches:
+      - field_name: eventName
+        regex: "^Decrypt$"
+"#,
+    )
+    .unwrap();
+
+    let in_dir = temp_path("filter-dir-in");
+    let out_dir = temp_path("filter-dir-out");
+    std::fs::create_dir_all(in_dir.join("nested")).unwrap();
+
+    // Top-level object: one record survives.
+    std::fs::write(
+        in_dir.join("a.json.gz"),
+        gzip_bytes(br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#),
+    )
+    .unwrap();
+    // Nested object: all records dropped => no output file.
+    std::fs::write(
+        in_dir.join("nested/b.json.gz"),
+        gzip_bytes(br#"{"Records":[{"eventName":"Decrypt"}]}"#),
+    )
+    .unwrap();
+    // Non-candidate file: must be ignored entirely.
+    std::fs::write(in_dir.join("ignore.txt"), b"not a log").unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&in_dir)
+        .arg(&out_dir)
+        .arg("--rules")
+        .arg(&rules_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "filter must exit 0 on a directory, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Surviving object mirrored at the same relative path.
+    let written = std::fs::read(out_dir.join("a.json.gz")).expect("a.json.gz must be written");
+    let parsed: serde_json::Value = serde_json::from_slice(&gunzip(&written)).unwrap();
+    let names: Vec<&str> = parsed["Records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["eventName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["ConsoleLogin"]);
+
+    // All-dropped nested object: zero empty writes.
+    assert!(
+        !out_dir.join("nested/b.json.gz").exists(),
+        "all-dropped object must not be written"
+    );
+    // Non-candidate file never mirrored.
+    assert!(!out_dir.join("ignore.txt").exists());
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_dir_all(&in_dir).unwrap();
+    std::fs::remove_dir_all(&out_dir).unwrap();
+}
+
+#[test]
 fn test_command_reports_per_record_keep_drop_and_summary() {
     let rules_path = temp_path("test-cmd-rules");
     std::fs::write(

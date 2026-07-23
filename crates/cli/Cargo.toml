@@ -8,6 +8,7 @@ cloudtrail-rs-core = { path = "../core" }
 cloudtrail-rs-aws = { path = "../aws" }
 anyhow = "1"
 aws-config = { version = "1", default-features = false }
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde = { version = "1", features = ["derive"] }

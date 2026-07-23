@@ -46,6 +46,41 @@ impl S3ObjectStore {
         self.multipart_part_bytes = n;
         self
     }
+
+    /// Lists every object key under `prefix` in `bucket`, following
+    /// `ListObjectsV2` pagination to completion.
+    ///
+    /// Inherent rather than part of the `ObjectStore` port: only the CLI's
+    /// batch/backfill mode enumerates a bucket. The Lambda hot path is handed
+    /// exact keys by its event decoder and never lists, so keeping this off
+    /// the trait avoids burdening `InMemoryStore` and every future adapter
+    /// with a method they do not need.
+    pub async fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let mut keys = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let out = req
+                .send()
+                .await
+                .map_err(|e| StoreError::Backend(format!("{}", DisplayErrorContext(e))))?;
+            for obj in out.contents() {
+                if let Some(k) = obj.key() {
+                    keys.push(k.to_string());
+                }
+            }
+            match out.next_continuation_token() {
+                Some(token) if out.is_truncated() == Some(true) => {
+                    continuation = Some(token.to_string());
+                }
+                _ => break,
+            }
+        }
+        Ok(keys)
+    }
 }
 
 #[async_trait]
@@ -380,6 +415,44 @@ mod tests {
                 None => std::task::Poll::Ready(Err(std::io::Error::other("reader exploded"))),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn list_keys_follows_pagination_across_pages() {
+        use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+        use aws_sdk_s3::types::Object;
+
+        let page1 = mock!(Client::list_objects_v2)
+            .match_requests(|r| {
+                r.bucket() == Some("b")
+                    && r.prefix() == Some("logs/")
+                    && r.continuation_token().is_none()
+            })
+            .then_output(|| {
+                ListObjectsV2Output::builder()
+                    .contents(Object::builder().key("logs/a.json.gz").build())
+                    .contents(Object::builder().key("logs/b.json.gz").build())
+                    .is_truncated(true)
+                    .next_continuation_token("tok-2")
+                    .build()
+            });
+        let page2 = mock!(Client::list_objects_v2)
+            .match_requests(|r| r.continuation_token() == Some("tok-2"))
+            .then_output(|| {
+                ListObjectsV2Output::builder()
+                    .contents(Object::builder().key("logs/c.json.gz").build())
+                    .is_truncated(false)
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&page1, &page2]);
+        let store = S3ObjectStore::from_client(client);
+
+        let keys = store.list_keys("b", "logs/").await.unwrap();
+
+        assert_eq!(
+            keys,
+            vec!["logs/a.json.gz", "logs/b.json.gz", "logs/c.json.gz"]
+        );
     }
 
     #[tokio::test]
