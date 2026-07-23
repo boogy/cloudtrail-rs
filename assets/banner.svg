@@ -1,0 +1,74 @@
+<svg width="900" height="300" viewBox="0 0 900 300" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cloudtrail-rs: filter AWS CloudTrail logs in flight before they reach your SIEM">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="900" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#111C2E"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="390" y1="150" x2="510" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F5A623"/>
+      <stop offset="1" stop-color="#E8743B"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L6 3 L0 6 Z" fill="#8B98A5"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L6 3 L0 6 Z" fill="#3FB950"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="898" height="298" rx="18" fill="url(#bg)" stroke="#22304A" stroke-width="2"/>
+
+  <!-- title -->
+  <text x="450" y="52" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="38" font-weight="700" fill="#E6EDF3">cloudtrail-rs</text>
+  <text x="450" y="80" text-anchor="middle" font-family="ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" fill="#8B98A5">Filter AWS CloudTrail logs in flight — before they reach your SIEM</text>
+
+  <!-- source cylinder -->
+  <g>
+    <path d="M55 170 v52 a35 11 0 0 0 70 0 v-52" fill="#152238" stroke="#58A6FF" stroke-width="2"/>
+    <ellipse cx="90" cy="170" rx="35" ry="11" fill="#1E304C" stroke="#58A6FF" stroke-width="2"/>
+    <text x="90" y="256" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#8B98A5">CloudTrail</text>
+    <text x="90" y="272" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#8B98A5">S3 bucket</text>
+  </g>
+
+  <!-- noisy records in -->
+  <g>
+    <rect x="160" y="160" width="30" height="18" rx="3" fill="#F85149" opacity="0.9"/>
+    <rect x="196" y="160" width="30" height="18" rx="3" fill="#58A6FF" opacity="0.9"/>
+    <rect x="160" y="184" width="30" height="18" rx="3" fill="#58A6FF" opacity="0.9"/>
+    <rect x="196" y="184" width="30" height="18" rx="3" fill="#F85149" opacity="0.9"/>
+    <rect x="160" y="208" width="30" height="18" rx="3" fill="#58A6FF" opacity="0.9"/>
+    <rect x="196" y="208" width="30" height="18" rx="3" fill="#F85149" opacity="0.9"/>
+    <line x1="240" y1="193" x2="374" y2="193" stroke="#8B98A5" stroke-width="2" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- filter / rules engine -->
+  <g>
+    <text x="450" y="132" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="13" font-weight="600" fill="#F5A623">rules engine</text>
+    <rect x="382" y="146" width="136" height="94" rx="14" fill="#152238" stroke="url(#rust)" stroke-width="2.5"/>
+    <path d="M414 170 L486 170 L461 198 L461 218 L439 226 L439 198 Z" fill="url(#rust)"/>
+  </g>
+
+  <!-- dropped noise (below the box, clear of all labels) -->
+  <g>
+    <line x1="450" y1="240" x2="450" y2="258" stroke="#F85149" stroke-width="2" stroke-dasharray="4 4"/>
+    <rect x="418" y="262" width="26" height="15" rx="3" fill="#F85149" opacity="0.55"/>
+    <rect x="450" y="262" width="26" height="15" rx="3" fill="#F85149" opacity="0.4"/>
+    <text x="486" y="274" text-anchor="start" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#6E7B8A">dropped (noise)</text>
+  </g>
+
+  <!-- survivors out -->
+  <g>
+    <rect x="558" y="158" width="30" height="18" rx="3" fill="#3FB950" opacity="0.95"/>
+    <rect x="594" y="158" width="30" height="18" rx="3" fill="#3FB950" opacity="0.95"/>
+    <rect x="630" y="158" width="30" height="18" rx="3" fill="#3FB950" opacity="0.95"/>
+    <line x1="524" y1="193" x2="752" y2="193" stroke="#3FB950" stroke-width="2" marker-end="url(#arrowGreen)"/>
+  </g>
+
+  <!-- destination cylinder -->
+  <g>
+    <path d="M755 170 v52 a35 11 0 0 0 70 0 v-52" fill="#152238" stroke="#3FB950" stroke-width="2"/>
+    <ellipse cx="790" cy="170" rx="35" ry="11" fill="#1B3527" stroke="#3FB950" stroke-width="2"/>
+    <text x="790" y="256" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#8B98A5">Destination</text>
+    <text x="790" y="272" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#8B98A5">bucket · SIEM</text>
+  </g>
+</svg>
