@@ -1,5 +1,5 @@
-# GoReleaser assembles its own dist/ build contexts and COPYs a single static
-# binary — the Rust build tree must never enter a Docker context.
+# The release workflow assembles a minimal dist/ build context and COPYs a single
+# static binary — the Rust build tree must never enter a Docker context.
 target/
 dist/
 .git/

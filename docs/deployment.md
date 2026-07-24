@@ -66,14 +66,14 @@ cargo build --release -p cloudtrail-rs
 ```
 
 The release pipeline builds both musl arches (`aarch64` and `x86_64`) for all
-four lambdas and the CLI via GoReleaser — see
+four lambdas and the CLI on native-arch CI runners — see
 [development.md](development.md#release-process).
 
 ## Build: container images
 
 The release pipeline also publishes minimal container images (one per module) to
 GHCR and Docker Hub. Because Rust's `lambda_runtime` crate speaks the Lambda
-Runtime API directly, the images use `gcr.io/distroless/static-debian12` (~2 MB)
+Runtime API directly, the images use `gcr.io/distroless/static-debian13` (~2 MB)
 rather than the ~40 MB `public.ecr.aws/lambda/provided:al2023` base — a static
 musl `bootstrap` runs on distroless/static (which ships CA certs for S3/SSM TLS;
 the Runtime API endpoint is localhost HTTP). Final images are typically <10 MB:
@@ -84,15 +84,16 @@ base + one stripped static binary.
 docker pull ghcr.io/boogy/cloudtrail-rs:lambda-s3-latest
 ```
 
-Images are published for `lambda-s3`, `lambda-sns`, `lambda-sqs`,
-`lambda-eventbridge`, and the `cli`. Tags: `<module>-<version>` (immutable) and
-`<module>-latest` (moved only on non-prerelease tags).
+Images are published for `lambda-s3`, `lambda-sns`, `lambda-sqs`, and
+`lambda-eventbridge`. Tags: `<module>-<version>` (immutable) and
+`<module>-latest` (moved only on non-prerelease tags). The CLI ships as a
+`tar.gz` archive on the GitHub Release and via the Homebrew cask, not as an image.
 
 ## Deploying a container image to Lambda
 
 ```mermaid
 flowchart LR
-    TAG["git tag v1.2.3"] --> GR["GoReleaser (CI)"]
+    TAG["git tag v1.2.3"] --> GR["Release workflow (CI)"]
     GR --> IMG["multi-arch image<br/>ghcr.io/boogy/cloudtrail-rs:lambda-s3-1.2.3"]
     IMG --> FN["Lambda function<br/>PackageType: Image<br/>arch: arm64 | x86_64"]
     FN -.pulls matching arch.-> IMG

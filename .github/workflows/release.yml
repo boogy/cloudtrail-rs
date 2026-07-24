@@ -12,12 +12,137 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Build every static-musl binary on its NATIVE-arch runner — no zig, no
+  # cross-linker. x86_64 builds on ubuntu-latest, aarch64 on the GitHub-hosted
+  # arm64 runner. Each job produces:
+  #   - release archives (lambda zips + CLI tar.gz) for the GitHub Release
+  #   - raw `bootstrap` binaries laid out for the multi-arch container build
+  # The 4 lambda crates all emit a binary named `bootstrap`, so they are built
+  # one at a time and the artifact copied out before the next overwrites it.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      # musl-gcc provides the target C toolchain for the `ring` C sources. The
+      # native-arch build needs no cross-linker: rustc links musl self-contained.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build binaries
+        env:
+          # Point ring's cc-rs build at musl-gcc for this target.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          arch='${{ matrix.arch }}'
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist bins
+          for m in s3 sns sqs eventbridge; do
+            cargo build --locked --release --target "$target" -p "cloudtrail-rs-lambda-$m"
+            install -Dm755 "target/$target/release/bootstrap" "bins/lambda-$m/bootstrap"
+            zip -q -j "dist/lambda-$m-$version-$arch.zip" "bins/lambda-$m/bootstrap"
+          done
+          cargo build --locked --release --target "$target" -p cloudtrail-rs
+          install -Dm755 "target/$target/release/cloudtrail-rs" "bins/cli/cloudtrail-rs"
+          tar -czf "dist/cli-$version-linux-$arch.tar.gz" -C bins/cli cloudtrail-rs
+          ls -l dist bins/lambda-*
+
+      - name: Upload archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: archives-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload binaries (for images)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bins-${{ matrix.arch }}
+          path: bins/lambda-*/bootstrap
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS (Apple Silicon) CLI binary for the Homebrew cask, built on a NATIVE
+  # macOS runner — real Xcode SDK, so `Security`/`CoreFoundation` link cleanly.
+  # This is the correct replacement for the old zigbuild darwin cross-compile
+  # that failed for lack of a macOS SDK. Intel Macs are not targeted.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build darwin arm64 (CLI)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-aarch64-apple-darwin
+
+      - name: Build CLI
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo build --locked --release --target aarch64-apple-darwin -p cloudtrail-rs
+          mkdir -p dist bins/cli-darwin
+          install -m755 target/aarch64-apple-darwin/release/cloudtrail-rs bins/cli-darwin/cloudtrail-rs
+          tar -czf "dist/cli-$version-darwin-arm64.tar.gz" -C bins/cli-darwin cloudtrail-rs
+          ls -l dist
+
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: archives-darwin
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Assemble the GitHub Release from every arch (linux musl + darwin): one
+  # checksums.txt over all archives, cosign keyless signature of it, then the
+  # release itself. Provenance is attested over the archives + checksums.
+  # ---------------------------------------------------------------------------
   release:
-    name: Release
+    name: GitHub Release
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release + upload artifacts
-      packages: write # push images to GHCR
       id-token: write # cosign keyless + provenance OIDC
       attestations: write # actions/attest-build-provenance
     steps:
@@ -26,33 +151,121 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          toolchain: stable
-          cache: false
-
-      # Cache the cargo registry + cross-compile target dirs across release
-      # runs. First tagged release is cold; subsequent ones reuse the compiled
-      # AWS-SDK dependency tree per target instead of rebuilding from scratch.
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: goreleaser
-
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
-        with:
-          tool: cargo-zigbuild
+          pattern: archives-*
+          merge-multiple: true
+          path: dist
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
+      - name: Checksums + signature
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum lambda-*.zip cli-*.tar.gz > checksums.txt
+          cat checksums.txt
+          cosign sign-blob \
+            --output-signature=checksums.txt.sig \
+            --output-certificate=checksums.txt.pem \
+            --yes checksums.txt
+
+      # generate_release_notes builds GitHub's auto changelog (merged PRs since the
+      # previous tag, new contributors, a Full Changelog compare link) — the
+      # equivalent of goreleaser's `changelog: use: github`. prerelease is set from
+      # a '-' in the tag (v1.2.3-rc.1), matching goreleaser's `prerelease: auto`.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: dist/*
+
+      - name: Attest build provenance for archives
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/checksums.txt
+
+  # ---------------------------------------------------------------------------
+  # One multi-arch container image per Lambda module. buildx stitches the two
+  # arches from the pre-built binaries via a COPY-only Dockerfile (no QEMU),
+  # pushes to GHCR + Docker Hub, and cosign signs the manifest by digest.
+  # ---------------------------------------------------------------------------
+  images:
+    name: Image ${{ matrix.module }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push images to GHCR
+      id-token: write # cosign keyless
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [s3, sns, sqs, eventbridge]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bins-*
+          path: bins
+
+      - name: Assemble build context + tags
+        id: ctx
+        env:
+          GHCR_NS: ${{ github.repository_owner }}
+          DOCKERHUB_NS: ${{ secrets.DOCKER_HUB_USER }}
+        run: |
+          set -euo pipefail
+          m='${{ matrix.module }}'
+          version="${GITHUB_REF_NAME#v}"
+          ghcr_ns="${GHCR_NS,,}"
+
+          # Derive the platform set from whatever bins-<arch> artifacts the build
+          # matrix produced (each downloads to bins/bins-<arch>/). Add an arch to
+          # the build matrix and it flows through here with no edits: one linux/<arch>
+          # context dir per artifact, and the buildx --platform list built to match.
+          mkdir -p ctx
+          cp docker/Dockerfile.lambda ctx/Dockerfile
+          platforms=""
+          for d in bins/bins-*/; do
+            arch="$(basename "$d")"; arch="${arch#bins-}"
+            mkdir -p "ctx/linux/$arch"
+            cp "$d/lambda-$m/bootstrap" "ctx/linux/$arch/bootstrap"
+            platforms="${platforms:+$platforms,}linux/$arch"
+          done
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "tags<<EOF"
+            echo "ghcr.io/${ghcr_ns}/cloudtrail-rs:lambda-${m}-${version}"
+            echo "docker.io/${DOCKERHUB_NS}/cloudtrail-rs:lambda-${m}-${version}"
+            # -latest only on a non-prerelease tag (no '-' in the version).
+            if [[ "$version" != *-* ]]; then
+              echo "ghcr.io/${ghcr_ns}/cloudtrail-rs:lambda-${m}-latest"
+              echo "docker.io/${DOCKERHUB_NS}/cloudtrail-rs:lambda-${m}-latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "ghcr_image=ghcr.io/${ghcr_ns}/cloudtrail-rs" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_image=docker.io/${DOCKERHUB_NS}/cloudtrail-rs" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GHCR
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
@@ -68,30 +281,36 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USER }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
-          version: "~> v2"
-          args: release --clean
+          context: ctx
+          file: ctx/Dockerfile
+          platforms: ${{ steps.ctx.outputs.platforms }}
+          push: true
+          provenance: false
+          tags: ${{ steps.ctx.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/boogy/cloudtrail-rs
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Sign manifest (cosign keyless)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_NAMESPACE: ${{ github.repository_owner }}
-          DOCKERHUB_NAMESPACE: ${{ secrets.DOCKER_HUB_USER }}
-          # PAT with repo scope on the Homebrew tap repo — the default
-          # GITHUB_TOKEN can't push to a different repository.
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${{ steps.ctx.outputs.ghcr_image }}@${DIGEST}"
+          cosign sign --yes "${{ steps.ctx.outputs.dockerhub_image }}@${DIGEST}"
 
-      - name: Attest build provenance for archives
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: |
-            dist/*.zip
-            dist/*.tar.gz
-            dist/checksums.txt
-
+  # ---------------------------------------------------------------------------
+  # Trivy-scan each published module image; fail on fixable HIGH/CRITICAL.
+  # ---------------------------------------------------------------------------
   scan:
     name: Scan images
-    needs: release
+    needs: images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -112,7 +331,8 @@ jobs:
         id: ref
         run: |
           version="${GITHUB_REF_NAME#v}"
-          echo "image=ghcr.io/${{ github.repository_owner }}/cloudtrail-rs:${{ matrix.module }}-${version}" >> "$GITHUB_OUTPUT"
+          owner="${{ github.repository_owner }}"
+          echo "image=ghcr.io/${owner,,}/cloudtrail-rs:${{ matrix.module }}-${version}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for image to be pullable
@@ -150,3 +370,71 @@ jobs:
             echo "  --image-uri ${{ steps.ref.outputs.image }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Publish the CLI Homebrew cask to github.com/<owner>/homebrew-tap, enabling
+  #   brew install <owner>/tap/cloudtrail-rs
+  # Renders the cask from the darwin archive built above and pushes it with a PAT
+  # (HOMEBREW_TAP_TOKEN, repo scope on the tap) — the default GITHUB_TOKEN can't
+  # push to another repo. Skipped on prereleases so a `-rc` never moves the tap.
+  # ---------------------------------------------------------------------------
+  homebrew:
+    name: Homebrew cask
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download darwin archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: archives-darwin
+          path: dist
+
+      - name: Checkout tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render + push cask
+        run: |
+          set -euo pipefail
+          owner='${{ github.repository_owner }}'
+          version="${GITHUB_REF_NAME#v}"
+          tarball="dist/cli-${version}-darwin-arm64.tar.gz"
+          sha="$(sha256sum "$tarball" | awk '{print $1}')"
+
+          mkdir -p tap/Casks
+          cat > tap/Casks/cloudtrail-rs.rb <<EOF
+          cask "cloudtrail-rs" do
+            version "$version"
+            sha256 "$sha"
+
+            url "https://github.com/$owner/cloudtrail-rs/releases/download/v#{version}/cli-#{version}-darwin-arm64.tar.gz"
+            name "cloudtrail-rs"
+            desc "Local tooling for cloudtrail-rs exclusion rules"
+            homepage "https://github.com/$owner/cloudtrail-rs"
+
+            depends_on arch: :arm64
+
+            binary "cloudtrail-rs"
+
+            # Apple quarantines unsigned binaries downloaded from the internet.
+            postflight do
+              system_command "/usr/bin/xattr",
+                             args: ["-dr", "com.apple.quarantine", "#{staged_path}/cloudtrail-rs"]
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/cloudtrail-rs.rb
+          if git diff --cached --quiet; then
+            echo "cask already up to date for $version"
+          else
+            git commit -m "cloudtrail-rs $version"
+            git push
+          fi

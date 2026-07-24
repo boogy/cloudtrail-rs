@@ -6,6 +6,7 @@ CARGO        ?= cargo
 LAMBDA_ARCH  ?= --arm64
 COMPOSE_FILE := docker-compose.test.yml
 CLI_PKG      := cloudtrail-rs
+MUSL_TARGET  ?= x86_64-unknown-linux-musl
 RULES_URI    := file://$(CURDIR)/examples/rules.example.yaml
 SAMPLE_GZ    := crates/core/tests/fixtures/sample.json.gz
 
@@ -33,7 +34,7 @@ release: ## Optimized release build (fat LTO, stripped) of every crate
 	$(CARGO) build --workspace --release
 
 .PHONY: lambda-build
-lambda-build: ## Cross-compile the four Lambda bootstrap binaries (needs cargo-lambda + zig)
+lambda-build: ## Cross-compile the four Lambda bootstrap binaries (needs cargo-lambda)
 	$(CARGO) lambda build --release $(LAMBDA_ARCH)
 
 # ---- test & lint -------------------------------------------------------
@@ -75,20 +76,19 @@ coverage: ## Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-
 	$(CARGO) llvm-cov report --html
 	$(CARGO) llvm-cov report --lcov --output-path lcov.info
 
-# ---- release (GoReleaser) ---------------------------------------------
-.PHONY: release-check
-release-check: ## Validate .goreleaser.yaml (needs goreleaser)
-	goreleaser check
-
-.PHONY: release-snapshot
-release-snapshot: ## Fast local dry-run: linux musl (arm64+amd64) + macOS (arm64) CLI binaries + archives, no images/signing
-	goreleaser release --snapshot --clean --skip=docker,sign
+# ---- release ----------------------------------------------------------
+# The release pipeline lives entirely in .github/workflows/release.yml: native
+# per-arch static-musl builds (no zig/goreleaser), archives + checksums, the
+# GitHub Release, multi-arch Lambda images, and cosign signatures.
+.PHONY: release-musl
+release-musl: ## Local static-musl release build of the whole workspace for one target (needs musl-tools + rustup target)
+	CC_x86_64_unknown_linux_musl=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc \
+		$(CARGO) build --workspace --release --target $(MUSL_TARGET)
 
 # ---- toolchain ---------------------------------------------------------
 .PHONY: install-tools
 install-tools: ## Install every dev/release tool + rustup targets and components
-	$(CARGO) install cargo-lambda cargo-zigbuild cargo-audit cargo-deny cargo-llvm-cov cargo-edit cargo-outdated
-	go install github.com/goreleaser/goreleaser/v2@latest || echo "install goreleaser manually: https://goreleaser.com/install/"
+	$(CARGO) install cargo-lambda cargo-audit cargo-deny cargo-llvm-cov cargo-edit cargo-outdated
 	rustup component add llvm-tools-preview
 	rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 

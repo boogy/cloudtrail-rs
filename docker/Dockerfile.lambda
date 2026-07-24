@@ -3,7 +3,7 @@
 # Rust's lambda_runtime crate speaks the Lambda Runtime API directly, so we do
 # NOT need the ~40MB public.ecr.aws/lambda/provided:al2023 base. A static-musl
 # `bootstrap` runs on distroless/static (~2MB, ships CA certs for S3/SSM TLS;
-# the Runtime API endpoint is localhost HTTP). GoReleaser (dockers_v2) lays the
+# the Runtime API endpoint is localhost HTTP). The release workflow lays the
 # per-arch static binary under $TARGETPLATFORM in the build context — this is a
 # COPY-only stage, so buildx needs no QEMU.
 FROM gcr.io/distroless/static-debian13:latest@sha256:9197324ba51d9cd071af8505989365c006adf9d6d2067eada25aef00abbb5278

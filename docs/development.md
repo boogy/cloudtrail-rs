@@ -34,7 +34,7 @@ make install-tools
 | --------------------------------- | ------------------------------------------------------------------------------ |
 | `build`                           | Debug build of the whole workspace.                                            |
 | `release`                         | Optimized release build (fat LTO, stripped) of every crate.                    |
-| `lambda-build`                    | Cross-compile the four Lambda `bootstrap` binaries (needs cargo-lambda + zig). |
+| `lambda-build`                    | Cross-compile the four Lambda `bootstrap` binaries (needs cargo-lambda).        |
 | `test`                            | Run the full test suite (all features).                                        |
 | `clippy`                          | Lint with clippy, warnings as errors.                                          |
 | `fmt` / `fmt-check`               | Format in place / verify formatting without writing.                           |
@@ -43,8 +43,7 @@ make install-tools
 | `audit`                           | Scan dependencies for RUSTSEC advisories (needs cargo-audit).                  |
 | `deny`                            | Check licenses, bans, advisories, sources via `deny.toml` (needs cargo-deny).  |
 | `coverage`                        | Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-preview).   |
-| `release-check`                   | Validate `.goreleaser.yaml` (needs goreleaser).                                |
-| `release-snapshot`                | Full local dry-run: binaries, archives, images — nothing pushed.               |
+| `release-musl`                    | Local static-musl release build of the whole workspace for one target.         |
 | `validate`                        | Validate the example ruleset (prints always-bucket warnings).                  |
 | `sample`                          | Show KEEP/DROP breakdown for the sample fixture.                               |
 | `ministack-up` / `ministack-down` | Start / stop the local S3/SSM stack on `:4566`.                                |
@@ -73,10 +72,10 @@ cargo test --workspace -- --ignored
 - **fmt** — `cargo fmt --check`.
 - **clippy** — `cargo clippy … -D warnings`.
 - **test** — `cargo test --workspace --all-features` with a coverage summary.
-- **build** — native `cargo build --workspace --release` on PRs (fast, proves
-  compilation); the **full `goreleaser release --snapshot` cross-build runs only
-  on push-to-main**, which is where the musl / `ring`-vs-`aws-lc-rs` breakage
-  surfaces.
+- **build** — static-musl `cargo build --workspace --release` on both arches
+  (`x86_64` on `ubuntu-latest`, `aarch64` on the GitHub-hosted arm64 runner),
+  the real release artifact path — no zig, no cross-linker. This is where the
+  musl / `ring`-vs-`aws-lc-rs` breakage surfaces.
 - **security** — `cargo audit` + `cargo deny check` + Trivy filesystem scan
   (advisory, `continue-on-error`).
 
@@ -86,60 +85,80 @@ on push/PR/weekly. `cargo-audit`/`cargo-deny` in CI are the reliable backstop.
 ## Release process
 
 Cut a `v*` tag; everything else is automated by
-[`.github/workflows/release.yml`](../.github/workflows/release.yml), driven by a
-single [`.goreleaser.yaml`](../.goreleaser.yaml).
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub
+Actions, no goreleaser and no zig.
 
 ```mermaid
 flowchart TD
-    TAG["git tag v1.2.3<br/>git push --tags"] --> REL["release job"]
-    REL --> GR["goreleaser release --clean<br/>(Rust builder, cargo zigbuild)"]
-    GR --> BINS["4 lambda bootstrap zips<br/>+ CLI archives<br/>(aarch64 & x86_64 musl)"]
-    GR --> SUMS["checksums.txt"]
-    GR --> GH["GitHub Release<br/>(prerelease auto-detected from '-')"]
-    GR --> IMGS["multi-arch images →<br/>GHCR + Docker Hub<br/>(docker_manifests)"]
-    GR --> SIGN["cosign keyless signatures<br/>(docker_signs + signs)"]
-    BINS --> ATT["attest-build-provenance<br/>over dist/*.zip, *.tar.gz, checksums.txt"]
-    IMGS --> SCAN["scan job (needs: release)<br/>Trivy per module image,<br/>fail on HIGH/CRITICAL"]
+    TAG["git tag v1.2.3<br/>git push --tags"] --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
+    TAG --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
+    B --> BINS["4 lambda bootstrap zips<br/>+ CLI tar.gz<br/>(aarch64 & x86_64 musl)"]
+    B --> RAW["raw bootstrap binaries<br/>(artifacts, for images)"]
+    BM --> DARWIN["CLI darwin tar.gz"]
+    BINS --> REL["release job"]
+    DARWIN --> REL
+    REL --> SUMS["checksums.txt + cosign sig"]
+    REL --> GH["GitHub Release<br/>(prerelease auto-detected from '-')"]
+    REL --> ATT["attest-build-provenance<br/>over dist/*.zip, *.tar.gz, checksums.txt"]
+    REL --> BREW["homebrew job<br/>push CLI cask → homebrew-tap<br/>(skipped on prerelease)"]
+    RAW --> IMG["images job (per module)<br/>buildx multi-arch → GHCR + Docker Hub<br/>+ cosign manifest signature"]
+    IMG --> SCAN["scan job (needs: images)<br/>Trivy per module image,<br/>fail on HIGH/CRITICAL"]
 ```
 
 Details:
 
-- **Builder** — GoReleaser's Rust builder (`builder: rust`, `command: zigbuild`,
-  v2.5+) compiles each declared target into its own `dist/` path and auto-runs
-  `rustup target add`. One toolchain for lambdas _and_ CLI — all static-musl; the
-  4 lambdas set `binary: bootstrap`, the CLI keeps its name.
-- **Arches** — `aarch64-unknown-linux-musl` + `x86_64-unknown-linux-musl`, one
-  `targets:` list driving binaries, zips, and images so arch coverage can never
-  drift.
-- **Images** — one image per module × arch from COPY-only Dockerfiles on
-  `gcr.io/distroless/static-debian12`; `docker_manifests` stitch the two arches
-  into `<module>-<version>` and `<module>-latest` (latest only on non-prerelease).
-- **Prerelease** — tag pattern `v*` also matches `v*-rc.N`; GoReleaser marks the
-  GH release `prerelease` from the `-` and guards `<module>-latest` behind
-  non-prerelease.
-- **Supply chain** — cosign keyless (`docker_signs` + `signs`, needs
-  `id-token: write`) for images and checksums; `attest-build-provenance` for the
-  archive artifacts; Trivy scans each module image and fails on HIGH/CRITICAL.
+- **build** — a 2-entry matrix builds every static-musl binary on its **native-arch
+  runner** (`x86_64-unknown-linux-musl` on `ubuntu-latest`,
+  `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`). No cross-linker: `musl-tools`
+  supplies `musl-gcc` for `ring`'s C sources and rustc links musl self-contained.
+  The 4 lambda crates each emit a `bootstrap` binary, so they build one at a time
+  and the artifact is copied out before the next overwrites it. Uploads the release
+  archives and the raw per-arch binaries.
+- **build-macos** — the CLI's Apple Silicon (`aarch64-apple-darwin`) binary for the
+  Homebrew cask, built on a **native `macos-14` runner** so `Security`/`CoreFoundation`
+  link against the real Xcode SDK. This replaces the old zigbuild darwin
+  cross-compile that failed for lack of a macOS SDK. Intel Macs are not targeted.
+- **Arches** — `aarch64-unknown-linux-musl` + `x86_64-unknown-linux-musl` for all
+  four lambdas and the CLI, plus `aarch64-apple-darwin` for the CLI (Homebrew only).
+- **release** — merges every arch's archives (linux musl + darwin), writes one
+  `checksums.txt`, cosign
+  keyless `sign-blob`s it, then `softprops/action-gh-release` creates the GitHub
+  Release with auto-generated notes (merged PRs since the previous tag + a Full
+  Changelog link, like goreleaser's `changelog: use: github`); `prerelease` is set
+  when the tag contains `-`. Provenance is attested over the archives + checksums.
+- **images** — one multi-arch image per module. `docker buildx` stitches both
+  arches from the pre-built binaries via the COPY-only
+  [`docker/Dockerfile.lambda`](../docker/Dockerfile.lambda) on
+  `gcr.io/distroless/static-debian13` (no QEMU), pushes `<module>-<version>` and
+  `<module>-latest` (latest only on non-prerelease) to GHCR + Docker Hub, and cosign
+  signs the manifest by digest.
+- **homebrew** — renders the CLI cask from the darwin archive and pushes it to
+  `github.com/<owner>/homebrew-tap` (`brew install <owner>/tap/cloudtrail-rs`), using
+  the `HOMEBREW_TAP_TOKEN` PAT since the default `GITHUB_TOKEN` can't push to another
+  repo. Skipped on prereleases so an `-rc` tag never moves the tap.
+- **Supply chain** — cosign keyless (needs `id-token: write`) for the checksums and
+  the image manifests; `attest-build-provenance` for the archive artifacts; Trivy
+  scans each module image and fails on HIGH/CRITICAL.
 
-Dry-run the whole thing locally before tagging:
+Dry-run a release build locally before tagging (per target):
 
 ```sh
-make release-check       # goreleaser check
-make release-snapshot    # builds binaries/archives/images locally, pushes nothing
+rustup target add x86_64-unknown-linux-musl   # once
+make release-musl                             # MUSL_TARGET overrides the target
 ```
 
 ### Docker Hub namespace
 
-The Docker Hub namespace is assumed to be `boogy` (the GitHub owner), overridable
-via an env in `.goreleaser.yaml`. GHCR uses `${{ github.repository_owner }}` so a
-fork stays correct.
+GHCR uses `${{ github.repository_owner }}` (lowercased) so a fork stays correct.
+The Docker Hub namespace comes from the `DOCKER_HUB_USER` secret.
 
 ## Required repo secrets
 
-| Secret             | Purpose                              |
-| ------------------ | ------------------------------------ |
-| `DOCKER_HUB_USER`  | Docker Hub login for pushing images. |
-| `DOCKER_HUB_TOKEN` | Docker Hub access token.             |
+| Secret               | Purpose                                                     |
+| -------------------- | ---------------------------------------------------------- |
+| `DOCKER_HUB_USER`    | Docker Hub login + namespace for pushing images.           |
+| `DOCKER_HUB_TOKEN`   | Docker Hub access token.                                   |
+| `HOMEBREW_TAP_TOKEN` | PAT (repo scope on `homebrew-tap`) to push the CLI cask.   |
 
 GHCR needs no extra secret beyond the automatic `GITHUB_TOKEN`. Cosign keyless
 signing and build-provenance attestation use the workflow's OIDC identity
