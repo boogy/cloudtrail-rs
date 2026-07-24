@@ -18,8 +18,13 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  fmt:
-    name: Format
+  # fmt + clippy share one runner: fmt is a no-compile check, so folding it in
+  # here costs ~2s and saves a whole runner's checkout + toolchain install. The
+  # heavier jobs (test, integration, build) stay separate — they benefit more
+  # from parallelism than from a shared checkout, and test's coverage build
+  # shares no artifacts with clippy anyway.
+  lint:
+    name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,22 +33,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
-          components: rustfmt
-          cache: false
+          components: rustfmt, clippy
       - name: cargo fmt --check
         run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          toolchain: stable
-          components: clippy
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
