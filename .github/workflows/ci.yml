@@ -120,11 +120,15 @@ jobs:
       # where the musl / ring-vs-aws-lc-rs breakage surfaces (see docs/deployment.md).
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # testkit is dev-only scaffolding (a dev-dependency everywhere, never linked
+      # into a shipped binary) — exclude it so the artifact build doesn't compile
+      # test code. Its heavy deps are already built for the real crates, so this
+      # is about correctness, not speed.
       - name: Cross-target release build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --release --exclude cloudtrail-rs-testkit --target ${{ matrix.target }}
 
   security:
     name: Security

@@ -69,9 +69,12 @@ cargo test --workspace -- --ignored
 
 `.github/workflows/ci.yml` runs on every PR and push to `main`. Parallel jobs:
 
-- **fmt** — `cargo fmt --check`.
-- **clippy** — `cargo clippy … -D warnings`.
-- **test** — `cargo test --workspace --all-features` with a coverage summary.
+- **lint** — `cargo fmt --check` + `cargo clippy … -D warnings` on one runner.
+- **test** — one instrumented `cargo llvm-cov` job that counts BOTH unit and
+  MiniStack coverage: it starts MiniStack, runs two `--no-report` passes (unit,
+  then `-- --ignored`), and merges a coverage summary (testkit scaffolding
+  excluded). The spawned `bootstrap-<mod>` bins are instrumented, so the lambda
+  `main.rs` roots and the ring HTTP client count instead of reading as 0%.
 - **build** — static-musl `cargo build --workspace --release` on both arches
   (`x86_64` on `ubuntu-latest`, `aarch64` on the GitHub-hosted arm64 runner),
   the real release artifact path — no zig, no cross-linker. This is where the
