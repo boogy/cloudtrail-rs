@@ -39,8 +39,18 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # Unit + MiniStack tests share one instrumented job so BOTH count toward
+  # coverage. Two `--no-report` passes accumulate profile data that a final
+  # `report` merges: the second pass runs the #[ignore]d MiniStack + cold-start
+  # tests (crates/aws/tests/ministack.rs, crates/lambda-*/tests/cold_start.rs)
+  # against the container on :4566. cargo-llvm-cov instruments the spawned
+  # `bootstrap-<mod>` bins too, so the four lambda main.rs composition roots and
+  # the ring HTTP client are covered rather than reading as 0%. testkit is
+  # dev-only scaffolding, excluded from the denominator. Merging the two former
+  # jobs trades some parallelism for an accurate single coverage number and
+  # avoids running the ignored tests twice.
   test:
-    name: Test
+    name: Test + coverage (incl. MiniStack)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -53,28 +63,6 @@ jobs:
         uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
           tool: cargo-llvm-cov
-      - name: cargo test with coverage
-        run: cargo llvm-cov --workspace --all-features --summary-only | tee coverage.txt
-      - name: Coverage summary
-        if: always()
-        run: |
-          {
-            echo "### Coverage"
-            echo '```'
-            cat coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  integration:
-    name: Integration (MiniStack)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          toolchain: stable
       - name: Start MiniStack
         run: docker compose -f docker-compose.test.yml up -d
       - name: Wait for MiniStack (:4566)
@@ -88,17 +76,24 @@ jobs:
           echo "MiniStack never became ready on :4566"
           docker compose -f docker-compose.test.yml logs
           exit 1
-      # Every MiniStack test is #[ignore]d, so `--ignored` runs exactly them
-      # against the container on localhost:4566 (and nothing else). Covers both
-      # crates/aws/tests/ministack.rs and the per-lambda cold-start tests
-      # (crates/lambda-*/tests/cold_start.rs), which spawn the real `bootstrap`
-      # binary. --workspace ensures those bins are built so CARGO_BIN_EXE_* is
-      # set. Mirrors `make ministack-test`.
-      - name: Run MiniStack integration tests
-        run: cargo test --workspace -- --ignored
+      - name: Unit tests (coverage, no report)
+        run: cargo llvm-cov --no-report --workspace --all-features
+      - name: MiniStack integration tests (coverage, no report)
+        run: cargo llvm-cov --no-report --workspace --all-features -- --ignored
+      - name: Merge coverage report
+        run: cargo llvm-cov report --summary-only --ignore-filename-regex '/testkit/' | tee coverage.txt
       - name: Stop MiniStack
         if: always()
         run: docker compose -f docker-compose.test.yml down
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "### Coverage"
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build (${{ matrix.arch }} musl)
