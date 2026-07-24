@@ -37,6 +37,9 @@ allow = ["OpenSSL"]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are referenced by path without a version req, which
+# reads as a wildcard. Exempt path-only deps; external wildcards still denied.
+allow-wildcard-paths = true
 # Guard the hexagonal boundary at the dependency level: aws-lc-rs must never
 # reappear (we standardize on rustls + ring — see crates/aws/src/http_client.rs).
 deny = [
