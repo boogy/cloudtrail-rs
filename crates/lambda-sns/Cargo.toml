@@ -3,6 +3,7 @@ name = "cloudtrail-rs-lambda-sns"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+publish.workspace = true
 
 # AWS Lambda's custom runtime requires the executable be named `bootstrap`.
 # Without this, cargo names the binary after the package and GoReleaser's

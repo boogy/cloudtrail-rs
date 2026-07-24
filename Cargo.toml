@@ -12,6 +12,10 @@ members = [
 
 [workspace.package]
 license = "Apache-2.0"
+# Application/internal crates — never published to crates.io. Marking them
+# non-publishable also lets cargo-deny's allow-wildcard-paths exempt the
+# internal path dependencies (crates.io disallows path deps on public crates).
+publish = false
 
 [profile.release]
 opt-level = 3
