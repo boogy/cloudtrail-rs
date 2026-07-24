@@ -251,17 +251,21 @@ impl Pipeline {
         }
     }
 
-    /// `behavior.dry_run`: still evaluates every record through `engine`
-    /// (so `RecordsDropped`/`RuleDrops` reflect what *would* have been
-    /// dropped), but always forwards the object unmodified — always buffer
-    /// semantics, since dry-run's purpose is cheap evaluation, not streaming
-    /// efficiency.
+    /// `behavior.dry_run`: a true no-op against the destination. Every record
+    /// is still evaluated through `engine` so `RecordsDropped`/`RuleDrops`
+    /// report exactly what *would* be filtered, but nothing is ever written —
+    /// no `put`, no `BytesOut`. Dry-run's purpose is to preview a ruleset
+    /// against live traffic without touching the destination bucket, so it uses
+    /// buffer semantics (cheap full-object evaluation) and discards the result.
+    ///
+    /// `dest_bucket`/`dest_key` are unused: they exist only to keep the
+    /// signature uniform with the buffer/stream paths this dispatches from.
     async fn process_dry_run(
         &self,
         engine: &Arc<Engine>,
         object: &ObjectRef,
-        dest_bucket: &str,
-        dest_key: &str,
+        _dest_bucket: &str,
+        _dest_key: &str,
     ) -> Result<(), CoreError> {
         let Some(bytes) = self
             .fetch_with_missing_policy(&object.bucket, &object.key)
@@ -271,15 +275,11 @@ impl Pipeline {
         };
         self.metrics.add_bytes_in(bytes.len() as u64);
 
-        // Side effect only: updates RecordsIn/RecordsKept/RecordsDropped/
-        // RuleDrops via `metrics`. The `Outcome` itself is discarded — the
-        // written bytes are always the untouched original.
+        // Evaluation only: updates RecordsIn/RecordsKept/RecordsDropped/
+        // RuleDrops via `metrics` so the operator sees what would be filtered.
+        // The produced `Outcome` is discarded and nothing is written.
         buffer_run(&bytes, engine, &self.settings.processing, &self.metrics)?;
 
-        self.store
-            .put(dest_bucket, dest_key, bytes.clone(), CANONICAL_META)
-            .await?;
-        self.metrics.add_bytes_out(bytes.len() as u64);
         self.metrics.add_objects_processed(1);
         Ok(())
     }
@@ -677,7 +677,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn dry_run_forwards_everything_but_still_counts_drops() {
+    async fn dry_run_writes_nothing_but_still_counts_drops() {
         let store = Arc::new(InMemoryStore::new());
         let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin", "Decrypt", "AssumeRole"]));
         store.seed("src-bucket", "file.json.gz", body.clone());
@@ -704,13 +704,9 @@ rules:
 
         pipeline.handle(b"{}").await.expect("must succeed");
 
-        let written = store
-            .object("dest-bucket", "file.json.gz")
-            .expect("dry_run must still forward the object");
-        assert_eq!(
-            gunzip(&written),
-            gunzip(&body),
-            "dry_run must forward the object completely unfiltered"
+        assert!(
+            store.object("dest-bucket", "file.json.gz").is_none(),
+            "dry_run must not write anything to the destination"
         );
 
         let snapshots = sink.snapshots();
@@ -720,6 +716,10 @@ rules:
             "dry_run must still count what would have been dropped"
         );
         assert_eq!(snapshots[0].records_kept, 2);
+        assert_eq!(
+            snapshots[0].bytes_out, 0,
+            "dry_run must report no bytes written"
+        );
     }
 
     #[tokio::test]

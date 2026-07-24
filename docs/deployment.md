@@ -212,7 +212,8 @@ flowchart LR
 ```
 
 1. Deploy with `CT_DRY_RUN=true`. Every record is still evaluated and counted,
-   but nothing is dropped — the pipeline forwards everything.
+   but nothing is written — the pipeline touches the destination bucket not at
+   all, so you can preview a ruleset against live traffic with zero side effects.
 2. Watch the `RecordsDropped` EMF metric (namespace `CT_METRICS_NAMESPACE`,
    default `cloudtrail-rs`) against `RecordsIn` for a representative window.
    Cross-check against per-rule `RuleDrops` (dimension `Rule`) to confirm the

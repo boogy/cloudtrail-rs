@@ -865,6 +865,7 @@ dependencies = [
  "aws-config",
  "cloudtrail-rs-aws",
  "cloudtrail-rs-core",
+ "cloudtrail-rs-testkit",
  "flate2",
  "lambda_runtime",
  "serde_json",
@@ -881,6 +882,7 @@ dependencies = [
  "aws-config",
  "cloudtrail-rs-aws",
  "cloudtrail-rs-core",
+ "cloudtrail-rs-testkit",
  "flate2",
  "lambda_runtime",
  "serde_json",
@@ -897,6 +899,7 @@ dependencies = [
  "aws-config",
  "cloudtrail-rs-aws",
  "cloudtrail-rs-core",
+ "cloudtrail-rs-testkit",
  "flate2",
  "lambda_runtime",
  "serde_json",
@@ -913,12 +916,28 @@ dependencies = [
  "aws-config",
  "cloudtrail-rs-aws",
  "cloudtrail-rs-core",
+ "cloudtrail-rs-testkit",
  "flate2",
  "lambda_runtime",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cloudtrail-rs-testkit"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-sdk-ssm",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "cloudtrail-rs-core",
+ "flate2",
+ "serde_json",
 ]
 
 [[package]]

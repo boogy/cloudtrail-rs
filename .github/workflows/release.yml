@@ -13,6 +13,30 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # SINGLE SOURCE OF TRUTH for the Lambda module set. Every downstream job — the
+  # build loop, the image matrix, the scan matrix — derives its list from here.
+  # Add or remove a module in `modules` below and it flows through the entire
+  # release with no other edits.
+  #   modules_list -> space-separated, for shell `for` loops
+  #   modules_json -> JSON array ["s3",...], for `matrix: ${{ fromJSON(...) }}`
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Define module set
+    runs-on: ubuntu-latest
+    outputs:
+      modules_list: ${{ steps.def.outputs.modules_list }}
+      modules_json: ${{ steps.def.outputs.modules_json }}
+    steps:
+      - name: Define modules
+        id: def
+        run: |
+          set -euo pipefail
+          modules="s3 sns sqs eventbridge"
+          echo "modules_list=$modules" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2086
+          echo "modules_json=$(printf '%s\n' $modules | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
   # Build every static-musl binary on its NATIVE-arch runner — no zig, no
   # cross-linker. x86_64 builds on ubuntu-latest, aarch64 on the GitHub-hosted
   # arm64 runner. Each job produces:
@@ -23,6 +47,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.arch }}
+    needs: setup
     strategy:
       fail-fast: false
       matrix:
@@ -66,13 +91,13 @@ jobs:
           arch='${{ matrix.arch }}'
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist bins
-          for m in s3 sns sqs eventbridge; do
-            cargo build --locked --release --target "$target" -p "cloudtrail-rs-lambda-$m"
-            install -Dm755 "target/$target/release/bootstrap" "bins/lambda-$m/bootstrap"
+          for m in ${{ needs.setup.outputs.modules_list }}; do
+            cargo build --locked --profile dist --target "$target" -p "cloudtrail-rs-lambda-$m" --bin bootstrap
+            install -Dm755 "target/$target/dist/bootstrap" "bins/lambda-$m/bootstrap"
             zip -q -j "dist/lambda-$m-$version-$arch.zip" "bins/lambda-$m/bootstrap"
           done
-          cargo build --locked --release --target "$target" -p cloudtrail-rs
-          install -Dm755 "target/$target/release/cloudtrail-rs" "bins/cli/cloudtrail-rs"
+          cargo build --locked --profile dist --target "$target" -p cloudtrail-rs
+          install -Dm755 "target/$target/dist/cloudtrail-rs" "bins/cli/cloudtrail-rs"
           tar -czf "dist/cli-$version-linux-$arch.tar.gz" -C bins/cli cloudtrail-rs
           ls -l dist bins/lambda-*
 
@@ -119,9 +144,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          cargo build --locked --release --target aarch64-apple-darwin -p cloudtrail-rs
+          cargo build --locked --profile dist --target aarch64-apple-darwin -p cloudtrail-rs
           mkdir -p dist bins/cli-darwin
-          install -m755 target/aarch64-apple-darwin/release/cloudtrail-rs bins/cli-darwin/cloudtrail-rs
+          install -m755 target/aarch64-apple-darwin/dist/cloudtrail-rs bins/cli-darwin/cloudtrail-rs
           tar -czf "dist/cli-$version-darwin-arm64.tar.gz" -C bins/cli-darwin cloudtrail-rs
           ls -l dist
 
@@ -206,7 +231,7 @@ jobs:
   # ---------------------------------------------------------------------------
   images:
     name: Image ${{ matrix.module }}
-    needs: build
+    needs: [setup, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -215,7 +240,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [s3, sns, sqs, eventbridge]
+        module: ${{ fromJSON(needs.setup.outputs.modules_json) }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -316,7 +341,7 @@ jobs:
   # ---------------------------------------------------------------------------
   scan:
     name: Scan images
-    needs: images
+    needs: [setup, images]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -324,7 +349,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [lambda-s3, lambda-sns, lambda-sqs, lambda-eventbridge]
+        module: ${{ fromJSON(needs.setup.outputs.modules_json) }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
@@ -338,7 +363,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           owner="${{ github.repository_owner }}"
-          echo "image=ghcr.io/${owner,,}/cloudtrail-rs:${{ matrix.module }}-${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner,,}/cloudtrail-rs:lambda-${{ matrix.module }}-${version}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Wait for image to be pullable
@@ -365,14 +390,14 @@ jobs:
         if: always()
         run: |
           {
-            echo "### ${{ matrix.module }} — ${{ steps.ref.outputs.version }}"
+            echo "### lambda-${{ matrix.module }} — ${{ steps.ref.outputs.version }}"
             echo ""
             echo "Image: \`${{ steps.ref.outputs.image }}\`"
             echo ""
             echo "Deploy to Lambda (container image):"
             echo '```sh'
             echo "aws lambda update-function-code \\"
-            echo "  --function-name my-${{ matrix.module }} \\"
+            echo "  --function-name my-lambda-${{ matrix.module }} \\"
             echo "  --image-uri ${{ steps.ref.outputs.image }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

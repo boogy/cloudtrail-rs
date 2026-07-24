@@ -257,6 +257,9 @@ impl Default for Processing {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Behavior {
+    /// Evaluate every record and count what *would* be dropped
+    /// (`RecordsDropped`/`RuleDrops`), but write nothing to the destination —
+    /// a true no-op for previewing a ruleset against live traffic.
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]

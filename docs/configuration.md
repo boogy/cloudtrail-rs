@@ -56,7 +56,7 @@ processing:
   multipart_part_bytes: 8388608 # stream mode
   gzip_level: 6
 behavior:
-  dry_run: false # evaluate + count, forward everything
+  dry_run: false # evaluate + count, write nothing to the destination
   on_config_error: open # open | closed   (DEFAULT: open)
   on_missing_object: error # error | skip
   on_unrecognized_object: copy # copy | skip | error
@@ -91,7 +91,7 @@ observability:
 | `CT_MAX_OBJECT_BYTES`         | `processing.max_object_bytes`       | Buffer-mode-only guard on decompressed size.                                                                                                                                              | `134217728`                             |
 | `CT_MULTIPART_PART_BYTES`     | `processing.multipart_part_bytes`   | Stream-mode S3 multipart part size.                                                                                                                                                       | `8388608`                               |
 | `CT_GZIP_LEVEL`               | `processing.gzip_level`             | Output gzip compression level.                                                                                                                                                            | `6`                                     |
-| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count, but forward every record untouched.                                                                                                                                   | `false`                                 |
+| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count what would be dropped, but write nothing to the destination.                                                                                                            | `false`                                 |
 | `CT_ON_CONFIG_ERROR`          | `behavior.on_config_error`          | `open` \| `closed` when the rules doc has never loaded successfully.                                                                                                                      | `open`                                  |
 | `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                         | `error`                                 |
 | `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                             | `copy`                                  |

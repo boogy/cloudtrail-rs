@@ -30,12 +30,12 @@ build: ## Debug build of the whole workspace
 	$(CARGO) build --workspace
 
 .PHONY: release
-release: ## Optimized release build (fat LTO, stripped) of every crate
+release: ## Fast local `release` profile build (lean: no LTO) — verify it builds/links
 	$(CARGO) build --workspace --release
 
 .PHONY: lambda-build
-lambda-build: ## Cross-compile the four Lambda bootstrap binaries (needs cargo-lambda)
-	$(CARGO) lambda build --release $(LAMBDA_ARCH)
+lambda-build: ## Cross-compile the four Lambda bootstrap binaries, shipped `dist` profile (needs cargo-lambda)
+	$(CARGO) lambda build --profile dist $(LAMBDA_ARCH)
 
 # ---- test & lint -------------------------------------------------------
 .PHONY: test
@@ -81,9 +81,9 @@ coverage: ## Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-
 # per-arch static-musl builds (no zig/goreleaser), archives + checksums, the
 # GitHub Release, multi-arch Lambda images, and cosign signatures.
 .PHONY: release-musl
-release-musl: ## Local static-musl release build of the whole workspace for one target (needs musl-tools + rustup target)
+release-musl: ## Local static-musl shipped `dist` build of the whole workspace for one target (needs musl-tools + rustup target)
 	CC_x86_64_unknown_linux_musl=musl-gcc CC_aarch64_unknown_linux_musl=musl-gcc \
-		$(CARGO) build --workspace --release --target $(MUSL_TARGET)
+		$(CARGO) build --workspace --profile dist --target $(MUSL_TARGET)
 
 # ---- toolchain ---------------------------------------------------------
 .PHONY: install-tools

@@ -12,6 +12,16 @@ publish.workspace = true
 name = "bootstrap"
 path = "src/main.rs"
 
+# All four lambda crates emit a binary named `bootstrap`, so they share one
+# output path and cargo uplifts whichever linked last — which also makes
+# `CARGO_BIN_EXE_bootstrap` ambiguous under a workspace-wide `cargo test`.
+# This second target builds the same `main.rs` under a unique name purely so
+# integration tests can address *this* crate's binary. Release builds pass
+# `--bin bootstrap` and never produce it.
+[[bin]]
+name = "bootstrap-s3"
+path = "src/main.rs"
+
 [dependencies]
 cloudtrail-rs-core = { path = "../core", features = ["decode-s3"] }
 cloudtrail-rs-aws = { path = "../aws" }
@@ -25,4 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 cloudtrail-rs-core = { path = "../core", features = ["testing"] }
+cloudtrail-rs-testkit = { path = "../testkit" }
 flate2 = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
