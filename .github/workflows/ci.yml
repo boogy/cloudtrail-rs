@@ -96,9 +96,12 @@ jobs:
           echo "MiniStack never became ready on :4566"
           docker compose -f docker-compose.test.yml logs
           exit 1
-      # The MiniStack tests are #[ignore]d (crates/aws/tests/ministack.rs); --ignored
-      # runs exactly those against the container on localhost:4566. Mirrors `make
-      # ministack-test`.
+      # Every MiniStack test is #[ignore]d, so `--ignored` runs exactly them
+      # against the container on localhost:4566 (and nothing else). Covers both
+      # crates/aws/tests/ministack.rs and the per-lambda cold-start tests
+      # (crates/lambda-*/tests/cold_start.rs), which spawn the real `bootstrap`
+      # binary. --workspace ensures those bins are built so CARGO_BIN_EXE_* is
+      # set. Mirrors `make ministack-test`.
       - name: Run MiniStack integration tests
         run: cargo test --workspace -- --ignored
       - name: Stop MiniStack
