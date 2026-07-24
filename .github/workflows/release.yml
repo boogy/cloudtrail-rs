@@ -92,8 +92,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist bins
           for m in ${{ needs.setup.outputs.modules_list }}; do
-            cargo build --locked --profile dist --target "$target" -p "cloudtrail-rs-lambda-$m" --bin bootstrap
-            install -Dm755 "target/$target/dist/bootstrap" "bins/lambda-$m/bootstrap"
+            cargo build --locked --profile dist --target "$target" -p "cloudtrail-rs-lambda-$m" --bin "bootstrap-$m"
+            install -Dm755 "target/$target/dist/bootstrap-$m" "bins/lambda-$m/bootstrap"
             zip -q -j "dist/lambda-$m-$version-$arch.zip" "bins/lambda-$m/bootstrap"
           done
           cargo build --locked --profile dist --target "$target" -p cloudtrail-rs

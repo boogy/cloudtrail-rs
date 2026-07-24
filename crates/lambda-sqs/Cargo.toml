@@ -5,19 +5,14 @@ edition = "2024"
 license.workspace = true
 publish.workspace = true
 
-# AWS Lambda's custom runtime requires the executable be named `bootstrap`.
-# Without this, cargo names the binary after the package and GoReleaser's
-# `binary: bootstrap` lookup fails.
-[[bin]]
-name = "bootstrap"
-path = "src/main.rs"
-
-# All four lambda crates emit a binary named `bootstrap`, so they share one
-# output path and cargo uplifts whichever linked last — which also makes
-# `CARGO_BIN_EXE_bootstrap` ambiguous under a workspace-wide `cargo test`.
-# This second target builds the same `main.rs` under a unique name purely so
-# integration tests can address *this* crate's binary. Release builds pass
-# `--bin bootstrap` and never produce it.
+# AWS Lambda's custom runtime requires the *deployed* executable be named
+# `bootstrap`. All four lambda crates would otherwise emit a bin literally named
+# `bootstrap`, colliding on one `target/.../bootstrap` output path under any
+# `--workspace` build and making `CARGO_BIN_EXE_bootstrap` ambiguous in tests.
+# Instead each crate builds a uniquely-named bin and it's renamed to `bootstrap`
+# at packaging: release.yml installs it as `bootstrap`, and `cargo lambda build`
+# emits `target/lambda/<name>/bootstrap`. Tests address it via
+# CARGO_BIN_EXE_bootstrap-sqs.
 [[bin]]
 name = "bootstrap-sqs"
 path = "src/main.rs"
