@@ -73,6 +73,38 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  integration:
+    name: Integration (MiniStack)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+      - name: Start MiniStack
+        run: docker compose -f docker-compose.test.yml up -d
+      - name: Wait for MiniStack (:4566)
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null http://localhost:4566; then
+              echo "MiniStack ready"; exit 0
+            fi
+            echo "waiting for MiniStack ($i)..."; sleep 2
+          done
+          echo "MiniStack never became ready on :4566"
+          docker compose -f docker-compose.test.yml logs
+          exit 1
+      # The MiniStack tests are #[ignore]d (crates/aws/tests/ministack.rs); --ignored
+      # runs exactly those against the container on localhost:4566. Mirrors `make
+      # ministack-test`.
+      - name: Run MiniStack integration tests
+        run: cargo test --workspace -- --ignored
+      - name: Stop MiniStack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down
+
   build:
     name: Build (${{ matrix.arch }} musl)
     strategy:
