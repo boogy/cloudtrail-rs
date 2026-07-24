@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
-use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource};
+use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{
     ConfigStore, ConfigUri, FileConfigSource, MetricsMode, Observability, RuleSet, Settings,
 };
@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- INIT: once per container ----
     init_tracing();
     let settings = Arc::new(Settings::load().await?);
-    let sdk_conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let sdk_conf = load_aws_config(BehaviorVersion::latest()).await;
     let store = Arc::new(S3ObjectStore::new(&sdk_conf));
     let decoder = Arc::new(SqsEventDecoder::new(settings.sqs.body_format));
     let cfg_src = build_config_source(&settings, &sdk_conf)?;

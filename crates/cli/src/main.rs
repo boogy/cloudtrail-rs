@@ -27,7 +27,7 @@ use anyhow::Context;
 use aws_config::BehaviorVersion;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource};
+use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{ConfigUri, Processing, RuleSet};
 use cloudtrail_rs_core::filter::{Decision, Engine};
 use cloudtrail_rs_core::metrics::Metrics;
@@ -141,13 +141,13 @@ async fn load_rules_bytes(uri: &str) -> anyhow::Result<Vec<u8>> {
             std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))
         }
         ConfigUri::S3 { bucket, key } => {
-            let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let conf = load_aws_config(BehaviorVersion::latest()).await;
             let source = S3ConfigSource::new(&conf, bucket, key);
             let (bytes, _version) = source.fetch().await?;
             Ok(bytes)
         }
         ConfigUri::Ssm { path } => {
-            let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let conf = load_aws_config(BehaviorVersion::latest()).await;
             let source = SsmConfigSource::new(&conf, path);
             let (bytes, _version) = source.fetch().await?;
             Ok(bytes)
@@ -427,7 +427,7 @@ async fn write_single(
 /// S3; a purely local run never touches AWS.
 async fn build_s3_if_needed(src: &Location, dst: &Location) -> Option<S3ObjectStore> {
     if src.is_s3() || dst.is_s3() {
-        let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let conf = load_aws_config(BehaviorVersion::latest()).await;
         Some(S3ObjectStore::new(&conf))
     } else {
         None
