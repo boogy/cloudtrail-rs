@@ -19,7 +19,7 @@ members = [
 # release.yml bakes `$GITHUB_REF_NAME` into the binaries via core/build.rs, and
 # `make version-check` (run by release.yml before anything is built) fails the
 # release if this number and the tag disagree. Bump with `make bump VERSION=x.y.z`.
-version = "0.1.1"
+version = "0.2.0"
 license = "Apache-2.0"
 # Application/internal crates — never published to crates.io. Marking them
 # non-publishable also lets cargo-deny's allow-wildcard-paths exempt the
