@@ -16,9 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
+use aws_config::SdkConfig;
 use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{
-    ConfigStore, ConfigUri, FileConfigSource, MetricsMode, Observability, RuleSet, Settings,
+    ConfigStore, ConfigUri, FileConfigSource, MetricsMode, Observability, Processing, RuleSet,
+    Settings,
 };
 use cloudtrail_rs_core::decode::sqs::SqsEventDecoder;
 use cloudtrail_rs_core::filter::Engine;
@@ -53,6 +55,14 @@ fn build_sink(observability: &Observability) -> Arc<dyn MetricsSink> {
     }
 }
 
+/// Builds the `S3ObjectStore`, carrying `processing.multipart_part_bytes`
+/// through via `S3ObjectStore::from_settings` — extracted out of `main` so a
+/// test can prove the composition root's own wiring passes the configured
+/// value through, not just that `from_settings` does so in isolation.
+fn build_store(conf: &SdkConfig, processing: &Processing) -> S3ObjectStore {
+    S3ObjectStore::from_settings(conf, processing)
+}
+
 /// The Lambda SQS partial-batch response: `failed_ack_ids` become
 /// `itemIdentifier`s so the event source mapping re-drives only those
 /// messages. An empty list yields `{"batchItemFailures":[]}`, which deletes
@@ -78,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let settings = Arc::new(Settings::load().await?);
     let sdk_conf = load_aws_config(BehaviorVersion::latest()).await;
-    let store = Arc::new(S3ObjectStore::new(&sdk_conf));
+    let store = Arc::new(build_store(&sdk_conf, &settings.processing));
     let decoder = Arc::new(SqsEventDecoder::new(settings.sqs.body_format));
     let cfg_src = build_config_source(&settings, &sdk_conf)?;
     let metrics = Arc::new(Metrics::default());
@@ -110,9 +120,38 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::batch_response;
+    use super::{batch_response, build_store};
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
+    use cloudtrail_rs_aws::DEFAULT_MULTIPART_PART_BYTES;
+    use cloudtrail_rs_core::config::Processing;
     use cloudtrail_rs_core::pipeline::BatchOutcome;
     use serde_json::json;
+
+    /// A bare `SdkConfig` is enough: `build_store` only builds a client from
+    /// it, no network call happens.
+    fn test_sdk_config() -> SdkConfig {
+        SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .build()
+    }
+
+    // --- F6: `settings.processing.multipart_part_bytes` must reach the
+    // store `main` actually builds, not just `S3ObjectStore::from_settings`
+    // in isolation. ---------------------------------------------------
+
+    #[test]
+    fn build_store_wires_a_non_default_multipart_part_bytes_through() {
+        let processing = Processing {
+            multipart_part_bytes: 16 * 1024 * 1024,
+            ..Processing::default()
+        };
+
+        let store = build_store(&test_sdk_config(), &processing);
+
+        assert_eq!(store.multipart_part_bytes(), 16 * 1024 * 1024);
+        assert_ne!(store.multipart_part_bytes(), DEFAULT_MULTIPART_PART_BYTES);
+    }
 
     #[test]
     fn empty_failed_ack_ids_yields_empty_batch_item_failures() {

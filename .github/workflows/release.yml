@@ -19,14 +19,27 @@ jobs:
   # release with no other edits.
   #   modules_list -> space-separated, for shell `for` loops
   #   modules_json -> JSON array ["s3",...], for `matrix: ${{ fromJSON(...) }}`
+  #
+  # Also the RELEASE GATE: every other job needs this one, so the version check
+  # below runs before a single binary is built. A tag whose version disagrees
+  # with `[workspace.package] version` fails here, cheaply, instead of shipping
+  # artifacts that claim one version while cargo's tree says another.
   # ---------------------------------------------------------------------------
   setup:
-    name: Define module set
+    name: Verify version + define module set
     runs-on: ubuntu-latest
     outputs:
       modules_list: ${{ steps.def.outputs.modules_list }}
       modules_json: ${{ steps.def.outputs.modules_json }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `cargo metadata --no-deps` resolves nothing and hits no network; the
+      # runner's preinstalled cargo is enough, no toolchain setup needed.
+      - name: Verify tag matches workspace version
+        run: make version-check TAG="${GITHUB_REF_NAME}"
+
       - name: Define modules
         id: def
         run: |
@@ -128,6 +141,8 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: Build darwin arm64 (CLI)
+    # Only for `setup`'s version gate — this job needs none of its outputs.
+    needs: setup
     runs-on: macos-14
     steps:
       - name: Checkout

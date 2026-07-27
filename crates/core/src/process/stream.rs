@@ -115,6 +115,16 @@ impl ChannelSyncRead {
 
 impl Read for ChannelSyncRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // A zero-length buffer is answered before touching the channel.
+        // `Read`'s contract makes `Ok(0)` the required answer here and
+        // explicitly not an EOF signal, but reaching it via the loop below
+        // would first `blocking_recv` a chunk into `pending` and *then*
+        // return `Ok(0)` — indistinguishable from EOF to the caller, which
+        // would stop reading and silently truncate the object at whatever
+        // had already been consumed.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             if !self.pending.is_empty() {
                 let n = std::cmp::min(buf.len(), self.pending.len());
@@ -157,6 +167,14 @@ impl AsyncRead for ChannelAsyncRead {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // The async mirror of `ChannelSyncRead::read`'s zero-length guard: a
+        // `ReadBuf` with no remaining capacity is answered without consuming
+        // from the channel. `Poll::Ready(Ok(()))` having filled nothing is
+        // precisely tokio's EOF signal, so falling through to the loop would
+        // report end-of-stream to `put_stream` mid-object.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if !this.pending.is_empty() {
                 let n = std::cmp::min(buf.remaining(), this.pending.len());
@@ -178,12 +196,22 @@ impl AsyncRead for ChannelAsyncRead {
 /// side of the input bridge. Bounded by `INPUT_CHUNK_BYTES` regardless of
 /// how much `input` would otherwise be willing to hand back in one `read`
 /// call, which is what keeps input-side peak memory bounded.
-async fn pump_input(mut input: Box<dyn AsyncRead + Send + Unpin>, tx: mpsc::Sender<ByteMsg>) {
+///
+/// This is also where stream mode accounts `BytesIn`: buffer mode counts the
+/// whole object at once because it has it in hand, while here the object is
+/// never fully materialized, so the counter is fed chunk by chunk as the
+/// bytes are actually ingested.
+async fn pump_input(
+    mut input: Box<dyn AsyncRead + Send + Unpin>,
+    tx: mpsc::Sender<ByteMsg>,
+    metrics: &Metrics,
+) {
     let mut buf = vec![0u8; INPUT_CHUNK_BYTES];
     loop {
         match input.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
+                metrics.add_bytes_in(n as u64);
                 if tx
                     .send(Ok(Bytes::copy_from_slice(&buf[..n])))
                     .await
@@ -379,7 +407,7 @@ pub async fn stream_run(
     let (raw_tx, mut raw_rx) = mpsc::channel::<StreamMsg>(RECORD_CHANNEL_CAPACITY);
     let (out_tx, out_rx) = mpsc::channel::<ByteMsg>(OUTPUT_CHANNEL_CAPACITY);
 
-    let pump = pump_input(input, in_tx);
+    let pump = pump_input(input, in_tx, metrics);
     let blocking =
         tokio::task::spawn_blocking(move || extract_records(ChannelSyncRead::new(in_rx), raw_tx));
 
@@ -412,6 +440,11 @@ pub async fn stream_run(
         let mut first = true;
         let mut kept: u64 = 0;
         let mut records_in: u64 = 0;
+        // Compressed bytes handed to `put_stream` so far. Accumulated rather
+        // than reported as it goes, because every non-`Written` outcome
+        // aborts the upload — nothing lands at the destination, so nothing
+        // may be billed to `BytesOut`. Committed once, below, on success.
+        let mut bytes_out: u64 = 0;
 
         let finish = loop {
             match raw_rx.recv().await {
@@ -452,6 +485,7 @@ pub async fn stream_run(
 
                     if encoder.get_ref().len() >= OUTPUT_FLUSH_THRESHOLD {
                         let chunk = std::mem::take(encoder.get_mut());
+                        bytes_out += chunk.len() as u64;
                         // If the consumer is already gone there is nothing
                         // further we can do about it here; the loop keeps
                         // draining `raw_rx` so the blocking producer never
@@ -482,8 +516,10 @@ pub async fn stream_run(
                 match encoder.finish() {
                     Ok(tail) => {
                         if !tail.is_empty() {
+                            bytes_out += tail.len() as u64;
                             let _ = out_tx.send(Ok(Bytes::from(tail))).await;
                         }
+                        metrics.add_bytes_out(bytes_out);
                         metrics.add_records_kept(kept);
                         metrics.add_records_dropped(records_in - kept);
                         Ok(Outcome::Written(None))
@@ -647,6 +683,154 @@ rules:
             written, expected,
             "stream_run's output must be byte-for-byte identical to buffer_run's on the same \
              fixture"
+        );
+    }
+
+    /// A caller offering no capacity must be answered immediately, without
+    /// pulling a chunk off the channel. The channel is left empty with a live
+    /// sender on purpose: before the guard, the zero-length read fell through
+    /// to `blocking_recv` and parked until a chunk arrived that the caller had
+    /// nowhere to put — so this hangs without the fix and returns at once with
+    /// it. It then proves the stream is intact, not truncated.
+    #[test]
+    fn sync_reader_zero_length_read_does_not_consume_from_the_channel() {
+        let (tx, rx) = mpsc::channel::<ByteMsg>(4);
+        let mut reader = ChannelSyncRead::new(rx);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let n = reader
+                .read(&mut [])
+                .expect("a zero-length read is not an error");
+            let _ = done_tx.send(n);
+            // Hold the reader (and so the channel) open until the test ends.
+            drop(reader);
+        });
+
+        // Nothing is ever sent on `tx`. Without the guard the thread is parked
+        // in `blocking_recv` and this times out; with it, the answer is
+        // already waiting. Sending a chunk here would mask the bug, because
+        // the buggy path also returns `Ok(0)` once a chunk finally arrives.
+        let n = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "a zero-length read must return immediately instead of blocking on a chunk the \
+                 caller has no room for",
+            );
+        assert_eq!(n, 0, "a zero-length read reports zero bytes");
+        drop(tx);
+    }
+
+    /// The async mirror: `Poll::Ready(Ok(()))` with nothing written is tokio's
+    /// EOF signal, so a no-capacity `poll_read` must not reach it by way of
+    /// consuming a chunk. Empty channel + live sender, as above.
+    #[tokio::test]
+    async fn async_reader_zero_capacity_read_does_not_consume_from_the_channel() {
+        let (tx, rx) = mpsc::channel::<ByteMsg>(4);
+        let mut reader = ChannelAsyncRead::new(rx);
+
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read(&mut []))
+            .await
+            .expect(
+                "a no-capacity read must return immediately instead of awaiting a chunk the \
+                 caller has no room for",
+            )
+            .expect("a no-capacity read is not an error");
+        assert_eq!(n, 0, "a no-capacity read reports zero bytes");
+
+        tx.send(Ok(Bytes::from_static(b"payload")))
+            .await
+            .expect("receiver is alive");
+        drop(tx);
+
+        let mut rest = Vec::new();
+        reader
+            .read_to_end(&mut rest)
+            .await
+            .expect("the rest of the stream must still be readable");
+        assert_eq!(
+            rest, b"payload",
+            "the no-capacity read must not have swallowed any of the stream"
+        );
+    }
+
+    /// Stream mode must feed `BytesIn`/`BytesOut` just like buffer mode does.
+    /// It reported neither for a long time, which zeroed both counters for
+    /// exactly the large objects operators reconcile input against output on.
+    #[tokio::test]
+    async fn stream_run_accounts_bytes_in_and_bytes_out() {
+        let body = br#"{"Records":[
+            {"eventName":"ConsoleLogin"},
+            {"eventName":"Decrypt"},
+            {"eventName":"AssumeRole"}
+        ]}"#;
+        let input = gzip_bytes(body);
+
+        let store = InMemoryStore::new();
+        let metrics = Metrics::default();
+        stream_run(
+            reader_over(input.clone()),
+            &drop_decrypt_engine(),
+            &Processing::default(),
+            &metrics,
+            &store,
+            "bucket",
+            "dest",
+        )
+        .await
+        .expect("stream_run must succeed");
+
+        let written = store
+            .object("bucket", "dest")
+            .expect("stream_run must have written to the destination key");
+        let snapshot = metrics.snapshot_and_reset();
+        assert_eq!(
+            snapshot.bytes_in,
+            input.len() as u64,
+            "BytesIn must equal the compressed bytes read from the source"
+        );
+        assert_eq!(
+            snapshot.bytes_out,
+            written.len() as u64,
+            "BytesOut must equal the compressed bytes actually committed to the destination"
+        );
+    }
+
+    /// The mirror of the above: when the upload is aborted nothing lands at
+    /// the destination, so `BytesOut` must stay zero even though the encoder
+    /// produced bytes and handed them to `put_stream` before the abort.
+    #[tokio::test]
+    async fn an_aborted_upload_reports_bytes_in_but_no_bytes_out() {
+        let body = br#"{"Records":[{"eventName":"Decrypt"}]}"#;
+        let input = gzip_bytes(body);
+
+        let store = InMemoryStore::new();
+        let metrics = Metrics::default();
+        let outcome = stream_run(
+            reader_over(input.clone()),
+            &drop_decrypt_engine(),
+            &Processing::default(),
+            &metrics,
+            &store,
+            "bucket",
+            "dest",
+        )
+        .await
+        .expect("dropping every record is not an error");
+        assert!(
+            matches!(outcome, Outcome::NothingKept),
+            "expected NothingKept, got {outcome:?}"
+        );
+
+        let snapshot = metrics.snapshot_and_reset();
+        assert_eq!(
+            snapshot.bytes_in,
+            input.len() as u64,
+            "the bytes were still read, so BytesIn must count them"
+        );
+        assert_eq!(
+            snapshot.bytes_out, 0,
+            "an aborted upload writes nothing, so BytesOut must stay zero"
         );
     }
 

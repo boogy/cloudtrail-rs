@@ -57,14 +57,16 @@ impl EventDecoder for SqsEventDecoder {
         let mut items = Vec::with_capacity(event.records.len());
         for record in event.records {
             // A single message's body failing to decode must not sink the
-            // whole batch (the partial-batch foundation) — drop just
-            // this one and keep going.
-            if let Ok(objects) = decode_body(&record.body, self.body_format) {
-                items.push(SourceItem {
-                    ack_id: Some(record.message_id),
-                    objects,
-                });
-            }
+            // whole batch (the partial-batch foundation) — but it must
+            // also not be silently dropped: that would ack a message
+            // whose referenced object, if any, never gets processed. Carry
+            // the failure forward as an undecodable `SourceItem` so the
+            // pipeline can fail this message's `ack_id` instead.
+            let item = match decode_body(&record.body, self.body_format) {
+                Ok(objects) => SourceItem::new(Some(record.message_id), objects),
+                Err(e) => SourceItem::undecodable(Some(record.message_id), e.to_string()),
+            };
+            items.push(item);
         }
         Ok(items)
     }
@@ -194,18 +196,31 @@ mod tests {
     fn batch_with_one_garbage_message_still_decodes_siblings() {
         let decoder = SqsEventDecoder::new(SqsBodyFormat::Auto);
         let items = decoder.decode(SQS_BATCH_PARTIAL_GARBAGE).unwrap();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(
             items[0].ack_id,
             Some("059f36b4-87a3-44ab-83d2-661975830a7d".to_string())
         );
         assert_eq!(items[0].objects[0].key, "b21b84d653bb07b05b1e6b33684dc11b");
+        assert!(items[0].decode_error.is_none());
+
+        // The garbage message must not be silently dropped: it must survive
+        // as an undecodable item carrying its own ack_id, so the pipeline
+        // can fail *this* message's ack instead of acking it clean.
         assert_eq!(
             items[1].ack_id,
+            Some("bad00000-0000-0000-0000-000000000002".to_string())
+        );
+        assert!(items[1].objects.is_empty());
+        assert!(items[1].decode_error.is_some());
+
+        assert_eq!(
+            items[2].ack_id,
             Some("2e1424d4-f796-459a-8184-9c92662be6da".to_string())
         );
-        assert_eq!(items[1].objects[0].key, "second-sibling-object.json.gz");
-        assert_eq!(items[1].objects[0].bucket, "ct-siem-sync");
+        assert_eq!(items[2].objects[0].key, "second-sibling-object.json.gz");
+        assert_eq!(items[2].objects[0].bucket, "ct-siem-sync");
+        assert!(items[2].decode_error.is_none());
     }
 
     #[test]

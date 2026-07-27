@@ -38,6 +38,11 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The one-decoder-per-binary invariant (root CLAUDE.md): each Lambda
+      # artifact must compile in exactly one EventDecoder, with no dead
+      # decoder code. Cheap — `cargo tree` resolves the graph, builds nothing.
+      - name: One decoder per binary
+        run: make tree-features
 
   # Unit + MiniStack tests share one instrumented job so BOTH count toward
   # coverage. Two `--no-report` passes accumulate profile data that a final

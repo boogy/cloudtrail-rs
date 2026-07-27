@@ -76,15 +76,15 @@ impl EventDecoder for EventBridgeDecoder {
             )));
         }
 
-        Ok(vec![SourceItem {
-            ack_id: None,
-            objects: vec![ObjectRef {
+        Ok(vec![SourceItem::new(
+            None,
+            vec![ObjectRef {
                 bucket: event.detail.bucket.name,
                 // Verbatim — EventBridge keys are not url-encoded.
                 key: event.detail.object.key,
                 size: event.detail.object.size,
             }],
-        }])
+        )])
     }
 }
 

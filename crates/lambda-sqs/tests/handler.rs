@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cloudtrail_rs_core::config::{
-    Behavior, ConfigStore, Destination, Observability, Processing, RuleSet, Rules, Settings,
-    Source, Sqs,
+    Behavior, ConfigStore, Destination, Observability, OnMissingObject, Processing, RuleSet, Rules,
+    Settings, Source, Sqs,
 };
 use cloudtrail_rs_core::decode::sqs::SqsEventDecoder;
 use cloudtrail_rs_core::filter::Engine;
@@ -98,5 +98,116 @@ async fn golden_sqs_payload_filters_and_writes_survivors() {
     assert_eq!(
         gunzip(&written),
         br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#
+    );
+}
+
+/// Fix 5(a): end-to-end proof that a missing object still reaches
+/// `batchItemFailures` — the first message's referenced object was never
+/// seeded in the store (`on_missing_object: error`), the second message's
+/// object was. Only the first message's id may appear in `failed_ack_ids`,
+/// and the second message's object must still land at the destination.
+#[tokio::test]
+async fn missing_object_fails_only_its_own_message_and_lets_the_sibling_through() {
+    let src = Arc::new(StaticConfigSource::new(
+        b"version: 1.0.0\nrules: []\n".to_vec(),
+        VersionTag::Version(1),
+    ));
+    let metrics = Arc::new(Metrics::default());
+    let cfg_store = Arc::new(ConfigStore::new(
+        src,
+        Duration::from_secs(300),
+        Arc::new(|b: &[u8]| Ok(Arc::new(Engine::new(RuleSet::parse(b)?)?))),
+        metrics.clone(),
+    ));
+    cfg_store.prime().await;
+
+    let store = Arc::new(InMemoryStore::new());
+    // "logs/missing.json.gz" is deliberately not seeded.
+    store.seed(
+        "src-bucket",
+        "logs/present.json.gz",
+        gzip(br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#),
+    );
+
+    let payload = br#"{"Records":[
+        {"messageId":"m-missing","body":"{\"Records\":[{\"s3\":{\"bucket\":{\"name\":\"src-bucket\"},\"object\":{\"key\":\"logs/missing.json.gz\",\"size\":64}}}]}"},
+        {"messageId":"m-present","body":"{\"Records\":[{\"s3\":{\"bucket\":{\"name\":\"src-bucket\"},\"object\":{\"key\":\"logs/present.json.gz\",\"size\":64}}}]}"}
+    ]}"#.to_vec();
+
+    let mut cfg = settings();
+    cfg.behavior.on_missing_object = OnMissingObject::Error;
+    cfg.behavior.partial_batch_failures = true;
+
+    let pipeline = Pipeline::new(
+        Arc::new(cfg.clone()),
+        Arc::new(SqsEventDecoder::new(cfg.sqs.body_format)),
+        store.clone(),
+        cfg_store,
+        metrics,
+        Arc::new(RecordingSink::new()),
+    );
+
+    let outcome = pipeline
+        .handle(&payload)
+        .await
+        .expect("partial_batch_failures=true must not fail the whole invocation");
+
+    assert_eq!(outcome.failed_ack_ids, vec!["m-missing".to_string()]);
+    assert!(
+        store.contains("dest-bucket", "logs/present.json.gz"),
+        "the sibling message's object must still have been written"
+    );
+}
+
+/// Fix 5(b): end-to-end proof that an undecodable message body (Fix 1)
+/// reaches `batchItemFailures` rather than being silently dropped and
+/// acked clean.
+#[tokio::test]
+async fn undecodable_message_body_fails_only_its_own_message() {
+    let src = Arc::new(StaticConfigSource::new(
+        b"version: 1.0.0\nrules: []\n".to_vec(),
+        VersionTag::Version(1),
+    ));
+    let metrics = Arc::new(Metrics::default());
+    let cfg_store = Arc::new(ConfigStore::new(
+        src,
+        Duration::from_secs(300),
+        Arc::new(|b: &[u8]| Ok(Arc::new(Engine::new(RuleSet::parse(b)?)?))),
+        metrics.clone(),
+    ));
+    cfg_store.prime().await;
+
+    let store = Arc::new(InMemoryStore::new());
+    store.seed(
+        "src-bucket",
+        "logs/present.json.gz",
+        gzip(br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#),
+    );
+
+    let payload = br#"{"Records":[
+        {"messageId":"m-garbage","body":"this is not json at all {{{"},
+        {"messageId":"m-present","body":"{\"Records\":[{\"s3\":{\"bucket\":{\"name\":\"src-bucket\"},\"object\":{\"key\":\"logs/present.json.gz\",\"size\":64}}}]}"}
+    ]}"#.to_vec();
+
+    let cfg = settings();
+
+    let pipeline = Pipeline::new(
+        Arc::new(cfg.clone()),
+        Arc::new(SqsEventDecoder::new(cfg.sqs.body_format)),
+        store.clone(),
+        cfg_store,
+        metrics,
+        Arc::new(RecordingSink::new()),
+    );
+
+    let outcome = pipeline
+        .handle(&payload)
+        .await
+        .expect("partial_batch_failures=true must not fail the whole invocation");
+
+    assert_eq!(outcome.failed_ack_ids, vec!["m-garbage".to_string()]);
+    assert!(
+        store.contains("dest-bucket", "logs/present.json.gz"),
+        "the sibling message's object must still have been written"
     );
 }

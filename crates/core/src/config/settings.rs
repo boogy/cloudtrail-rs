@@ -7,7 +7,22 @@
 //! the override step is a pure function of an injected `env` lookup:
 //! `Settings::load()` is the only place that closes over `std::env::var`.
 
+use regex::RegexBuilder;
+
+use crate::config::rules::REGEX_SIZE_LIMIT;
 use crate::error::ConfigError;
+
+/// S3's hard minimum for a non-final multipart upload part. A smaller
+/// `processing.multipart_part_bytes` fails `CompleteMultipartUpload` with
+/// `EntityTooSmall` mid-object, after bytes are already uploaded — so this is
+/// rejected at config load instead (Fix D).
+const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Highest gzip compression level `flate2`'s `rust_backend` (miniz_oxide)
+/// accepts. `Compression::new(11)` panics (`assertion failed: level.level()
+/// <= 10` inside `buffer_run`/`stream_run`, on the first object — not at
+/// init), so this is rejected at config load instead (Fix A).
+const MAX_GZIP_LEVEL: u32 = 9;
 
 /// How an object's size determines buffer vs. stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -467,6 +482,70 @@ impl Document {
                     .to_string(),
             ));
         }
+
+        // Fix B (F4): compile both key regexes here, at load time. Left
+        // uncompiled, an invalid pattern panics inside `Pipeline::new` —
+        // a cold-start crash loop unreachable from pre-deploy validation.
+        // Discarded once built: this is validation only, `Pipeline::new`
+        // compiles its own copy. Same size limit as the rules path so a
+        // pattern that passes here is guaranteed to also compile there.
+        RegexBuilder::new(&self.source.include_key_regex)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|e| {
+                ConfigError::Parse(format!(
+                    "source.include_key_regex {:?} is not a valid regex: {e}",
+                    self.source.include_key_regex
+                ))
+            })?;
+        RegexBuilder::new(&self.source.exclude_key_regex)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|e| {
+                ConfigError::Parse(format!(
+                    "source.exclude_key_regex {:?} is not a valid regex: {e}",
+                    self.source.exclude_key_regex
+                ))
+            })?;
+
+        // Fix A (F3): flate2's rust_backend panics on a gzip level above 9
+        // (`gzip_level` is `u32`, so a negative value is already impossible).
+        if self.processing.gzip_level > MAX_GZIP_LEVEL {
+            return Err(ConfigError::Parse(format!(
+                "processing.gzip_level {} is out of range: must be 0..={MAX_GZIP_LEVEL} \
+                 (9 = best compression) — flate2's rust_backend panics on higher values, on the \
+                 first object processed, not at startup",
+                self.processing.gzip_level
+            )));
+        }
+
+        // Fix C (F5): stream_threshold_bytes is a COMPRESSED-size estimate
+        // that routes an object to buffer vs. stream mode; max_object_bytes
+        // is buffer mode's DECOMPRESSED-size cap. If max_object_bytes is
+        // smaller, every object routed to buffer mode is guaranteed to blow
+        // the cap.
+        if self.processing.max_object_bytes < self.processing.stream_threshold_bytes {
+            return Err(ConfigError::Parse(format!(
+                "processing.max_object_bytes ({} bytes, buffer mode's decompressed-size cap) is \
+                 smaller than processing.stream_threshold_bytes ({} bytes, the compressed-size \
+                 estimate that selects buffer vs. stream mode): any object routed to buffer mode \
+                 is guaranteed to exceed max_object_bytes",
+                self.processing.max_object_bytes, self.processing.stream_threshold_bytes
+            )));
+        }
+
+        // Fix D (F7): S3's hard minimum for a non-final multipart part. A
+        // smaller value fails CompleteMultipartUpload with EntityTooSmall
+        // mid-object, after bytes are already uploaded.
+        if self.processing.multipart_part_bytes < S3_MIN_MULTIPART_PART_BYTES {
+            return Err(ConfigError::Parse(format!(
+                "processing.multipart_part_bytes ({} bytes) is below S3's hard minimum of {} \
+                 bytes (5 MiB) for a non-final multipart part: CompleteMultipartUpload would \
+                 fail with EntityTooSmall mid-object, after bytes are already uploaded",
+                self.processing.multipart_part_bytes, S3_MIN_MULTIPART_PART_BYTES
+            )));
+        }
+
         Ok(())
     }
 
@@ -505,7 +584,10 @@ impl Settings {
     /// process environment or filesystem access — so every override and
     /// default combination is directly testable without `std::env` global
     /// state.
-    fn from_parts(
+    ///
+    /// `pub` so the CLI's `validate-settings` subcommand can run the exact
+    /// same validation the Lambda binaries do, instead of reimplementing it.
+    pub fn from_parts(
         bytes: Option<&[u8]>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Settings, ConfigError> {
@@ -641,7 +723,8 @@ mod tests {
             ("CT_PROCESSING_MODE", "stream"),
             ("CT_STREAM_THRESHOLD_BYTES", "1"),
             ("CT_MAX_OBJECT_BYTES", "2"),
-            ("CT_MULTIPART_PART_BYTES", "3"),
+            // Must be >= S3's 5 MiB multipart-part minimum (Fix D).
+            ("CT_MULTIPART_PART_BYTES", "5242880"),
             ("CT_GZIP_LEVEL", "9"),
             ("CT_DRY_RUN", "true"),
             ("CT_ON_CONFIG_ERROR", "closed"),
@@ -666,7 +749,7 @@ mod tests {
         assert_eq!(settings.processing.mode, ProcessingMode::Stream);
         assert_eq!(settings.processing.stream_threshold_bytes, 1);
         assert_eq!(settings.processing.max_object_bytes, 2);
-        assert_eq!(settings.processing.multipart_part_bytes, 3);
+        assert_eq!(settings.processing.multipart_part_bytes, 5_242_880);
         assert_eq!(settings.processing.gzip_level, 9);
         assert!(settings.behavior.dry_run);
         assert_eq!(settings.behavior.on_config_error, OnConfigError::Closed);
@@ -707,5 +790,109 @@ mod tests {
         let err =
             Settings::from_parts(Some(yaml), &no_env).expect_err("unknown field must be rejected");
         assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+    }
+
+    // --- Fix A (F3): gzip_level range ---------------------------------
+
+    #[test]
+    fn rejects_gzip_level_above_nine() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  gzip_level: 10\n";
+        let err = Settings::from_parts(Some(yaml), &no_env)
+            .expect_err("gzip_level 10 must be rejected: flate2's rust_backend panics above 9");
+        assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("gzip_level"),
+            "error must name the offending key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_gzip_level_nine_boundary() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  gzip_level: 9\n";
+        let settings = Settings::from_parts(Some(yaml), &no_env)
+            .expect("gzip_level 9 is the highest valid level and must be accepted");
+        assert_eq!(settings.processing.gzip_level, 9);
+    }
+
+    // --- Fix B (F4): key regexes must compile --------------------------
+
+    #[test]
+    fn accepts_valid_key_regexes() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nsource:\n  include_key_regex: \"\\\\.json\\\\.gz$\"\n  exclude_key_regex: \"^ok$\"\n";
+        Settings::from_parts(Some(yaml), &no_env).expect("valid regexes must pass validation");
+    }
+
+    #[test]
+    fn rejects_uncompilable_include_key_regex() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nsource:\n  include_key_regex: \"[\"\n";
+        let err = Settings::from_parts(Some(yaml), &no_env)
+            .expect_err("an unterminated character class must be rejected");
+        assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("include_key_regex"),
+            "error must name include_key_regex, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_uncompilable_exclude_key_regex() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nsource:\n  exclude_key_regex: \"[\"\n";
+        let err = Settings::from_parts(Some(yaml), &no_env)
+            .expect_err("an unterminated character class must be rejected");
+        assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("exclude_key_regex"),
+            "error must name exclude_key_regex, got: {err}"
+        );
+    }
+
+    // --- Fix C (F5): max_object_bytes vs. stream_threshold_bytes -------
+
+    #[test]
+    fn rejects_max_object_bytes_below_stream_threshold_bytes() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  stream_threshold_bytes: 100\n  max_object_bytes: 99\n";
+        let err = Settings::from_parts(Some(yaml), &no_env).expect_err(
+            "max_object_bytes smaller than stream_threshold_bytes must be rejected: buffer-mode \
+             objects would be guaranteed to exceed the cap",
+        );
+        assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_object_bytes") && msg.contains("stream_threshold_bytes"),
+            "error must name both keys, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_max_object_bytes_equal_to_stream_threshold_bytes_boundary() {
+        let yaml = b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  stream_threshold_bytes: 100\n  max_object_bytes: 100\n";
+        let settings = Settings::from_parts(Some(yaml), &no_env)
+            .expect("max_object_bytes == stream_threshold_bytes must be accepted");
+        assert_eq!(settings.processing.max_object_bytes, 100);
+        assert_eq!(settings.processing.stream_threshold_bytes, 100);
+    }
+
+    // --- Fix D (F7): multipart_part_bytes minimum -----------------------
+
+    #[test]
+    fn rejects_multipart_part_bytes_below_s3_minimum() {
+        let yaml =
+            b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  multipart_part_bytes: 5242879\n";
+        let err = Settings::from_parts(Some(yaml), &no_env)
+            .expect_err("multipart_part_bytes below S3's 5 MiB minimum must be rejected");
+        assert!(matches!(err, crate::error::ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("multipart_part_bytes"),
+            "error must name the offending key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_multipart_part_bytes_at_s3_minimum_boundary() {
+        let yaml =
+            b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  multipart_part_bytes: 5242880\n";
+        let settings = Settings::from_parts(Some(yaml), &no_env)
+            .expect("multipart_part_bytes exactly at S3's 5 MiB minimum must be accepted");
+        assert_eq!(settings.processing.multipart_part_bytes, 5_242_880);
     }
 }

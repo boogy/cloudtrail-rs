@@ -22,8 +22,8 @@ rule, write the survivors to a destination bucket with the same
 | [configuration.md](configuration.md) | `SETTINGS_URI`, precedence, the settings file, full `CT_*` env-var reference, the YAML quoting trap.      |
 | [rules.md](rules.md)                 | Rules schema, AND-within/OR-across evaluation, the rule index and the `always` bucket, validation.        |
 | [deployment.md](deployment.md)       | Four trigger topologies, building zips and container images, IAM, the SQS data-loss warning, rollout.     |
-| [cli.md](cli.md)                     | `validate` / `test` / `filter` reference with examples.                                                   |
-| [development.md](development.md)     | Everyday commands, Makefile targets, MiniStack tests, CI, the release pipeline, repo secrets.  |
+| [cli.md](cli.md)                     | `validate` / `validate-settings` / `test` / `filter` reference with examples.                             |
+| [development.md](development.md)     | Everyday commands, Makefile targets, MiniStack tests, CI, the release pipeline, repo secrets.             |
 
 ---
 

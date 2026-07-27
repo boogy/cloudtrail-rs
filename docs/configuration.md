@@ -7,6 +7,8 @@ always) a `CT_*` environment override. **Environment always wins over the file.*
 - [Precedence](#precedence)
 - [The settings file](#the-settings-file)
 - [Environment variable reference](#environment-variable-reference)
+- [Validation constraints](#validation-constraints)
+- [Pre-deploy validation: `validate-settings`](#pre-deploy-validation-validate-settings)
 - [The YAML quoting trap](#the-yaml-quoting-trap)
 
 ## Where settings come from
@@ -91,7 +93,7 @@ observability:
 | `CT_MAX_OBJECT_BYTES`         | `processing.max_object_bytes`       | Buffer-mode-only guard on decompressed size.                                                                                                                                              | `134217728`                             |
 | `CT_MULTIPART_PART_BYTES`     | `processing.multipart_part_bytes`   | Stream-mode S3 multipart part size.                                                                                                                                                       | `8388608`                               |
 | `CT_GZIP_LEVEL`               | `processing.gzip_level`             | Output gzip compression level.                                                                                                                                                            | `6`                                     |
-| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count what would be dropped, but write nothing to the destination.                                                                                                            | `false`                                 |
+| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count what would be dropped, but write nothing to the destination.                                                                                                           | `false`                                 |
 | `CT_ON_CONFIG_ERROR`          | `behavior.on_config_error`          | `open` \| `closed` when the rules doc has never loaded successfully.                                                                                                                      | `open`                                  |
 | `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                         | `error`                                 |
 | `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                             | `copy`                                  |
@@ -118,6 +120,48 @@ observability:
   it, `error` fails.
 - **`processing.mode`** — see
   [buffer vs stream](architecture.md#processing-modes-buffer-vs-stream).
+
+## Validation constraints
+
+`panic = "abort"` is set in the release profile, so a bad config value that
+panics at runtime kills the whole Lambda process — a poison pill that retries
+until DLQ/expiry. These constraints are checked once, at settings load, so a
+bad value is a clear load-time error instead:
+
+| Field                             | Constraint                             | Why                                                                                                                                                                                                                    |
+| --------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `processing.gzip_level`           | `0`–`9`                                | `flate2`'s `rust_backend` panics on any level above 9 (`9` = best compression), on the first object processed — not at startup.                                                                                        |
+| `source.include_key_regex`        | must compile                           | An uncompilable pattern otherwise panics inside `Pipeline::new` at cold start (a crash loop), not at settings load.                                                                                                    |
+| `source.exclude_key_regex`        | must compile                           | Same as above.                                                                                                                                                                                                         |
+| `processing.max_object_bytes`     | `>= processing.stream_threshold_bytes` | `stream_threshold_bytes` is a **compressed**-size estimate that picks buffer vs. stream mode; `max_object_bytes` is buffer mode's **decompressed**-size cap. If it's smaller, buffer-mode objects always blow the cap. |
+| `processing.multipart_part_bytes` | `>= 5 * 1024 * 1024` (S3's minimum)    | A smaller part size fails `CompleteMultipartUpload` with `EntityTooSmall` mid-object, after bytes are already uploaded.                                                                                                |
+
+## Pre-deploy validation: `validate-settings`
+
+`cloudtrail-rs validate-settings [path]` runs a settings document through the
+exact same `Settings::from_parts` validation the Lambda binaries run at cold
+start — including every constraint above — so a bad settings file or a bad
+`CT_*` override is caught before it ships, not on the first invocation.
+
+```sh
+cloudtrail-rs validate-settings examples/settings.example.yaml
+# settings OK
+#   processing.mode:                   Auto
+#   processing.stream_threshold_bytes: 8388608
+#   processing.max_object_bytes:       134217728
+#   processing.multipart_part_bytes:   8388608
+#   processing.gzip_level:             6
+#   destination.bucket:                ct-siem-sync
+#   rules.uri:                         s3://sec-config/cloudtrail/rules.yaml
+echo $?   # 0
+```
+
+`path` is optional — omit it to validate the built-in defaults (plus any
+`CT_*` overrides already in the environment), the env-only deployment case.
+`CT_*` env vars are honoured exactly as in production, so the same command
+also doubles as a way to sanity-check a deployment's actual environment
+before it goes live. Exit code is non-zero, with the offending key named in
+the error, on any validation failure.
 
 ## The YAML quoting trap
 

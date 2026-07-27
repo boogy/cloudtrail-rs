@@ -5,13 +5,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
+use crate::config::rules::REGEX_SIZE_LIMIT;
 use crate::config::settings::{
     OnConfigError, OnMissingObject, OnUnrecognizedObject, ProcessingMode,
 };
 use crate::config::{ConfigStore, Settings};
-use crate::error::{CoreError, StoreError};
+use crate::error::{CoreError, DecodeError, StoreError};
 use crate::filter::Engine;
 use crate::metrics::Metrics;
 use crate::model::{ObjectRef, PutMeta, SourceItem};
@@ -69,18 +70,24 @@ impl Pipeline {
         metrics: Arc<Metrics>,
         sink: Arc<dyn MetricsSink>,
     ) -> Self {
-        let include_regex = Regex::new(&settings.source.include_key_regex).unwrap_or_else(|e| {
-            panic!(
-                "invalid source.include_key_regex {:?}: {e}",
-                settings.source.include_key_regex
-            )
-        });
-        let exclude_regex = Regex::new(&settings.source.exclude_key_regex).unwrap_or_else(|e| {
-            panic!(
-                "invalid source.exclude_key_regex {:?}: {e}",
-                settings.source.exclude_key_regex
-            )
-        });
+        let include_regex = RegexBuilder::new(&settings.source.include_key_regex)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "invalid source.include_key_regex {:?}: {e}",
+                    settings.source.include_key_regex
+                )
+            });
+        let exclude_regex = RegexBuilder::new(&settings.source.exclude_key_regex)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .build()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "invalid source.exclude_key_regex {:?}: {e}",
+                    settings.source.exclude_key_regex
+                )
+            });
         Self {
             settings,
             decoder,
@@ -116,6 +123,28 @@ impl Pipeline {
         let mut failed_ack_ids = Vec::new();
 
         for item in &items {
+            if let Some(msg) = &item.decode_error {
+                self.metrics.add_decode_errors(1);
+                tracing::error!(ack_id = ?item.ack_id, error = %msg, "message body failed to decode");
+
+                if self.settings.behavior.partial_batch_failures && item.ack_id.is_some() {
+                    // Safe to isolate: fail just this message's ack rather
+                    // than the whole batch (mirrors the per-object failure
+                    // handling below). The message is redriven and retried,
+                    // instead of being silently deleted by SQS with its
+                    // referenced object never processed.
+                    if let Some(id) = &item.ack_id {
+                        failed_ack_ids.push(id.clone());
+                    }
+                    continue;
+                }
+                return Err(CoreError::Decode(DecodeError::InvalidPayload(msg.clone())));
+            }
+
+            if item.objects.is_empty() {
+                self.metrics.add_items_without_objects(1);
+            }
+
             let mut item_failed = false;
 
             for object in &item.objects {
@@ -124,9 +153,20 @@ impl Pipeline {
                 }
 
                 let dest_bucket = self.settings.destination.bucket.clone();
-                let dest_key = format!("{}{}", self.settings.destination.key_prefix, object.key);
+                let key_prefix = &self.settings.destination.key_prefix;
+                let dest_key = format!("{key_prefix}{}", object.key);
 
-                if dest_bucket == object.bucket && dest_key == object.key {
+                // Exact match (dest_key == object.key) catches the trivial
+                // loop. But if the destination bucket equals the source
+                // bucket and key_prefix is non-empty, every object we
+                // *ever write* lives under key_prefix in that same bucket —
+                // so reading an object already under our own output prefix
+                // means we are about to reprocess our own prior output,
+                // which would re-trigger the Lambda forever even though no
+                // single (bucket, key) pair is an exact match.
+                let reading_own_output =
+                    !key_prefix.is_empty() && object.key.starts_with(key_prefix.as_str());
+                if dest_bucket == object.bucket && (dest_key == object.key || reading_own_output) {
                     return Err(CoreError::SelfTrigger {
                         dest_bucket,
                         dest_key,
@@ -241,8 +281,36 @@ impl Pipeline {
 
         match self.select_mode(object.size) {
             ObjectMode::Buffer => {
-                self.process_buffer(engine, object, dest_bucket, dest_key)
-                    .await
+                let result = self
+                    .process_buffer(engine, object, dest_bucket, dest_key)
+                    .await;
+                match result {
+                    // Auto mode picked Buffer off `object.size` vs.
+                    // `stream_threshold_bytes` (a *compressed*-size
+                    // estimate); `max_object_bytes` (buffer-mode's
+                    // *decompressed*-size cap) can still be blown by a
+                    // highly compressible object. Without this retry that
+                    // object fails identically on every redelivery — a
+                    // permanent poison pill. Stream mode has no size cap by
+                    // design (bounded-memory), so it always succeeds where
+                    // buffer mode overflowed. Only in Auto: an explicit
+                    // `mode: buffer` config means the operator opted out of
+                    // stream mode, so ObjectTooLarge there must still surface.
+                    Err(CoreError::ObjectTooLarge { limit })
+                        if self.settings.processing.mode == ProcessingMode::Auto =>
+                    {
+                        tracing::warn!(
+                            bucket = %object.bucket,
+                            key = %object.key,
+                            limit,
+                            "buffer mode exceeded max_object_bytes in auto mode; retrying via \
+                             stream mode (bounded memory, no size cap)"
+                        );
+                        self.process_stream(engine, object, dest_bucket, dest_key)
+                            .await
+                    }
+                    other => other,
+                }
             }
             ObjectMode::Stream => {
                 self.process_stream(engine, object, dest_bucket, dest_key)
@@ -297,9 +365,19 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        self.metrics.add_bytes_in(bytes.len() as u64);
+        let result = buffer_run(&bytes, engine, &self.settings.processing, &self.metrics);
 
-        let outcome = buffer_run(&bytes, engine, &self.settings.processing, &self.metrics)?;
+        // `BytesIn` is skipped for exactly one case: an `ObjectTooLarge` in
+        // auto mode, which `process_object` retries through `process_stream`.
+        // Stream mode counts the input bytes it reads itself, so counting
+        // here as well would bill the same object twice. Every other outcome
+        // — success or failure — counts the bytes actually ingested.
+        let retried_via_stream = matches!(result, Err(CoreError::ObjectTooLarge { .. }))
+            && self.settings.processing.mode == ProcessingMode::Auto;
+        if !retried_via_stream {
+            self.metrics.add_bytes_in(bytes.len() as u64);
+        }
+        let outcome = result?;
 
         match outcome {
             Outcome::Written(Some(out_bytes)) => {
@@ -518,10 +596,14 @@ rules:
     }
 
     fn item(ack_id: Option<&str>, objects: Vec<ObjectRef>) -> SourceItem {
-        SourceItem {
-            ack_id: ack_id.map(str::to_string),
-            objects,
-        }
+        SourceItem::new(ack_id.map(str::to_string), objects)
+    }
+
+    /// Like `item`, but pre-marked as undecodable — for tests exercising
+    /// `Pipeline::handle_inner`'s FIX 1 decode-error handling directly,
+    /// without going through a real `EventDecoder`.
+    fn undecodable_item(ack_id: Option<&str>, error: &str) -> SourceItem {
+        SourceItem::undecodable(ack_id.map(str::to_string), error.to_string())
     }
 
     fn cloudtrail_body(event_names: &[&str]) -> Vec<u8> {
@@ -604,6 +686,161 @@ rules:
     }
 
     #[tokio::test]
+    async fn self_trigger_guard_errors_when_reading_own_output_prefix_in_same_bucket() {
+        // Not an exact-match case: the source key is "output/some-file.json.gz"
+        // but the computed dest_key is "output/output/some-file.json.gz" — no
+        // single (bucket, key) pair matches. But dest bucket == source bucket
+        // and the source key already lives under our own output prefix, so
+        // every object we write here would itself be read back in and
+        // re-written forever.
+        let store = Arc::new(InMemoryStore::new());
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("shared-bucket", "output/some-file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.destination.bucket = "shared-bucket".to_string();
+        settings.destination.key_prefix = "output/".to_string();
+
+        let pipeline = Pipeline::new(Arc::new(settings), decoder, store, config, metrics, sink);
+
+        let err = pipeline.handle(b"{}").await.expect_err(
+            "reading an object under our own output prefix in our own bucket must error",
+        );
+        assert!(matches!(err, CoreError::SelfTrigger { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn self_trigger_guard_allows_same_prefix_in_a_different_bucket() {
+        // Same key_prefix shape as the positive case above, but the
+        // destination bucket differs from the source bucket — cross-bucket
+        // is never a self-trigger, so this must succeed.
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+        store.seed("other-bucket", "output/some-file.json.gz", body.clone());
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("other-bucket", "output/some-file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.destination.bucket = "dest-bucket".to_string();
+        settings.destination.key_prefix = "output/".to_string();
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink,
+        );
+
+        pipeline
+            .handle(b"{}")
+            .await
+            .expect("a different destination bucket must never be treated as a self-trigger");
+        assert!(store.contains("dest-bucket", "output/output/some-file.json.gz"));
+    }
+
+    #[tokio::test]
+    async fn undecodable_item_with_ack_id_collects_its_ack_id_without_failing_the_batch() {
+        let store = Arc::new(InMemoryStore::new());
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![
+            undecodable_item(Some("bad-ack"), "garbage message body"),
+            item(
+                Some("good-ack"),
+                vec![object("src-bucket", "file.json.gz", None)],
+            ),
+        ]));
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+        store.seed("src-bucket", "file.json.gz", body);
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.behavior.partial_batch_failures = true;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink,
+        );
+
+        let outcome = pipeline
+            .handle(b"{}")
+            .await
+            .expect("an undecodable item with partial_batch_failures=true must not fail the batch");
+        assert_eq!(outcome.failed_ack_ids, vec!["bad-ack".to_string()]);
+        assert!(
+            store.contains("dest-bucket", "file.json.gz"),
+            "the sibling item must still have been processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_item_without_ack_id_is_a_hard_error() {
+        // Mirrors the S3/SNS/EventBridge decoders, which never set ack_id:
+        // there is no per-message ack to isolate the failure to, so it must
+        // fail the whole invocation rather than being silently swallowed.
+        let store = Arc::new(InMemoryStore::new());
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![undecodable_item(
+            None,
+            "garbage message body",
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.behavior.partial_batch_failures = true;
+
+        let pipeline = Pipeline::new(Arc::new(settings), decoder, store, config, metrics, sink);
+
+        let err = pipeline
+            .handle(b"{}")
+            .await
+            .expect_err("an undecodable item with no ack_id must be a hard error");
+        assert!(matches!(err, CoreError::Decode(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn item_with_no_objects_increments_the_items_without_objects_metric() {
+        let store = Arc::new(InMemoryStore::new());
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(Some("ack-1"), vec![])]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let pipeline = Pipeline::new(
+            Arc::new(base_settings()),
+            decoder,
+            store,
+            config,
+            metrics,
+            sink.clone(),
+        );
+
+        pipeline.handle(b"{}").await.expect("must succeed");
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].items_without_objects, 1);
+        assert_eq!(snapshots[0].decode_errors, 0);
+    }
+
+    #[tokio::test]
     async fn absent_size_selects_buffer_mode() {
         let store = Arc::new(InMemoryStore::new());
         let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
@@ -674,6 +911,117 @@ rules:
             .object("dest-bucket", "file.json.gz")
             .expect("must have written the destination");
         assert_eq!(gunzip(&written), gunzip(&body));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_retries_via_stream_when_buffer_mode_hits_max_object_bytes() {
+        // No `size` on the object (so `select_mode` picks Buffer off the
+        // default arm), but `max_object_bytes` is set far smaller than the
+        // decompressed body — buffer mode must hit ObjectTooLarge, and Auto
+        // mode must retry the same object through stream mode (no size cap)
+        // rather than treat ObjectTooLarge as a permanent failure.
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&[
+            "ConsoleLogin",
+            "AssumeRole",
+            "StopInstances",
+        ]));
+        store.seed("src-bucket", "file.json.gz", body.clone());
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.processing.mode = ProcessingMode::Auto;
+        settings.processing.max_object_bytes = 10; // far smaller than the decompressed body
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink.clone(),
+        );
+
+        pipeline
+            .handle(b"{}")
+            .await
+            .expect("auto mode must retry via stream and succeed, not fail permanently");
+        assert!(
+            store.put_stream_progress() > 0,
+            "the retry must have gone through stream mode (put_stream)"
+        );
+        let written = store
+            .object("dest-bucket", "file.json.gz")
+            .expect("must have written the destination via the stream retry");
+        assert_eq!(gunzip(&written), gunzip(&body));
+
+        // The failed buffer attempt must not also bill its bytes: the
+        // object is ingested once, so BytesIn must equal the object size
+        // exactly once, not twice.
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 1, "one snapshot per invocation");
+        assert_eq!(
+            snapshots[0].bytes_in,
+            body.len() as u64,
+            "BytesIn must count the retried object once, not once per attempt"
+        );
+        assert_eq!(
+            snapshots[0].objects_processed, 1,
+            "the retried object must be counted as processed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_buffer_mode_still_fails_object_too_large_without_retry() {
+        // Same oversized-decompressed-body setup as the Auto-mode retry
+        // test above, but `mode: buffer` is explicit — the operator opted
+        // out of stream mode, so ObjectTooLarge must still surface as an
+        // error rather than being silently retried.
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&[
+            "ConsoleLogin",
+            "AssumeRole",
+            "StopInstances",
+        ]));
+        store.seed("src-bucket", "file.json.gz", body);
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.processing.mode = ProcessingMode::Buffer;
+        settings.processing.max_object_bytes = 10;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink,
+        );
+
+        let err = pipeline
+            .handle(b"{}")
+            .await
+            .expect_err("explicit buffer mode must not retry via stream");
+        assert!(
+            matches!(err, CoreError::ObjectTooLarge { .. }),
+            "got {err:?}"
+        );
+        assert!(!store.contains("dest-bucket", "file.json.gz"));
     }
 
     #[tokio::test]

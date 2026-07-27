@@ -18,7 +18,7 @@ local/offline **CLI**, on a hexagonal core. Every crate is `#![forbid(unsafe_cod
 | --------------------------- | ----------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------- |
 | `crates/core`               | `cloudtrail-rs-core`    | [CLAUDE.md](crates/core/CLAUDE.md)               | Hexagonal core: filtering engine, ports, decoders, pipeline. **Zero AWS deps.** |
 | `crates/aws`                | `cloudtrail-rs-aws`     | [CLAUDE.md](crates/aws/CLAUDE.md)                | AWS adapters (S3/SSM) behind core's ports. Owns the **ring TLS** decision.      |
-| `crates/cli`                | `cloudtrail-rs`         | [CLAUDE.md](crates/cli/CLAUDE.md)                | Local/offline CLI: `validate` / `test` / `filter`.                              |
+| `crates/cli`                | `cloudtrail-rs`         | [CLAUDE.md](crates/cli/CLAUDE.md)                | Local/offline CLI: `validate` / `validate-settings` / `test` / `filter`.        |
 | `crates/lambda-s3`          | —                       | [CLAUDE.md](crates/lambda-s3/CLAUDE.md)          | Composition root, `decode-s3`.                                                  |
 | `crates/lambda-sns`         | —                       | [CLAUDE.md](crates/lambda-sns/CLAUDE.md)         | Composition root, `decode-sns`.                                                 |
 | `crates/lambda-sqs`         | —                       | [CLAUDE.md](crates/lambda-sqs/CLAUDE.md)         | Composition root, `decode-sqs`. **Batch-failure invariant.**                    |
@@ -47,6 +47,12 @@ deployment, cli, development. The root [`README.md`](README.md) is the user-faci
 5. **SQS = `ReportBatchItemFailures` mandatory.** Without it a partial batch
    failure is silent, unrecoverable data loss. See
    [`crates/lambda-sqs/CLAUDE.md`](crates/lambda-sqs/CLAUDE.md).
+6. **One version, and it equals the tag.** No crate carries its own `version` —
+   all eight inherit `[workspace.package] version` via `version.workspace = true`.
+   Release = `make bump VERSION=x.y.z` → commit → `git tag vx.y.z`.
+   `make version-check` (release.yml's `setup` job, which gates every other
+   job) fails the release if a crate breaks inheritance or the tag disagrees.
+   The tag is what `crates/core/build.rs` bakes into the binaries.
 
 ## Build / test
 
@@ -59,6 +65,7 @@ Stable toolchain (`rust-toolchain.toml`). Common `make` targets:
 - `make release` — fast lean `release` build (verify it builds/links).
 - `make lambda-build` — cross-compile the four `bootstrap` binaries, `dist` profile (needs `cargo-lambda`).
 - `make ministack-up` then `make ministack-test` — `#[ignore]`d local S3/SSM integration tests.
+- `make bump VERSION=x.y.z` / `make version-check` — the release version gate (invariant 6).
 
 Two profiles in root `Cargo.toml`: `release` (lean, CI smoke — proves static-musl
 

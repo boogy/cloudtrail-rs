@@ -43,6 +43,9 @@ make install-tools
 | `audit`                           | Scan dependencies for RUSTSEC advisories (needs cargo-audit).                      |
 | `deny`                            | Check licenses, bans, advisories, sources via `deny.toml` (needs cargo-deny).      |
 | `coverage`                        | Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-preview).       |
+| `version`                         | Print the one workspace version.                                                   |
+| `version-check`                   | Fail if crates disagree, or if `TAG` != the workspace version (release gate).      |
+| `bump`                            | `make bump VERSION=1.2.3` — set the workspace version + refresh `Cargo.lock`.      |
 | `release-musl`                    | Local static-musl `dist`-profile build of the whole workspace for one target.      |
 | `validate`                        | Validate the example ruleset (prints always-bucket warnings).                      |
 | `sample`                          | Show KEEP/DROP breakdown for the sample fixture.                                   |
@@ -85,16 +88,48 @@ cargo test --workspace -- --ignored
 `.github/workflows/codeql.yml` runs CodeQL (`language: rust`, `build-mode: none`)
 on push/PR/weekly. `cargo-audit`/`cargo-deny` in CI are the reliable backstop.
 
+## Versioning
+
+There is exactly **one** version, `[workspace.package] version` in the root
+`Cargo.toml`; all eight crates inherit it with `version.workspace = true`. It is
+not a publishing version — nothing is published (`publish = false`) and every
+internal dependency is a path dependency — it exists so cargo's view of the tree
+matches the artifacts.
+
+What actually ships is the **git tag**: `release.yml` passes `$GITHUB_REF_NAME`
+as `CLOUDTRAIL_RS_VERSION`, and [`crates/core/build.rs`](../crates/core/build.rs)
+bakes it into every binary (`core::build_info::VERSION`, logged at cold start and
+printed by `cloudtrail-rs --version`).
+
+`make version-check` is what keeps the two from drifting. It fails if any crate
+carries its own version, and — given a `TAG` (or a tag on `HEAD`) — if that tag
+disagrees with the workspace version. It runs in release.yml's `setup` job, which
+every other job `needs`, so a mismatched tag fails the release before a single
+binary is built.
+
 ## Release process
 
-Cut a `v*` tag; everything else is automated by
+```sh
+make bump VERSION=1.2.3        # sets [workspace.package] version + Cargo.lock
+git commit -am "chore: release v1.2.3"
+git tag v1.2.3 && git push --follow-tags
+```
+
+`make bump` refuses non-semver input, runs `version-check` on the result, and
+prints those next steps. Skipping it is not a silent mistake: the tag push fails
+in `setup`. The `Cargo.lock` refresh matters — release builds use
+`cargo build --locked`, which errors on a stale lockfile.
+
+Everything after the tag is automated by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub
 Actions, no goreleaser and no zig.
 
 ```mermaid
 flowchart TD
-    TAG["git tag v1.2.3<br/>git push --tags"] --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
-    TAG --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
+    BUMP["make bump VERSION=1.2.3<br/>commit"] --> TAG["git tag v1.2.3<br/>git push --follow-tags"]
+    TAG --> GATE["setup job<br/>make version-check TAG=$GITHUB_REF_NAME<br/>(gates every job below)"]
+    GATE --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
+    GATE --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
     B --> BINS["4 lambda bootstrap zips<br/>+ CLI tar.gz<br/>(aarch64 & x86_64 musl)"]
     B --> RAW["raw bootstrap binaries<br/>(artifacts, for images)"]
     BM --> DARWIN["CLI darwin tar.gz"]

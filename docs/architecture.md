@@ -50,15 +50,15 @@ flowchart LR
 Adding a new event source is one new `EventDecoder` behind one new Cargo feature
 and one new bin — **zero changes to `core`**.
 
-| Crate                                                            | Role                                                                                                                             |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/core` (`cloudtrail-rs-core`)                             | Filtering engine, ports, model, config schema. No `aws-sdk-*` dependency.                                                        |
-| `crates/aws` (`cloudtrail-rs-aws`)                               | `S3ObjectStore`, `S3ConfigSource`, `SsmConfigSource` — the AWS-backed port implementations.                                      |
-| `crates/lambda-s3` (`cloudtrail-rs-lambda-s3`)                   | Composition root, S3 → Lambda direct trigger, feature `decode-s3`.                                                               |
-| `crates/lambda-sns` (`cloudtrail-rs-lambda-sns`)                 | Composition root, S3 → SNS → Lambda trigger, feature `decode-sns`.                                                               |
-| `crates/lambda-sqs` (`cloudtrail-rs-lambda-sqs`)                 | Composition root, S3 → SQS → Lambda trigger, feature `decode-sqs`.                                                               |
-| `crates/lambda-eventbridge` (`cloudtrail-rs-lambda-eventbridge`) | Composition root, S3 → EventBridge → Lambda trigger, feature `decode-eventbridge`.                                               |
-| `crates/cli` (`cloudtrail-rs`)                                   | Offline CLI: `validate`, `test`, `filter`. Depends on `core` **and** `aws` (so a rules/config `uri` can be `ssm://` or `s3://`). |
+| Crate                                                            | Role                                                                                                                                                  |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/core` (`cloudtrail-rs-core`)                             | Filtering engine, ports, model, config schema. No `aws-sdk-*` dependency.                                                                             |
+| `crates/aws` (`cloudtrail-rs-aws`)                               | `S3ObjectStore`, `S3ConfigSource`, `SsmConfigSource` — the AWS-backed port implementations.                                                           |
+| `crates/lambda-s3` (`cloudtrail-rs-lambda-s3`)                   | Composition root, S3 → Lambda direct trigger, feature `decode-s3`.                                                                                    |
+| `crates/lambda-sns` (`cloudtrail-rs-lambda-sns`)                 | Composition root, S3 → SNS → Lambda trigger, feature `decode-sns`.                                                                                    |
+| `crates/lambda-sqs` (`cloudtrail-rs-lambda-sqs`)                 | Composition root, S3 → SQS → Lambda trigger, feature `decode-sqs`.                                                                                    |
+| `crates/lambda-eventbridge` (`cloudtrail-rs-lambda-eventbridge`) | Composition root, S3 → EventBridge → Lambda trigger, feature `decode-eventbridge`.                                                                    |
+| `crates/cli` (`cloudtrail-rs`)                                   | Offline CLI: `validate`, `validate-settings`, `test`, `filter`. Depends on `core` **and** `aws` (so a rules/config `uri` can be `ssm://` or `s3://`). |
 
 Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*`
 dependencies by design — the hexagonal boundary is enforced by the crate graph,
