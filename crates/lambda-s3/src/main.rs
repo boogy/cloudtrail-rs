@@ -51,6 +51,11 @@ fn build_sink(observability: &Observability) -> Arc<dyn MetricsSink> {
 async fn main() -> anyhow::Result<()> {
     // ---- INIT: once per container ----
     init_tracing();
+    tracing::info!(
+        version = cloudtrail_rs_core::build_info::VERSION,
+        git_sha = cloudtrail_rs_core::build_info::GIT_SHA,
+        "cloudtrail-rs starting"
+    );
     let settings = Arc::new(Settings::load().await?);
     let sdk_conf = load_aws_config(BehaviorVersion::latest()).await;
     let store = Arc::new(S3ObjectStore::new(&sdk_conf));

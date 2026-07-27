@@ -46,7 +46,8 @@ const GZIP_META: PutMeta = PutMeta {
 #[derive(Parser)]
 #[command(
     name = "cloudtrail-rs",
-    about = "Local tooling for cloudtrail-rs exclusion rules"
+    about = "Local tooling for cloudtrail-rs exclusion rules",
+    version = cloudtrail_rs_core::build_info::LONG
 )]
 struct Cli {
     #[command(subcommand)]

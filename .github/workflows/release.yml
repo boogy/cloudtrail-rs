@@ -85,6 +85,11 @@ jobs:
           # Point ring's cc-rs build at musl-gcc for this target.
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
+          # Bake the tag + commit into the binaries (core/build.rs). The tag is
+          # authoritative — GitHub's checkout is shallow/tag-less so `git
+          # describe` can't be trusted here.
+          CLOUDTRAIL_RS_VERSION: ${{ github.ref_name }}
+          CLOUDTRAIL_RS_GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           target='${{ matrix.target }}'
@@ -141,6 +146,9 @@ jobs:
           key: release-aarch64-apple-darwin
 
       - name: Build CLI
+        env:
+          CLOUDTRAIL_RS_VERSION: ${{ github.ref_name }}
+          CLOUDTRAIL_RS_GIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
