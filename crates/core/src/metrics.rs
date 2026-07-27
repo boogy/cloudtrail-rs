@@ -33,6 +33,8 @@ pub struct Metrics {
     bytes_out: AtomicU64,
     config_load_errors: AtomicU64,
     parse_errors: AtomicU64,
+    decode_errors: AtomicU64,
+    items_without_objects: AtomicU64,
     rule_drops: Mutex<HashMap<String, u64>>,
 }
 
@@ -77,6 +79,22 @@ impl Metrics {
         self.parse_errors.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// One decode error per undecodable `SourceItem` (a message whose body
+    /// itself failed to parse) — see `SourceItem::undecodable`.
+    pub fn add_decode_errors(&self, n: u64) {
+        self.decode_errors.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One per cleanly-decoded `SourceItem` that nonetheless carried zero
+    /// objects. This is an alarm signal, not necessarily an error: a
+    /// legitimate `s3:TestEvent` delivered via SQS trips it once (see
+    /// `MetricSnapshot::items_without_objects`); a *sustained* nonzero rate
+    /// usually means `sqs.body_format` is misconfigured against what the
+    /// queue is actually carrying, silently discarding every message.
+    pub fn add_items_without_objects(&self, n: u64) {
+        self.items_without_objects.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Records one dropped record attributed to `rule_name` (the `RuleDrops`
     /// metric's `Rule` dimension).
     pub fn record_rule_drop(&self, rule_name: &str) {
@@ -110,6 +128,8 @@ impl Metrics {
             bytes_out: self.bytes_out.swap(0, Ordering::Relaxed),
             config_load_errors: self.config_load_errors.swap(0, Ordering::Relaxed),
             parse_errors: self.parse_errors.swap(0, Ordering::Relaxed),
+            decode_errors: self.decode_errors.swap(0, Ordering::Relaxed),
+            items_without_objects: self.items_without_objects.swap(0, Ordering::Relaxed),
             rule_drops,
         }
     }
@@ -170,6 +190,8 @@ impl EmfMetricsSink {
                         {"Name": "BytesOut", "Unit": "Bytes"},
                         {"Name": "ConfigLoadErrors", "Unit": "Count"},
                         {"Name": "ParseErrors", "Unit": "Count"},
+                        {"Name": "DecodeErrors", "Unit": "Count"},
+                        {"Name": "ItemsWithoutObjects", "Unit": "Count"},
                         {"Name": "ColdStart", "Unit": "Count"}
                     ]
                 }]
@@ -184,6 +206,8 @@ impl EmfMetricsSink {
             "BytesOut": snapshot.bytes_out,
             "ConfigLoadErrors": snapshot.config_load_errors,
             "ParseErrors": snapshot.parse_errors,
+            "DecodeErrors": snapshot.decode_errors,
+            "ItemsWithoutObjects": snapshot.items_without_objects,
             "ColdStart": u8::from(snapshot.cold_start)
         })];
 
@@ -272,6 +296,8 @@ mod tests {
         metrics.add_bytes_out(8);
         metrics.add_config_load_errors(9);
         metrics.add_parse_errors(10);
+        metrics.add_decode_errors(11);
+        metrics.add_items_without_objects(12);
 
         let snapshot = metrics.snapshot_and_reset();
         assert_eq!(
@@ -288,6 +314,8 @@ mod tests {
                 bytes_out: 8,
                 config_load_errors: 9,
                 parse_errors: 10,
+                decode_errors: 11,
+                items_without_objects: 12,
                 rule_drops: vec![],
             }
         );
@@ -334,6 +362,8 @@ mod tests {
             bytes_out: 4500,
             config_load_errors: 0,
             parse_errors: 3,
+            decode_errors: 2,
+            items_without_objects: 1,
             rule_drops: vec![],
         };
 
@@ -360,6 +390,8 @@ mod tests {
                             {"Name": "BytesOut", "Unit": "Bytes"},
                             {"Name": "ConfigLoadErrors", "Unit": "Count"},
                             {"Name": "ParseErrors", "Unit": "Count"},
+                            {"Name": "DecodeErrors", "Unit": "Count"},
+                            {"Name": "ItemsWithoutObjects", "Unit": "Count"},
                             {"Name": "ColdStart", "Unit": "Count"}
                         ]
                     }]
@@ -374,6 +406,8 @@ mod tests {
                 "BytesOut": 4500,
                 "ConfigLoadErrors": 0,
                 "ParseErrors": 3,
+                "DecodeErrors": 2,
+                "ItemsWithoutObjects": 1,
                 "ColdStart": 1
             })
         );

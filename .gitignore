@@ -22,3 +22,7 @@ target
 
 docs/plans
 dist/
+tasks/
+
+# macOS Finder metadata
+.DS_Store

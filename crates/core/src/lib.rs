@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod build_info;
 pub mod config;
 #[cfg(any(
     feature = "decode-s3",

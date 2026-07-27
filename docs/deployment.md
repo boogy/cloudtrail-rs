@@ -182,6 +182,28 @@ The CLI's `filter`/`validate` S3 and SSM paths need the same read/write actions
 above, scoped to whatever bucket/prefix or parameter you point it at, under
 whatever credentials are active in your environment.
 
+## Which build is running
+
+Every Lambda logs its version and commit SHA once at cold start, as the first
+structured line of each new container's log stream:
+
+```json
+{
+  "level": "INFO",
+  "fields": {
+    "message": "cloudtrail-rs starting",
+    "version": "v1.2.3",
+    "git_sha": "a1b2c3d4e5f6"
+  }
+}
+```
+
+`version` is the release tag and `git_sha` the commit it was built from — both
+baked in at build time (`crates/core/build.rs`; release.yml injects the tag +
+`github.sha`). Filter for `"cloudtrail-rs starting"` in CloudWatch Logs Insights
+to see which build each function is on. The CLI reports the same via
+`cloudtrail-rs --version`.
+
 ## SQS: `ReportBatchItemFailures` is not optional
 
 > ⚠️ **This is silent, unrecoverable data loss if misconfigured.**
@@ -212,7 +234,8 @@ flowchart LR
 ```
 
 1. Deploy with `CT_DRY_RUN=true`. Every record is still evaluated and counted,
-   but nothing is dropped — the pipeline forwards everything.
+   but nothing is written — the pipeline touches the destination bucket not at
+   all, so you can preview a ruleset against live traffic with zero side effects.
 2. Watch the `RecordsDropped` EMF metric (namespace `CT_METRICS_NAMESPACE`,
    default `cloudtrail-rs`) against `RecordsIn` for a representative window.
    Cross-check against per-rule `RuleDrops` (dimension `Rule`) to confirm the

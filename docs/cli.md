@@ -7,6 +7,7 @@ package name `cloudtrail-rs`.
 - [Building](#building)
 - [URIs](#uris)
 - [`validate <uri>`](#validate-uri)
+- [`validate-settings [path]`](#validate-settings-path)
 - [`test <rules> <sample.json.gz>`](#test-rules-samplejsongz)
 - [`filter <source> <dest> --rules <uri>`](#filter-source-dest---rules-uri)
 
@@ -47,6 +48,37 @@ cloudtrail-rs validate examples/rules.example.yaml
 # warning: rule "Automated Tool Describe Operations" not indexed by eventSource (no eventSource condition): checked against every record
 echo $?   # 0
 ```
+
+## `validate-settings [path]`
+
+`validate` covers the _rules_ document; this covers the _settings_ document.
+It runs the file through the exact same `Settings::from_parts` the four Lambda
+binaries run at cold start — including every
+[validation constraint](configuration.md#validation-constraints) — so a value
+that would otherwise panic mid-invocation is caught before it ships. Because
+the release profile sets `panic = "abort"`, such a value is not a bad object,
+it is a poison pill: the process dies on every invocation until the DLQ or the
+retention window absorbs the backlog.
+
+`path` is optional. Omit it to validate the built-in defaults plus whatever
+`CT_*` overrides are in the environment — the env-only deployment case, and a
+way to sanity-check a deployment's real environment before it goes live.
+
+```sh
+cloudtrail-rs validate-settings examples/settings.example.yaml
+# settings OK
+#   processing.mode:                   Auto
+#   processing.stream_threshold_bytes: 8388608
+#   processing.max_object_bytes:       134217728
+#   processing.multipart_part_bytes:   8388608
+#   processing.gzip_level:             6
+#   destination.bucket:                ct-siem-sync
+#   rules.uri:                         s3://sec-config/cloudtrail/rules.yaml
+echo $?   # 0
+```
+
+Exit code is non-zero on any validation failure, with the offending key named
+in the error — the second thing CI should gate on, alongside `validate`.
 
 ## `test <rules> <sample.json.gz>`
 

@@ -4,8 +4,8 @@
 //! Depends on `cloudtrail-rs-core` **and** `cloudtrail-rs-aws` so a rules
 //! `uri` may be `ssm://`, `s3://`, `file://`, or a bare local path.
 //!
-//! Three subcommands, all reusing `core`'s existing engine/process logic —
-//! nothing here reimplements filtering:
+//! Four subcommands, all reusing `core`'s existing engine/process/config
+//! logic — nothing here reimplements filtering or validation:
 //! - `validate <uri>`: builds the `Engine`, prints rule/pattern counts, and
 //!   warns (non-fatally) about every rule `Engine::always_rules()` could not
 //!   index. Non-zero exit only on a config/build error — the CI gate.
@@ -18,6 +18,10 @@
 //!   object filtered into a mirrored destination), so filtering is visible
 //!   on the local filesystem and the same command works against S3 when AWS
 //!   credentials are present.
+//! - `validate-settings [path]`: runs a settings document through the exact
+//!   `Settings::from_parts` validation the Lambda binaries run at cold
+//!   start, so a bad value that would otherwise panic mid-invocation is
+//!   caught pre-deploy. Honours `CT_*` env overrides same as production.
 #![forbid(unsafe_code)]
 
 use std::io::Read;
@@ -27,8 +31,8 @@ use anyhow::Context;
 use aws_config::BehaviorVersion;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource};
-use cloudtrail_rs_core::config::{ConfigUri, Processing, RuleSet};
+use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
+use cloudtrail_rs_core::config::{ConfigUri, Processing, RuleSet, Settings};
 use cloudtrail_rs_core::filter::{Decision, Engine};
 use cloudtrail_rs_core::metrics::Metrics;
 use cloudtrail_rs_core::model::PutMeta;
@@ -46,7 +50,8 @@ const GZIP_META: PutMeta = PutMeta {
 #[derive(Parser)]
 #[command(
     name = "cloudtrail-rs",
-    about = "Local tooling for cloudtrail-rs exclusion rules"
+    about = "Local tooling for cloudtrail-rs exclusion rules",
+    version = cloudtrail_rs_core::build_info::LONG
 )]
 struct Cli {
     #[command(subcommand)]
@@ -86,6 +91,19 @@ enum Command {
         /// `ssm://`, `s3://`, `file://`, or a bare local path.
         #[arg(long)]
         rules: String,
+    },
+    /// Load a settings document and run the exact validation the Lambda
+    /// binaries run at cold start (`Settings::from_parts`), so a bad value
+    /// that would otherwise panic mid-invocation — `gzip_level` out of
+    /// range, an uncompilable key regex, `max_object_bytes` smaller than
+    /// `stream_threshold_bytes`, `multipart_part_bytes` below S3's 5 MiB
+    /// minimum — is caught pre-deploy instead. Prints a summary of the
+    /// effective settings on success; exits non-zero with the error on
+    /// failure.
+    ValidateSettings {
+        /// Local settings YAML file. Omit to validate built-in defaults
+        /// (plus any `CT_*` env overrides) — a valid env-only deployment.
+        path: Option<PathBuf>,
     },
 }
 
@@ -141,13 +159,13 @@ async fn load_rules_bytes(uri: &str) -> anyhow::Result<Vec<u8>> {
             std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))
         }
         ConfigUri::S3 { bucket, key } => {
-            let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let conf = load_aws_config(BehaviorVersion::latest()).await;
             let source = S3ConfigSource::new(&conf, bucket, key);
             let (bytes, _version) = source.fetch().await?;
             Ok(bytes)
         }
         ConfigUri::Ssm { path } => {
-            let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let conf = load_aws_config(BehaviorVersion::latest()).await;
             let source = SsmConfigSource::new(&conf, path);
             let (bytes, _version) = source.fetch().await?;
             Ok(bytes)
@@ -427,7 +445,7 @@ async fn write_single(
 /// S3; a purely local run never touches AWS.
 async fn build_s3_if_needed(src: &Location, dst: &Location) -> Option<S3ObjectStore> {
     if src.is_s3() || dst.is_s3() {
-        let conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let conf = load_aws_config(BehaviorVersion::latest()).await;
         Some(S3ObjectStore::new(&conf))
     } else {
         None
@@ -518,6 +536,57 @@ async fn cmd_filter(source: &str, dest: &str, rules_uri: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Loads `path` (or falls back to built-in defaults when `None`) and runs it
+/// through `Settings::from_parts` with `std::env::var` as the override
+/// source — the identical parse-override-validate path `Settings::load()`
+/// uses in production, so `validate-settings` is never a CLI-side
+/// reimplementation of the Lambda's validation.
+fn load_and_validate_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
+    let bytes = match path {
+        Some(p) => Some(std::fs::read(p).with_context(|| format!("failed to read {p:?}"))?),
+        None => None,
+    };
+    Ok(Settings::from_parts(bytes.as_deref(), &|key| {
+        std::env::var(key).ok()
+    })?)
+}
+
+fn cmd_validate_settings(path: Option<&Path>) -> anyhow::Result<()> {
+    let settings = load_and_validate_settings(path)?;
+
+    println!("settings OK");
+    println!(
+        "  processing.mode:                   {:?}",
+        settings.processing.mode
+    );
+    println!(
+        "  processing.stream_threshold_bytes: {}",
+        settings.processing.stream_threshold_bytes
+    );
+    println!(
+        "  processing.max_object_bytes:       {}",
+        settings.processing.max_object_bytes
+    );
+    println!(
+        "  processing.multipart_part_bytes:   {}",
+        settings.processing.multipart_part_bytes
+    );
+    println!(
+        "  processing.gzip_level:             {}",
+        settings.processing.gzip_level
+    );
+    println!(
+        "  destination.bucket:                {}",
+        settings.destination.bucket
+    );
+    println!(
+        "  rules.uri:                         {}",
+        settings.rules.uri
+    );
+
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -530,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
             dest,
             rules,
         } => cmd_filter(&source, &dest, &rules).await,
+        Command::ValidateSettings { path } => cmd_validate_settings(path.as_deref()),
     };
 
     if let Err(e) = result {

@@ -11,9 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
-use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource};
+use aws_config::SdkConfig;
+use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{
-    ConfigStore, ConfigUri, FileConfigSource, MetricsMode, Observability, RuleSet, Settings,
+    ConfigStore, ConfigUri, FileConfigSource, MetricsMode, Observability, Processing, RuleSet,
+    Settings,
 };
 use cloudtrail_rs_core::decode::eventbridge::EventBridgeDecoder;
 use cloudtrail_rs_core::filter::Engine;
@@ -48,13 +50,26 @@ fn build_sink(observability: &Observability) -> Arc<dyn MetricsSink> {
     }
 }
 
+/// Builds the `S3ObjectStore`, carrying `processing.multipart_part_bytes`
+/// through via `S3ObjectStore::from_settings` — extracted out of `main` so a
+/// test can prove the composition root's own wiring passes the configured
+/// value through, not just that `from_settings` does so in isolation.
+fn build_store(conf: &SdkConfig, processing: &Processing) -> S3ObjectStore {
+    S3ObjectStore::from_settings(conf, processing)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // ---- INIT: once per container ----
     init_tracing();
+    tracing::info!(
+        version = cloudtrail_rs_core::build_info::VERSION,
+        git_sha = cloudtrail_rs_core::build_info::GIT_SHA,
+        "cloudtrail-rs starting"
+    );
     let settings = Arc::new(Settings::load().await?);
-    let sdk_conf = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let store = Arc::new(S3ObjectStore::new(&sdk_conf));
+    let sdk_conf = load_aws_config(BehaviorVersion::latest()).await;
+    let store = Arc::new(build_store(&sdk_conf, &settings.processing));
     let decoder = Arc::new(EventBridgeDecoder::new());
     let cfg_src = build_config_source(&settings, &sdk_conf)?;
     let metrics = Arc::new(Metrics::default());
@@ -82,4 +97,38 @@ async fn main() -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("lambda runtime error: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_store;
+    use aws_config::{BehaviorVersion, Region, SdkConfig};
+    use cloudtrail_rs_aws::DEFAULT_MULTIPART_PART_BYTES;
+    use cloudtrail_rs_core::config::Processing;
+
+    /// A bare `SdkConfig` is enough: `build_store` only builds a client from
+    /// it, no network call happens.
+    fn test_sdk_config() -> SdkConfig {
+        SdkConfig::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .build()
+    }
+
+    // --- F6: `settings.processing.multipart_part_bytes` must reach the
+    // store `main` actually builds, not just `S3ObjectStore::from_settings`
+    // in isolation. ---------------------------------------------------
+
+    #[test]
+    fn build_store_wires_a_non_default_multipart_part_bytes_through() {
+        let processing = Processing {
+            multipart_part_bytes: 16 * 1024 * 1024,
+            ..Processing::default()
+        };
+
+        let store = build_store(&test_sdk_config(), &processing);
+
+        assert_eq!(store.multipart_part_bytes(), 16 * 1024 * 1024);
+        assert_ne!(store.multipart_part_bytes(), DEFAULT_MULTIPART_PART_BYTES);
+    }
 }

@@ -30,28 +30,31 @@ make install-tools
 
 `make` (or `make help`) lists them all. The full set:
 
-| Target                            | What it does                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------------ |
-| `build`                           | Debug build of the whole workspace.                                            |
-| `release`                         | Optimized release build (fat LTO, stripped) of every crate.                    |
-| `lambda-build`                    | Cross-compile the four Lambda `bootstrap` binaries (needs cargo-lambda).        |
-| `test`                            | Run the full test suite (all features).                                        |
-| `clippy`                          | Lint with clippy, warnings as errors.                                          |
-| `fmt` / `fmt-check`               | Format in place / verify formatting without writing.                           |
-| `check`                           | Fast type-check without producing binaries.                                    |
-| `ci`                              | Everything CI enforces: `fmt-check` + `clippy` + `test` + `audit`.             |
-| `audit`                           | Scan dependencies for RUSTSEC advisories (needs cargo-audit).                  |
-| `deny`                            | Check licenses, bans, advisories, sources via `deny.toml` (needs cargo-deny).  |
-| `coverage`                        | Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-preview).   |
-| `release-musl`                    | Local static-musl release build of the whole workspace for one target.         |
-| `validate`                        | Validate the example ruleset (prints always-bucket warnings).                  |
-| `sample`                          | Show KEEP/DROP breakdown for the sample fixture.                               |
-| `ministack-up` / `ministack-down` | Start / stop the local S3/SSM stack on `:4566`.                                |
-| `ministack-test`                  | Run the `#[ignore]`d MiniStack tests (requires `ministack-up` first).          |
-| `update` / `upgrade` / `outdated` | Dependency maintenance.                                                        |
-| `install-tools`                   | Install every dev/release tool + rustup targets and components.                |
-| `clean`                           | Remove the `target/` build directory.                                          |
-| `tree-features`                   | Prove `lambda-s3` pulls in no other decoder feature (expect 0).                |
+| Target                            | What it does                                                                       |
+| --------------------------------- | ---------------------------------------------------------------------------------- |
+| `build`                           | Debug build of the whole workspace.                                                |
+| `release`                         | Fast local `release`-profile build (lean, no LTO) — verify it builds/links.        |
+| `lambda-build`                    | Cross-compile the four Lambda `bootstrap` binaries, `dist` profile (cargo-lambda). |
+| `test`                            | Run the full test suite (all features).                                            |
+| `clippy`                          | Lint with clippy, warnings as errors.                                              |
+| `fmt` / `fmt-check`               | Format in place / verify formatting without writing.                               |
+| `check`                           | Fast type-check without producing binaries.                                        |
+| `ci`                              | Everything CI enforces: `fmt-check` + `clippy` + `test` + `audit`.                 |
+| `audit`                           | Scan dependencies for RUSTSEC advisories (needs cargo-audit).                      |
+| `deny`                            | Check licenses, bans, advisories, sources via `deny.toml` (needs cargo-deny).      |
+| `coverage`                        | Workspace coverage, HTML + lcov (needs cargo-llvm-cov + llvm-tools-preview).       |
+| `version`                         | Print the one workspace version.                                                   |
+| `version-check`                   | Fail if crates disagree, or if `TAG` != the workspace version (release gate).      |
+| `bump`                            | `make bump VERSION=1.2.3` — set the workspace version + refresh `Cargo.lock`.      |
+| `release-musl`                    | Local static-musl `dist`-profile build of the whole workspace for one target.      |
+| `validate`                        | Validate the example ruleset (prints always-bucket warnings).                      |
+| `sample`                          | Show KEEP/DROP breakdown for the sample fixture.                                   |
+| `ministack-up` / `ministack-down` | Start / stop the local S3/SSM stack on `:4566`.                                    |
+| `ministack-test`                  | Run the `#[ignore]`d MiniStack tests (requires `ministack-up` first).              |
+| `update` / `upgrade` / `outdated` | Dependency maintenance.                                                            |
+| `install-tools`                   | Install every dev/release tool + rustup targets and components.                    |
+| `clean`                           | Remove the `target/` build directory.                                              |
+| `tree-features`                   | Prove `lambda-s3` pulls in no other decoder feature (expect 0).                    |
 
 ## Integration tests (MiniStack)
 
@@ -69,9 +72,12 @@ cargo test --workspace -- --ignored
 
 `.github/workflows/ci.yml` runs on every PR and push to `main`. Parallel jobs:
 
-- **fmt** — `cargo fmt --check`.
-- **clippy** — `cargo clippy … -D warnings`.
-- **test** — `cargo test --workspace --all-features` with a coverage summary.
+- **lint** — `cargo fmt --check` + `cargo clippy … -D warnings` on one runner.
+- **test** — one instrumented `cargo llvm-cov` job that counts BOTH unit and
+  MiniStack coverage: it starts MiniStack, runs two `--no-report` passes (unit,
+  then `-- --ignored`), and merges a coverage summary (testkit scaffolding
+  excluded). The spawned `bootstrap-<mod>` bins are instrumented, so the lambda
+  `main.rs` roots and the ring HTTP client count instead of reading as 0%.
 - **build** — static-musl `cargo build --workspace --release` on both arches
   (`x86_64` on `ubuntu-latest`, `aarch64` on the GitHub-hosted arm64 runner),
   the real release artifact path — no zig, no cross-linker. This is where the
@@ -82,16 +88,48 @@ cargo test --workspace -- --ignored
 `.github/workflows/codeql.yml` runs CodeQL (`language: rust`, `build-mode: none`)
 on push/PR/weekly. `cargo-audit`/`cargo-deny` in CI are the reliable backstop.
 
+## Versioning
+
+There is exactly **one** version, `[workspace.package] version` in the root
+`Cargo.toml`; all eight crates inherit it with `version.workspace = true`. It is
+not a publishing version — nothing is published (`publish = false`) and every
+internal dependency is a path dependency — it exists so cargo's view of the tree
+matches the artifacts.
+
+What actually ships is the **git tag**: `release.yml` passes `$GITHUB_REF_NAME`
+as `CLOUDTRAIL_RS_VERSION`, and [`crates/core/build.rs`](../crates/core/build.rs)
+bakes it into every binary (`core::build_info::VERSION`, logged at cold start and
+printed by `cloudtrail-rs --version`).
+
+`make version-check` is what keeps the two from drifting. It fails if any crate
+carries its own version, and — given a `TAG` (or a tag on `HEAD`) — if that tag
+disagrees with the workspace version. It runs in release.yml's `setup` job, which
+every other job `needs`, so a mismatched tag fails the release before a single
+binary is built.
+
 ## Release process
 
-Cut a `v*` tag; everything else is automated by
+```sh
+make bump VERSION=1.2.3        # sets [workspace.package] version + Cargo.lock
+git commit -am "chore: release v1.2.3"
+git tag v1.2.3 && git push --follow-tags
+```
+
+`make bump` refuses non-semver input, runs `version-check` on the result, and
+prints those next steps. Skipping it is not a silent mistake: the tag push fails
+in `setup`. The `Cargo.lock` refresh matters — release builds use
+`cargo build --locked`, which errors on a stale lockfile.
+
+Everything after the tag is automated by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub
 Actions, no goreleaser and no zig.
 
 ```mermaid
 flowchart TD
-    TAG["git tag v1.2.3<br/>git push --tags"] --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
-    TAG --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
+    BUMP["make bump VERSION=1.2.3<br/>commit"] --> TAG["git tag v1.2.3<br/>git push --follow-tags"]
+    TAG --> GATE["setup job<br/>make version-check TAG=$GITHUB_REF_NAME<br/>(gates every job below)"]
+    GATE --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
+    GATE --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
     B --> BINS["4 lambda bootstrap zips<br/>+ CLI tar.gz<br/>(aarch64 & x86_64 musl)"]
     B --> RAW["raw bootstrap binaries<br/>(artifacts, for images)"]
     BM --> DARWIN["CLI darwin tar.gz"]
@@ -111,9 +149,10 @@ Details:
   runner** (`x86_64-unknown-linux-musl` on `ubuntu-latest`,
   `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`). No cross-linker: `musl-tools`
   supplies `musl-gcc` for `ring`'s C sources and rustc links musl self-contained.
-  The 4 lambda crates each emit a `bootstrap` binary, so they build one at a time
-  and the artifact is copied out before the next overwrites it. Uploads the release
-  archives and the raw per-arch binaries.
+  Each lambda crate builds a uniquely-named bin (`bootstrap-<mod>`) — avoiding an
+  output-path collision under a `--workspace` build — which is then installed as
+  `bootstrap` for the archive and image context. Uploads the release archives and
+  the raw per-arch binaries.
 - **build-macos** — the CLI's Apple Silicon (`aarch64-apple-darwin`) binary for the
   Homebrew cask, built on a **native `macos-14` runner** so `Security`/`CoreFoundation`
   link against the real Xcode SDK. This replaces the old zigbuild darwin
@@ -154,11 +193,11 @@ The Docker Hub namespace comes from the `DOCKER_HUB_USER` secret.
 
 ## Required repo secrets
 
-| Secret               | Purpose                                                     |
-| -------------------- | ---------------------------------------------------------- |
-| `DOCKER_HUB_USER`    | Docker Hub login + namespace for pushing images.           |
-| `DOCKER_HUB_TOKEN`   | Docker Hub access token.                                   |
-| `HOMEBREW_TAP_TOKEN` | PAT (repo scope on `homebrew-tap`) to push the CLI cask.   |
+| Secret               | Purpose                                                  |
+| -------------------- | -------------------------------------------------------- |
+| `DOCKER_HUB_USER`    | Docker Hub login + namespace for pushing images.         |
+| `DOCKER_HUB_TOKEN`   | Docker Hub access token.                                 |
+| `HOMEBREW_TAP_TOKEN` | PAT (repo scope on `homebrew-tap`) to push the CLI cask. |
 
 GHCR needs no extra secret beyond the automatic `GITHUB_TOKEN`. Cosign keyless
 signing and build-provenance attestation use the workflow's OIDC identity

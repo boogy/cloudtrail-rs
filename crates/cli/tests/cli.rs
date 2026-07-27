@@ -337,3 +337,136 @@ rules:
     std::fs::remove_file(&rules_path).unwrap();
     std::fs::remove_file(&sample_path).unwrap();
 }
+
+#[test]
+fn validate_settings_accepts_defaults_via_env_only() {
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate-settings")
+        .env("CT_DEST_BUCKET", "env-only-bucket")
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        output.status.success(),
+        "validate-settings must accept built-in defaults + CT_DEST_BUCKET, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("env-only-bucket"),
+        "expected the effective dest bucket in the summary, got stdout: {stdout}"
+    );
+}
+
+#[test]
+fn validate_settings_accepts_a_valid_file() {
+    let path = temp_path("validate-settings-good.yaml");
+    std::fs::write(
+        &path,
+        b"version: 1\ndestination:\n  bucket: file-bucket\nprocessing:\n  gzip_level: 9\n",
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate-settings")
+        .arg(&path)
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        output.status.success(),
+        "validate-settings must exit 0 on a valid settings file, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("file-bucket"));
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn validate_settings_rejects_gzip_level_above_nine() {
+    let path = temp_path("validate-settings-bad-gzip.yaml");
+    std::fs::write(
+        &path,
+        b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  gzip_level: 11\n",
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate-settings")
+        .arg(&path)
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        !output.status.success(),
+        "validate-settings must exit non-zero on gzip_level 11"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gzip_level"),
+        "error must name the offending key, got stderr: {stderr}"
+    );
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn validate_settings_rejects_max_object_bytes_below_stream_threshold() {
+    let path = temp_path("validate-settings-bad-thresholds.yaml");
+    std::fs::write(
+        &path,
+        b"version: 1\ndestination:\n  bucket: b\nprocessing:\n  stream_threshold_bytes: 100\n  max_object_bytes: 10\n",
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate-settings")
+        .arg(&path)
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        !output.status.success(),
+        "validate-settings must exit non-zero when max_object_bytes < stream_threshold_bytes"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("max_object_bytes") && stderr.contains("stream_threshold_bytes"),
+        "error must name both keys, got stderr: {stderr}"
+    );
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn validate_settings_env_override_wins_over_file() {
+    let path = temp_path("validate-settings-env-override.yaml");
+    std::fs::write(&path, b"version: 1\ndestination:\n  bucket: file-bucket\n").unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate-settings")
+        .arg(&path)
+        .env("CT_DEST_BUCKET", "env-wins-bucket")
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("env-wins-bucket") && !stdout.contains("file-bucket"),
+        "CT_DEST_BUCKET must override the file value, got stdout: {stdout}"
+    );
+
+    std::fs::remove_file(&path).unwrap();
+}

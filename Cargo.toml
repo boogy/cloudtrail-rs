@@ -8,21 +8,44 @@ members = [
     "crates/lambda-sns",
     "crates/lambda-eventbridge",
     "crates/cli",
+    "crates/testkit",
 ]
 
 [workspace.package]
+# ONE version for the whole workspace — every crate inherits it with
+# `version.workspace = true`. It is not a publishing version (nothing is
+# published, all internal deps are path deps); it exists so `cargo`'s view of
+# the tree matches the thing that actually ships. What ships is the git tag:
+# release.yml bakes `$GITHUB_REF_NAME` into the binaries via core/build.rs, and
+# `make version-check` (run by release.yml before anything is built) fails the
+# release if this number and the tag disagree. Bump with `make bump VERSION=x.y.z`.
+version = "0.2.0"
 license = "Apache-2.0"
 # Application/internal crates — never published to crates.io. Marking them
 # non-publishable also lets cargo-deny's allow-wildcard-paths exempt the
 # internal path dependencies (crates.io disallows path deps on public crates).
 publish = false
 
+# Lean profile. Used by day-to-day `cargo build --release`, `make release`, and
+# the CI per-PR smoke build — all of which only need to prove the workspace
+# compiles and links (notably static-musl + ring), never to run fast. No LTO +
+# low opt + max codegen units keep those builds cheap; their binaries are
+# discarded. The shipped artifacts use `dist` below.
 [profile.release]
-opt-level = 3
-# thin LTO + parallel codegen: ~95% of fat-LTO runtime perf at a fraction of the
-# link time. With 11 build×target combos in the release pipeline, fat LTO +
-# codegen-units=1 was the dominant cost. Slightly larger binaries.
-lto = "thin"
-codegen-units = 16
+opt-level = 1
+lto = false
+codegen-units = 256
 panic = "abort"
 strip = "symbols"
+
+# Shipped-artifact profile. release.yml builds the Lambda `bootstrap` binaries
+# and the CLI with `--profile dist`; `make lambda-build` / `release-musl` too.
+# Inherits `release`, then restores full optimization for the deployed binaries:
+# thin LTO + parallel codegen gives ~95% of fat-LTO runtime perf at a fraction
+# of the link time (fat LTO + codegen-units=1 dominated the release pipeline).
+# Slightly larger binaries than fat LTO. `panic`/`strip` inherit from `release`.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16

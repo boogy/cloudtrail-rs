@@ -8,6 +8,7 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::Bytes;
+use cloudtrail_rs_core::config::Processing;
 use cloudtrail_rs_core::error::StoreError;
 use cloudtrail_rs_core::model::PutMeta;
 use cloudtrail_rs_core::ports::ObjectStore;
@@ -18,6 +19,17 @@ use crate::http_client::ring_http_client;
 /// Default multipart part size, matching `processing.multipart_part_bytes`'s
 /// documented default. Override with `with_multipart_part_bytes`.
 pub const DEFAULT_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
+
+/// `T::try_from(v).unwrap_or(default)` — a value that doesn't fit `T` falls
+/// back rather than panics. Generic (rather than inlined as `usize::try_from`
+/// in `from_settings`) so its overflow branch is provable in a test: on every
+/// real (64-bit) Lambda target `usize` is exactly as wide as `u64`, so
+/// `u64::MAX` never actually overflows `usize` there — instantiating this
+/// with a narrower type in a test exercises the identical fallback logic
+/// `from_settings` runs in production.
+fn checked_or_default<T: TryFrom<u64>>(v: u64, default: T) -> T {
+    T::try_from(v).unwrap_or(default)
+}
 
 pub struct S3ObjectStore {
     client: Client,
@@ -33,6 +45,28 @@ impl S3ObjectStore {
         Self::from_client(Client::from_conf(s3_conf))
     }
 
+    /// The one constructor every composition root should use: builds the S3
+    /// client from `conf` (as `new` does) and carries `processing`'s
+    /// `multipart_part_bytes` through, so a value set in the operator's
+    /// settings actually reaches the store instead of silently falling back
+    /// to the default.
+    ///
+    /// `processing.multipart_part_bytes` is a `u64` (it's deserialized
+    /// straight off the settings document); the store's `usize` can't
+    /// represent every `u64` on a 32-bit target. Rather than panic in a
+    /// `panic = "abort"` release profile — which would kill the Lambda at
+    /// cold start — a value that doesn't fit falls back to
+    /// `DEFAULT_MULTIPART_PART_BYTES`. `Document::validate()` already rejects
+    /// anything below S3's 5 MiB minimum at config load, so this is not
+    /// re-validated here.
+    pub fn from_settings(conf: &SdkConfig, processing: &Processing) -> Self {
+        let part_bytes = checked_or_default(
+            processing.multipart_part_bytes,
+            DEFAULT_MULTIPART_PART_BYTES,
+        );
+        Self::new(conf).with_multipart_part_bytes(part_bytes)
+    }
+
     /// For tests: wraps an already-built client (e.g. an `aws-smithy-mocks`
     /// client) directly, bypassing HTTP client construction entirely.
     pub fn from_client(client: Client) -> Self {
@@ -45,6 +79,15 @@ impl S3ObjectStore {
     pub fn with_multipart_part_bytes(mut self, n: usize) -> Self {
         self.multipart_part_bytes = n;
         self
+    }
+
+    /// The multipart part size this store uploads with. Public so
+    /// composition roots can prove `processing.multipart_part_bytes` actually
+    /// reached the store they built (see `crates/lambda-*/src/main.rs`'s
+    /// `build_store` tests), not just that it parsed out of the settings
+    /// document.
+    pub fn multipart_part_bytes(&self) -> usize {
+        self.multipart_part_bytes
     }
 
     /// Lists every object key under `prefix` in `bucket`, following
@@ -285,6 +328,47 @@ mod tests {
     use aws_sdk_s3::types::error::NoSuchKey;
     use aws_smithy_mocks::{RuleMode, mock, mock_client};
     use aws_smithy_types::byte_stream::ByteStream;
+
+    /// A bare `SdkConfig` is enough: `S3ObjectStore::new`/`from_settings`
+    /// only build a client from it, no network call happens.
+    fn test_sdk_config() -> SdkConfig {
+        SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build()
+    }
+
+    // --- F6: `processing.multipart_part_bytes` must reach the store -------
+
+    #[test]
+    fn from_settings_carries_a_non_default_multipart_part_bytes_through() {
+        let processing = Processing {
+            multipart_part_bytes: 16 * 1024 * 1024,
+            ..Processing::default()
+        };
+
+        let store = S3ObjectStore::from_settings(&test_sdk_config(), &processing);
+
+        assert_eq!(store.multipart_part_bytes(), 16 * 1024 * 1024);
+        assert_ne!(store.multipart_part_bytes(), DEFAULT_MULTIPART_PART_BYTES);
+    }
+
+    #[test]
+    fn checked_or_default_passes_through_a_value_that_fits() {
+        assert_eq!(checked_or_default::<u32>(42, 8), 42);
+    }
+
+    /// `from_settings` calls exactly this generic function (with `T =
+    /// usize`) to convert `multipart_part_bytes`. `u64::MAX` never overflows
+    /// a real (64-bit) `usize`, so the fallback can't be forced through
+    /// `from_settings` itself on this target — instantiating with `u32`
+    /// forces the identical `T::try_from(v).unwrap_or(default)` logic down
+    /// its overflow branch instead, proving it falls back rather than
+    /// panics or truncates.
+    #[test]
+    fn checked_or_default_falls_back_when_the_value_overflows_the_target_type() {
+        assert_eq!(checked_or_default::<u32>(u64::MAX, 8), 8);
+    }
 
     #[tokio::test]
     async fn get_returns_object_bytes() {

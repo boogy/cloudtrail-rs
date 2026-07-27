@@ -1,27 +1,23 @@
 [package]
-name = "cloudtrail-rs-aws"
+name = "cloudtrail-rs-testkit"
 version.workspace = true
 edition = "2024"
 license.workspace = true
 publish.workspace = true
 
+# Test-support only: every consumer depends on this from `[dev-dependencies]`,
+# so nothing here is linked into a shipped binary. It is a real crate rather
+# than a `#[path]`-included module because four separate lambda crates plus the
+# `aws` crate share it, and a dev-dependency is the only way to share code
+# across crate boundaries without publishing it.
+
 [dependencies]
 cloudtrail-rs-core = { path = "../core" }
-async-trait = "0.1"
-bytes = "1"
-tokio = { version = "1", features = ["io-util"] }
-tracing = "0.1"
 aws-config = { version = "1", default-features = false }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-sdk-ssm = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
-aws-smithy-types = "1"
 aws-smithy-runtime-api = "1"
-
-[dev-dependencies]
-cloudtrail-rs-core = { path = "../core", features = ["decode-s3"] }
-tokio = { version = "1", features = ["rt", "macros", "io-util"] }
-aws-smithy-mocks = "0.3"
-aws-sdk-s3 = { version = "1", default-features = false, features = ["test-util"] }
-aws-sdk-ssm = { version = "1", default-features = false, features = ["test-util"] }
+aws-smithy-types = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+serde_json = "1"

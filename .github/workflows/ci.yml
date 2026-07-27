@@ -18,8 +18,13 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  fmt:
-    name: Format
+  # fmt + clippy share one runner: fmt is a no-compile check, so folding it in
+  # here costs ~2s and saves a whole runner's checkout + toolchain install. The
+  # heavier jobs (test, integration, build) stay separate — they benefit more
+  # from parallelism than from a shared checkout, and test's coverage build
+  # shares no artifacts with clippy anyway.
+  lint:
+    name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,27 +33,29 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
-          components: rustfmt
-          cache: false
+          components: rustfmt, clippy
       - name: cargo fmt --check
         run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          toolchain: stable
-          components: clippy
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The one-decoder-per-binary invariant (root CLAUDE.md): each Lambda
+      # artifact must compile in exactly one EventDecoder, with no dead
+      # decoder code. Cheap — `cargo tree` resolves the graph, builds nothing.
+      - name: One decoder per binary
+        run: make tree-features
 
+  # Unit + MiniStack tests share one instrumented job so BOTH count toward
+  # coverage. Two `--no-report` passes accumulate profile data that a final
+  # `report` merges: the second pass runs the #[ignore]d MiniStack + cold-start
+  # tests (crates/aws/tests/ministack.rs, crates/lambda-*/tests/cold_start.rs)
+  # against the container on :4566. cargo-llvm-cov instruments the spawned
+  # `bootstrap-<mod>` bins too, so the four lambda main.rs composition roots and
+  # the ring HTTP client are covered rather than reading as 0%. testkit is
+  # dev-only scaffolding, excluded from the denominator. Merging the two former
+  # jobs trades some parallelism for an accurate single coverage number and
+  # avoids running the ignored tests twice.
   test:
-    name: Test
+    name: Test + coverage (incl. MiniStack)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -61,28 +68,6 @@ jobs:
         uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
           tool: cargo-llvm-cov
-      - name: cargo test with coverage
-        run: cargo llvm-cov --workspace --all-features --summary-only | tee coverage.txt
-      - name: Coverage summary
-        if: always()
-        run: |
-          {
-            echo "### Coverage"
-            echo '```'
-            cat coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  integration:
-    name: Integration (MiniStack)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
-        with:
-          toolchain: stable
       - name: Start MiniStack
         run: docker compose -f docker-compose.test.yml up -d
       - name: Wait for MiniStack (:4566)
@@ -96,14 +81,24 @@ jobs:
           echo "MiniStack never became ready on :4566"
           docker compose -f docker-compose.test.yml logs
           exit 1
-      # The MiniStack tests are #[ignore]d (crates/aws/tests/ministack.rs); --ignored
-      # runs exactly those against the container on localhost:4566. Mirrors `make
-      # ministack-test`.
-      - name: Run MiniStack integration tests
-        run: cargo test --workspace -- --ignored
+      - name: Unit tests (coverage, no report)
+        run: cargo llvm-cov --no-report --workspace --all-features
+      - name: MiniStack integration tests (coverage, no report)
+        run: cargo llvm-cov --no-report --workspace --all-features -- --ignored
+      - name: Merge coverage report
+        run: cargo llvm-cov report --summary-only --ignore-filename-regex '/testkit/' | tee coverage.txt
       - name: Stop MiniStack
         if: always()
         run: docker compose -f docker-compose.test.yml down
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "### Coverage"
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build (${{ matrix.arch }} musl)
@@ -130,11 +125,15 @@ jobs:
       # where the musl / ring-vs-aws-lc-rs breakage surfaces (see docs/deployment.md).
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # testkit is dev-only scaffolding (a dev-dependency everywhere, never linked
+      # into a shipped binary) — exclude it so the artifact build doesn't compile
+      # test code. Its heavy deps are already built for the real crates, so this
+      # is about correctness, not speed.
       - name: Cross-target release build
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --release --exclude cloudtrail-rs-testkit --target ${{ matrix.target }}
 
   security:
     name: Security

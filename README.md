@@ -29,14 +29,14 @@ flowchart LR
 
 ## Features
 
-| | |
-| --- | --- |
-| 🧩 **Hexagonal core** | All filtering logic lives in `cloudtrail-rs-core` with **zero AWS dependencies**; AWS is reached only through object-safe ports. Adding an event source is one decoder behind one Cargo feature — zero changes to core. |
-| 🎯 **One decoder per binary** | Each trigger topology is a separate binary compiling in exactly one `EventDecoder` via a feature. No runtime source sniffing, no dead decoder code in the artifact. |
-| ⚡ **Fast warm path** | The per-record path is pure computation, no trait dispatch — dispatch happens once per object or once per invocation, not once per record. |
-| 🌊 **Streaming or buffered** | Constant-memory streaming with S3 multipart for large objects, in-memory buffering for small ones, `auto` by size. |
-| 🔎 **Indexed rules** | Rules are indexed by `eventSource` literal, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset. |
-| 🔒 **Minimal, signed images** | Distroless static images (<10 MB), cosign-signed, with build-provenance attestation. |
+|                               |                                                                                                                                                                                                                         |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 🧩 **Hexagonal core**         | All filtering logic lives in `cloudtrail-rs-core` with **zero AWS dependencies**; AWS is reached only through object-safe ports. Adding an event source is one decoder behind one Cargo feature — zero changes to core. |
+| 🎯 **One decoder per binary** | Each trigger topology is a separate binary compiling in exactly one `EventDecoder` via a feature. No runtime source sniffing, no dead decoder code in the artifact.                                                     |
+| ⚡ **Fast warm path**         | The per-record path is pure computation, no trait dispatch — dispatch happens once per object or once per invocation, not once per record.                                                                              |
+| 🌊 **Streaming or buffered**  | Constant-memory streaming with S3 multipart for large objects, in-memory buffering for small ones, `auto` by size.                                                                                                      |
+| 🔎 **Indexed rules**          | Rules are indexed by `eventSource` literal, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                                             |
+| 🔒 **Minimal, signed images** | Distroless static images (<10 MB), cosign-signed, with build-provenance attestation.                                                                                                                                    |
 
 ## How it works
 
@@ -77,7 +77,10 @@ against a real sample:
 ./target/release/cloudtrail-rs test examples/rules.example.yaml sample.json.gz
 ```
 
-See the [CLI reference](docs/cli.md) for `validate` / `test` / `filter`.
+See the [CLI reference](docs/cli.md) for `validate` / `validate-settings` /
+`test` / `filter`. `validate-settings` runs a settings document through the same
+checks the Lambdas run at cold start, so a value that would panic mid-invocation
+is caught before it ships.
 
 ## Trigger topologies
 
@@ -113,8 +116,8 @@ Full docs live in [`docs/`](docs/README.md).
 | [Configuration](docs/configuration.md) | `SETTINGS_URI`, precedence, full `CT_*` env reference, the YAML quoting trap.         |
 | [Rules](docs/rules.md)                 | Rules schema, AND/OR evaluation, the rule index and the `always` bucket.              |
 | [Deployment](docs/deployment.md)       | Four topologies, zips + container images, IAM, the SQS data-loss warning, rollout.    |
-| [CLI](docs/cli.md)                     | `validate` / `test` / `filter` reference with examples.                               |
-| [Development](docs/development.md)      | Commands, Makefile targets, MiniStack tests, CI, the release pipeline.                |
+| [CLI](docs/cli.md)                     | `validate` / `validate-settings` / `test` / `filter` reference with examples.         |
+| [Development](docs/development.md)     | Commands, Makefile targets, MiniStack tests, CI, the release pipeline.                |
 
 > ⚠️ **SQS users:** `ReportBatchItemFailures` must be enabled on the event source
 > mapping, or a partial batch failure becomes **silent, unrecoverable data

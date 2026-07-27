@@ -102,10 +102,7 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<SourceItem>, D
         return Ok(Vec::new());
     }
 
-    Ok(vec![SourceItem {
-        ack_id: None,
-        objects,
-    }])
+    Ok(vec![SourceItem::new(None, objects)])
 }
 
 /// S3 notification object keys are form-urlencoded
