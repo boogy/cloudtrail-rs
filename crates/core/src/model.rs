@@ -69,6 +69,20 @@ pub struct MetricSnapshot {
     pub cold_start: bool,
     pub objects_processed: u64,
     pub objects_skipped: u64,
+    /// Objects whose processing returned an error. Under the default
+    /// `behavior.partial_batch_failures = true` a failing object does **not**
+    /// fail the invocation — the handler returns `Ok` with the message in
+    /// `batchItemFailures` — so AWS's own `Errors` metric stays at zero and
+    /// this counter is the only metric that moves. Alarm on it: a sustained
+    /// nonzero rate means messages are being redriven toward the DLQ.
+    pub objects_failed: u64,
+    /// Objects a decoder referenced that `source.include_key_regex` /
+    /// `source.exclude_key_regex` excluded, so they were never fetched. Zero
+    /// is normal only if the trigger is already scoped to matching keys; a
+    /// rate equal to the delivery rate (with `ObjectsProcessed` at zero) means
+    /// the key filter is rejecting everything — otherwise indistinguishable
+    /// from "no traffic".
+    pub objects_excluded_by_key: u64,
     pub unrecognized_objects: u64,
     pub records_in: u64,
     pub records_kept: u64,
@@ -87,4 +101,16 @@ pub struct MetricSnapshot {
     /// evidence.
     pub items_without_objects: u64,
     pub rule_drops: Vec<(String, u64)>,
+}
+
+impl MetricSnapshot {
+    /// Whether `records_in == records_kept + records_dropped` for this
+    /// snapshot — the reconciliation invariant both processing modes uphold.
+    /// Every record read out of a `Records` array is accounted for as exactly
+    /// one of kept or dropped, and an object that never yielded a usable
+    /// `Records` array contributes zero to all three. A snapshot that fails
+    /// this has lost track of a record, which is the shape of silent loss.
+    pub fn records_balance(&self) -> bool {
+        self.records_in == self.records_kept + self.records_dropped
+    }
 }

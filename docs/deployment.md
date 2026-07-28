@@ -9,6 +9,7 @@ safely.
 - [Deploying a container image to Lambda](#deploying-a-container-image-to-lambda)
 - [Required IAM actions](#required-iam-actions)
 - [SQS: `ReportBatchItemFailures` is not optional](#sqs-reportbatchitemfailures-is-not-optional)
+- [`max_object_bytes` is a buffer-mode cap, not a size limit](#max_object_bytes-is-a-buffer-mode-cap-not-a-size-limit)
 - [Rollout guidance](#rollout-guidance)
 
 ## The four trigger topologies
@@ -223,6 +224,60 @@ discarding a partial one — worse throughput under errors, but no silent loss.
 `partial_batch_failures: true` (the default) is only safe when
 `ReportBatchItemFailures` is actually enabled on the mapping.
 
+## `max_object_bytes` is a buffer-mode cap, not a size limit
+
+`processing.max_object_bytes` bounds what **buffer mode** will hold in memory —
+both halves of it. The source object is read through a cap, so the fetch itself
+stops one byte past the limit instead of materializing an arbitrarily large
+object, and the decompressed body is capped again on the way out of the
+decoder. Whichever side reaches the limit first fails with `ObjectTooLarge`.
+(Capping the compressed read rejects nothing that would otherwise have
+survived: gzip output is never meaningfully larger than its input, so an object
+whose compressed size already exceeds the cap cannot decompress to under it.)
+
+Stream mode has no equivalent cap, and that is deliberate: it decompresses,
+filters and uploads in bounded-memory chunks, so there is no size at which it
+needs to refuse. The fail-open passthrough (`on_config_error: open` with no
+cached ruleset) and the unrecognized-object copy stream source to destination
+for the same reason — neither ever holds a whole object. The consequence is
+that `max_object_bytes` does not put a ceiling on what the pipeline will
+attempt:
+
+- **`mode: auto`** (the default) — an object that blows the cap in buffer mode is
+  **retried through stream mode**, which succeeds. The cap is a mode-selection
+  backstop, not a rejection: it catches the highly-compressible object whose
+  compressed size sat below `stream_threshold_bytes` and routed it to buffer mode
+  by mistake — or the object that arrived with no size at all, which `auto`
+  routes to buffer mode on purpose (a missing size must never pick the
+  unbounded path). Nothing is rejected for being large.
+- **`mode: buffer`** — the cap is a real rejection. An object over it fails with
+  `ObjectTooLarge` on every redelivery: a poison pill, not a skip.
+- **`mode: stream`** — the cap is not consulted at all.
+
+So the operational limit on object size is not this setting, it is the
+**function timeout**: an object too large to finish within it times out, and
+times out again on every retry. Memory is not the binding constraint in stream
+mode; wall-clock is.
+
+Where that residual risk concentrates is the **S3 → Lambda direct** topology.
+The other three have durable redelivery in front of them (SQS keeps the message
+and its redrive policy moves it to a DLQ; SNS and EventBridge each have their own
+failure destinations). A direct S3 notification is an **asynchronous invocation**:
+Lambda retries it twice and then **discards the event** unless the function has an
+on-failure destination or a dead-letter queue configured. A timing-out object on
+that topology is therefore dropped with nothing left naming it.
+
+If you run `lambda-s3`:
+
+1. Configure an **on-failure destination** (or DLQ) on the function's async
+   invocation config. This is the piece that makes a repeated failure
+   recoverable instead of silent — it matters for every hard failure, not just
+   oversized objects.
+2. Size the **timeout** against your largest expected object, not your median
+   one, and alarm on Lambda `Duration` approaching it.
+3. Leave `mode: auto`. Explicit `mode: buffer` converts "large object" from a
+   mode switch into a permanent failure.
+
 ## Rollout guidance
 
 ```mermaid
@@ -248,6 +303,18 @@ Other metrics worth alarming on: `ParseErrors` and `ConfigLoadErrors` (both
 should normally be 0 or near-0), `ColdStart` (expected non-zero rate, not a
 problem by itself), `ObjectsSkipped`/`UnrecognizedObjects` (sanity-check against
 expected traffic shape).
+
+The full metric reference — every counter, the two reconciliation invariants,
+and a prioritised alarm table — is in [Metrics](metrics.md). Three alarms there
+matter more than the rest:
+
+- `RecordsIn != RecordsKept + RecordsDropped` — records entered the pipeline and
+  were neither written nor accounted for as filtered.
+- `sum(RuleDrops) != RecordsDropped` — the per-rule breakdown no longer accounts
+  for the drops, so a rule's apparent effect cannot be trusted.
+- `ObjectsFailed > 0` — under the default `partial_batch_failures: true` the
+  handler returns `Ok`, so AWS's own `Errors` metric stays at zero while
+  messages head for the DLQ.
 
 ---
 

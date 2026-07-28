@@ -36,6 +36,7 @@ flowchart LR
 | ⚡ **Fast warm path**         | The per-record path is pure computation, no trait dispatch — dispatch happens once per object or once per invocation, not once per record.                                                                              |
 | 🌊 **Streaming or buffered**  | Constant-memory streaming with S3 multipart for large objects, in-memory buffering for small ones, `auto` by size.                                                                                                      |
 | 🔎 **Indexed rules**          | Rules are indexed by `eventSource` literal, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                                             |
+| 📊 **Alarmable metrics**      | Every invocation emits a snapshot, success or failure, with two reconciliation identities (`RecordsIn == RecordsKept + RecordsDropped`, `sum(RuleDrops) == RecordsDropped`) so a silent drop cannot stay silent.        |
 | 🔒 **Minimal, signed images** | Distroless static images (<10 MB), cosign-signed, with build-provenance attestation.                                                                                                                                    |
 
 ## How it works
@@ -116,6 +117,7 @@ Full docs live in [`docs/`](docs/README.md).
 | [Configuration](docs/configuration.md) | `SETTINGS_URI`, precedence, full `CT_*` env reference, the YAML quoting trap.         |
 | [Rules](docs/rules.md)                 | Rules schema, AND/OR evaluation, the rule index and the `always` bucket.              |
 | [Deployment](docs/deployment.md)       | Four topologies, zips + container images, IAM, the SQS data-loss warning, rollout.    |
+| [Metrics](docs/metrics.md)             | Every emitted metric, the reconciliation invariants, and a prioritised alarm table.   |
 | [CLI](docs/cli.md)                     | `validate` / `validate-settings` / `test` / `filter` reference with examples.         |
 | [Development](docs/development.md)     | Commands, Makefile targets, MiniStack tests, CI, the release pipeline.                |
 

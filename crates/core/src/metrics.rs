@@ -25,6 +25,8 @@ pub struct Metrics {
     cold_start_emitted: AtomicBool,
     objects_processed: AtomicU64,
     objects_skipped: AtomicU64,
+    objects_failed: AtomicU64,
+    objects_excluded_by_key: AtomicU64,
     unrecognized_objects: AtomicU64,
     records_in: AtomicU64,
     records_kept: AtomicU64,
@@ -45,6 +47,22 @@ impl Metrics {
 
     pub fn add_objects_skipped(&self, n: u64) {
         self.objects_skipped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One per object whose processing returned an error. Critically, this is
+    /// incremented on the `partial_batch_failures` path too — where the
+    /// handler returns `Ok` and AWS's `Errors` metric therefore stays at zero,
+    /// making this the only metric that moves when objects start failing.
+    pub fn add_objects_failed(&self, n: u64) {
+        self.objects_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One per object excluded by `source.include_key_regex` /
+    /// `source.exclude_key_regex` before it was ever fetched. Without this the
+    /// exclusion is invisible: a key filter that rejects 100% of deliveries
+    /// leaves every other counter at zero, exactly like an idle function.
+    pub fn add_objects_excluded_by_key(&self, n: u64) {
+        self.objects_excluded_by_key.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_unrecognized_objects(&self, n: u64) {
@@ -98,8 +116,24 @@ impl Metrics {
     /// Records one dropped record attributed to `rule_name` (the `RuleDrops`
     /// metric's `Rule` dimension).
     pub fn record_rule_drop(&self, rule_name: &str) {
+        self.record_rule_drops(rule_name, 1);
+    }
+
+    /// Bulk form of [`Metrics::record_rule_drop`]: attributes `n` drops to
+    /// `rule_name` under one lock acquisition.
+    ///
+    /// Exists for `stream_run`, which tallies drops per rule locally while it
+    /// streams and commits them here only once the object as a whole is known
+    /// to have succeeded — the same deferral `RecordsDropped` already has.
+    /// Reporting them as they happened attributed drops to a rule for records
+    /// that were never actually dropped, because the object went on to fail
+    /// and be re-driven in full.
+    pub fn record_rule_drops(&self, rule_name: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
         let mut rule_drops = self.rule_drops.lock().expect("Metrics mutex poisoned");
-        *rule_drops.entry(rule_name.to_string()).or_insert(0) += 1;
+        *rule_drops.entry(rule_name.to_string()).or_insert(0) += n;
     }
 
     /// Reads every counter and resets it to zero, returning the delta since
@@ -120,6 +154,8 @@ impl Metrics {
             cold_start,
             objects_processed: self.objects_processed.swap(0, Ordering::Relaxed),
             objects_skipped: self.objects_skipped.swap(0, Ordering::Relaxed),
+            objects_failed: self.objects_failed.swap(0, Ordering::Relaxed),
+            objects_excluded_by_key: self.objects_excluded_by_key.swap(0, Ordering::Relaxed),
             unrecognized_objects: self.unrecognized_objects.swap(0, Ordering::Relaxed),
             records_in: self.records_in.swap(0, Ordering::Relaxed),
             records_kept: self.records_kept.swap(0, Ordering::Relaxed),
@@ -182,6 +218,8 @@ impl EmfMetricsSink {
                     "Metrics": [
                         {"Name": "ObjectsProcessed", "Unit": "Count"},
                         {"Name": "ObjectsSkipped", "Unit": "Count"},
+                        {"Name": "ObjectsFailed", "Unit": "Count"},
+                        {"Name": "ObjectsExcludedByKey", "Unit": "Count"},
                         {"Name": "UnrecognizedObjects", "Unit": "Count"},
                         {"Name": "RecordsIn", "Unit": "Count"},
                         {"Name": "RecordsKept", "Unit": "Count"},
@@ -198,6 +236,8 @@ impl EmfMetricsSink {
             },
             "ObjectsProcessed": snapshot.objects_processed,
             "ObjectsSkipped": snapshot.objects_skipped,
+            "ObjectsFailed": snapshot.objects_failed,
+            "ObjectsExcludedByKey": snapshot.objects_excluded_by_key,
             "UnrecognizedObjects": snapshot.unrecognized_objects,
             "RecordsIn": snapshot.records_in,
             "RecordsKept": snapshot.records_kept,
@@ -288,6 +328,8 @@ mod tests {
         let metrics = Metrics::default();
         metrics.add_objects_processed(1);
         metrics.add_objects_skipped(2);
+        metrics.add_objects_failed(13);
+        metrics.add_objects_excluded_by_key(14);
         metrics.add_unrecognized_objects(3);
         metrics.add_records_in(4);
         metrics.add_records_kept(5);
@@ -306,6 +348,8 @@ mod tests {
                 cold_start: true,
                 objects_processed: 1,
                 objects_skipped: 2,
+                objects_failed: 13,
+                objects_excluded_by_key: 14,
                 unrecognized_objects: 3,
                 records_in: 4,
                 records_kept: 5,
@@ -354,6 +398,8 @@ mod tests {
             cold_start: true,
             objects_processed: 10,
             objects_skipped: 2,
+            objects_failed: 4,
+            objects_excluded_by_key: 7,
             unrecognized_objects: 1,
             records_in: 100,
             records_kept: 90,
@@ -382,6 +428,8 @@ mod tests {
                         "Metrics": [
                             {"Name": "ObjectsProcessed", "Unit": "Count"},
                             {"Name": "ObjectsSkipped", "Unit": "Count"},
+                            {"Name": "ObjectsFailed", "Unit": "Count"},
+                            {"Name": "ObjectsExcludedByKey", "Unit": "Count"},
                             {"Name": "UnrecognizedObjects", "Unit": "Count"},
                             {"Name": "RecordsIn", "Unit": "Count"},
                             {"Name": "RecordsKept", "Unit": "Count"},
@@ -398,6 +446,8 @@ mod tests {
                 },
                 "ObjectsProcessed": 10,
                 "ObjectsSkipped": 2,
+                "ObjectsFailed": 4,
+                "ObjectsExcludedByKey": 7,
                 "UnrecognizedObjects": 1,
                 "RecordsIn": 100,
                 "RecordsKept": 90,

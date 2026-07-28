@@ -20,6 +20,21 @@ Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*`
 dependencies by design — the hexagonal boundary is enforced by the crate graph,
 not just convention.
 
+Two suites carry more weight than the rest and are worth running deliberately
+when you touch the processing path:
+
+```sh
+cargo test -p cloudtrail-rs-core --all-features --test mode_parity
+cargo test -p cloudtrail-rs-core --all-features metrics
+```
+
+`mode_parity` is the buffer-vs-stream equivalence harness: the mode is chosen by
+object **size**, so the two must agree on survivors, output bytes, failure
+classification and every counter, or an object changes meaning at
+`stream_threshold_bytes`. Each case asserts both reconciliation identities from
+[Metrics](metrics.md). **Any change to `process/buffer.rs` or `process/stream.rs`
+belongs in that file as a new case**, not only in the module's own unit tests.
+
 First-time setup installs every dev/release tool and the musl cross-targets:
 
 ```sh
@@ -208,8 +223,11 @@ signing and build-provenance attestation use the workflow's OIDC identity
 1. Branch off `main`.
 2. `make ci` must be green (`fmt-check` + `clippy` + `test` + `audit`).
 3. If you touch rules/config behavior, run `make validate` and `make sample`.
-4. Keep `#![forbid(unsafe_code)]` intact and `core` free of `aws-sdk-*` deps.
-5. Open a PR; CI gates the same checks plus CodeQL and the security scan.
+4. If you touch a processing mode, add a case to `mode_parity.rs`; if you touch
+   a metric, prove the new behavior fails without your change before claiming
+   the test guards it.
+5. Keep `#![forbid(unsafe_code)]` intact and `core` free of `aws-sdk-*` deps.
+6. Open a PR; CI gates the same checks plus CodeQL and the security scan.
 
 ---
 

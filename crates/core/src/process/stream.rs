@@ -36,6 +36,7 @@
 //! from (delivering an `Err` instead of a clean EOF) — no new `ObjectStore`
 //! port method is added for this.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -309,6 +310,12 @@ impl<'de> Visitor<'de> for RecordsVisitor<'_> {
 /// (`serde::de::IgnoredAny`), and reports whether a `Records` array was
 /// found — anything else (including a top-level JSON scalar/array) is
 /// `Unrecognized`, matching buffer mode.
+///
+/// A *repeated* `Records` key is also `Unrecognized`, for the same parity
+/// reason: buffer mode's derived `Envelope` rejects a duplicate field
+/// outright and falls back to `Value` → `Unrecognized`, so if stream mode
+/// streamed both arrays the two modes would disagree on the same bytes. See
+/// `visit_map`.
 struct EnvelopeVisitor<'a> {
     tx: &'a mpsc::Sender<StreamMsg>,
 }
@@ -325,14 +332,25 @@ impl<'de> Visitor<'de> for EnvelopeVisitor<'_> {
         A: MapAccess<'de>,
     {
         let mut found = false;
+        let mut records_keys = 0usize;
         while let Some(key) = map.next_key::<String>()? {
             if key == "Records" {
-                found = map.next_value_seed(RecordsSeed { tx: self.tx })?;
+                records_keys += 1;
+                // Only the first `Records` array is streamed. A second one is
+                // consumed but discarded, and the `records_keys == 1` test
+                // below turns the whole object into `Unrecognized` — the
+                // records already pushed downstream never commit, because
+                // `FinishKind::Unrecognized` aborts the in-flight upload.
+                if records_keys == 1 {
+                    found = map.next_value_seed(RecordsSeed { tx: self.tx })?;
+                } else {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
             } else {
                 map.next_value::<de::IgnoredAny>()?;
             }
         }
-        Ok(found)
+        Ok(found && records_keys == 1)
     }
 
     fn visit_bool<E>(self, _v: bool) -> Result<bool, E> {
@@ -370,7 +388,33 @@ impl<'de> Visitor<'de> for EnvelopeVisitor<'_> {
 fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
     let gz = MultiGzDecoder::new(reader);
     let mut deserializer = serde_json::Deserializer::from_reader(gz);
-    let result = deserializer.deserialize_any(EnvelopeVisitor { tx: &tx });
+    let parsed = deserializer.deserialize_any(EnvelopeVisitor { tx: &tx });
+
+    // `end()` is not optional politeness — it is what makes stream mode's
+    // integrity checking equal to buffer mode's, and skipping it was a silent
+    // data-loss bug. Parsing stops at the top-level `}`, so without this:
+    //
+    //   * bytes *after* that `}` are never looked at. Two concatenated
+    //     envelopes (`{"Records":[a]}{"Records":[b]}`) wrote only `a`,
+    //     returned `Written`, and let the message ack — `b` gone, no error, no
+    //     metric. Buffer mode's `from_slice` rejects the same bytes outright.
+    //   * the reader is never driven to EOF, so `MultiGzDecoder` never reads
+    //     the member's CRC32/ISIZE trailer. A truncated upload whose JSON
+    //     happens to be complete was accepted as authoritative, where buffer
+    //     mode's `read_to_end` fails it.
+    //
+    // `end()` skips whitespace to EOF and errors on the first non-whitespace
+    // byte, so a legitimate trailing newline still passes. Reaching EOF is
+    // also what forces the trailer check, which is why draining matters even
+    // when nothing follows. Errors land the same way buffer mode's do: a
+    // truncated trailer surfaces as an io error (`is_io()` → `Gzip`),
+    // trailing content as a syntax error (`Json`).
+    //
+    // Ordering is deliberate: this runs *before* the `Finished` send, so an
+    // envelope whose records were already streamed out still ends in
+    // `FinishKind::Error` — the processing block aborts the in-flight upload
+    // and nothing partial is committed.
+    let result = parsed.and_then(|found| deserializer.end().map(|()| found));
 
     let finish = match result {
         Ok(true) => FinishKind::RecordsFound,
@@ -394,6 +438,35 @@ fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
 /// a `store` and destination) — buffer mode instead hands its caller a
 /// `Bytes` to `put`, because stream mode can't wait until the end to know
 /// the destination is worth writing.
+/// Publishes an object's per-record counters as one unit, once the object's
+/// fate is known.
+///
+/// Called from exactly the two places `stream_run` can say "this object had a
+/// recognised `Records` array and did not fail". Everything about a record —
+/// that it arrived, that a rule dropped it, that it would not parse — is
+/// observable only from inside the streaming loop, but none of it is *true*
+/// until the object finishes: an object that fails halfway is re-driven whole
+/// and re-evaluated from scratch. Committing here keeps the counters
+/// describing objects that were actually accounted for, which is what makes
+/// `RecordsIn == RecordsKept + RecordsDropped` and `sum(RuleDrops) <=
+/// RecordsDropped` hold in stream mode as they do in buffer mode.
+fn commit_record_counters(
+    metrics: &Metrics,
+    engine: &Engine,
+    records_in: u64,
+    kept: u64,
+    parse_errors: u64,
+    rule_drops: &HashMap<usize, u64>,
+) {
+    metrics.add_records_in(records_in);
+    metrics.add_records_kept(kept);
+    metrics.add_records_dropped(records_in - kept);
+    metrics.add_parse_errors(parse_errors);
+    for (rule_idx, n) in rule_drops {
+        metrics.record_rule_drops(engine.rule_name(*rule_idx), *n);
+    }
+}
+
 pub async fn stream_run(
     input: Box<dyn AsyncRead + Send + Unpin>,
     engine: &Engine,
@@ -440,10 +513,25 @@ pub async fn stream_run(
         let mut first = true;
         let mut kept: u64 = 0;
         let mut records_in: u64 = 0;
+        // Tallied locally, committed to `metrics` only alongside
+        // `RecordsIn`/`RecordsKept`/`RecordsDropped` — see the comment above
+        // the `match finish` below. Buffer mode gets this for free: it decides
+        // the object's fate before it touches a counter. Stream mode has to
+        // evaluate records *before* it can know the object parses, so counting
+        // as it went published per-rule drops and parse errors for objects
+        // that then failed and were re-driven in full: `sum(RuleDrops)` and
+        // `ParseErrors` reported work on records that were never dropped and
+        // will be re-counted on every retry, while `RecordsDropped` for the
+        // same snapshot stayed at zero.
+        let mut parse_errors: u64 = 0;
+        let mut rule_drops: HashMap<usize, u64> = HashMap::new();
         // Compressed bytes handed to `put_stream` so far. Accumulated rather
         // than reported as it goes, because every non-`Written` outcome
         // aborts the upload — nothing lands at the destination, so nothing
-        // may be billed to `BytesOut`. Committed once, below, on success.
+        // may be billed to `BytesOut`. Returned to `stream_run`, which commits
+        // it only after `upload_result?` proves the write landed: "handed to
+        // the channel" is not "stored", and a `put_stream` that fails
+        // mid-upload must not show up as bytes written.
         let mut bytes_out: u64 = 0;
 
         let finish = loop {
@@ -455,14 +543,14 @@ pub async fn stream_run(
                         Ok(value) => match engine.evaluate(&value) {
                             Decision::Keep => true,
                             Decision::Drop { rule_idx } => {
-                                metrics.record_rule_drop(engine.rule_name(rule_idx));
+                                *rule_drops.entry(rule_idx).or_insert(0) += 1;
                                 false
                             }
                         },
                         Err(_) => {
                             // Unparseable individual record: kept, never
                             // dropped — parity with buffer_run.
-                            metrics.add_parse_errors(1);
+                            parse_errors += 1;
                             true
                         }
                     };
@@ -476,7 +564,19 @@ pub async fn stream_run(
                             Ok(())
                         })();
                         if let Err(e) = write_result {
-                            metrics.add_records_in(records_in);
+                            // Abort before returning. Dropping `out_tx`
+                            // without this looks exactly like a *successful*
+                            // end of stream to `ChannelAsyncRead`, so
+                            // `put_stream` would complete the multipart upload
+                            // and commit everything drained so far — an object
+                            // with no `]}` and no gzip trailer, sitting at the
+                            // destination looking like a real one. Whether
+                            // this returns `Err` is beside the point: the
+                            // damage is at the destination, not in the return
+                            // value.
+                            let _ = out_tx
+                                .send(Err(io::Error::other("aborting: gzip write failed")))
+                                .await;
                             return Err(CoreError::Gzip(e.to_string()));
                         }
                         first = false;
@@ -495,7 +595,13 @@ pub async fn stream_run(
                 }
                 Some(StreamMsg::Finished(kind)) => break kind,
                 None => {
-                    metrics.add_records_in(records_in);
+                    // The extraction task died without sending `Finished`
+                    // (it panicked). Same reasoning as the gzip-write abort
+                    // above: without the sentinel this is a clean EOF to
+                    // `put_stream`, which commits a truncated object.
+                    let _ = out_tx
+                        .send(Err(io::Error::other("aborting: record producer vanished")))
+                        .await;
                     return Err(CoreError::Json(
                         "stream_run: record producer ended without a Finished message".to_string(),
                     ));
@@ -503,8 +609,29 @@ pub async fn stream_run(
             }
         };
 
-        metrics.add_records_in(records_in);
-
+        // Every per-record counter — `RecordsIn`, `RecordsKept`,
+        // `RecordsDropped`, `ParseErrors`, `RuleDrops` — is reported in one
+        // place, the two `RecordsFound` arms below, and nowhere else.
+        //
+        // Reporting `RecordsIn` here instead made stream mode publish
+        // `RecordsIn > 0` with kept and dropped both zero for an object that
+        // turned out to be unrecognized or malformed, where buffer mode
+        // reports 0/0/0 for the same bytes. That broke
+        // `RecordsIn == RecordsKept + RecordsDropped` in exactly one mode,
+        // which meant the one arithmetic identity an operator could alarm on
+        // to detect a lost record was not an identity at all.
+        //
+        // `ParseErrors`/`RuleDrops` had the same defect one level down: they
+        // were incremented inside the loop, so an object that failed *after*
+        // some of its records had been evaluated left drops attributed to a
+        // rule and parse errors attributed to records that were never
+        // dropped, never kept, and never written — and got re-counted on
+        // every redelivery of an object that keeps failing. An operator
+        // cross-checking `RuleDrops` against `RecordsDropped` (as
+        // `docs/metrics.md` says to) saw drops that did not happen.
+        //
+        // See `MetricSnapshot::records_balance` and the metric-parity cases
+        // in `tests/mode_parity.rs`.
         match finish {
             FinishKind::RecordsFound if kept > 0 => {
                 if let Err(e) = encoder.write_all(b"]}") {
@@ -519,10 +646,15 @@ pub async fn stream_run(
                             bytes_out += tail.len() as u64;
                             let _ = out_tx.send(Ok(Bytes::from(tail))).await;
                         }
-                        metrics.add_bytes_out(bytes_out);
-                        metrics.add_records_kept(kept);
-                        metrics.add_records_dropped(records_in - kept);
-                        Ok(Outcome::Written(None))
+                        commit_record_counters(
+                            metrics,
+                            engine,
+                            records_in,
+                            kept,
+                            parse_errors,
+                            &rule_drops,
+                        );
+                        Ok((Outcome::Written(None), bytes_out))
                     }
                     Err(e) => {
                         let _ = out_tx
@@ -537,17 +669,17 @@ pub async fn stream_run(
                 // mode must never leave a zero-record object at the
                 // destination ("never leave a zero-record object") —
                 // abort the upload instead of committing one.
-                metrics.add_records_dropped(records_in);
+                commit_record_counters(metrics, engine, records_in, 0, parse_errors, &rule_drops);
                 let _ = out_tx
                     .send(Err(io::Error::other("aborting: all records dropped")))
                     .await;
-                Ok(Outcome::NothingKept)
+                Ok((Outcome::NothingKept, 0))
             }
             FinishKind::Unrecognized => {
                 let _ = out_tx
                     .send(Err(io::Error::other("aborting: no Records array")))
                     .await;
-                Ok(Outcome::Unrecognized)
+                Ok((Outcome::Unrecognized, 0))
             }
             FinishKind::Error(failure) => {
                 let _ = out_tx
@@ -568,12 +700,17 @@ pub async fn stream_run(
         CoreError::Json(format!("stream_run: record extraction task panicked: {e}"))
     })?;
 
-    let outcome = processing_result?;
+    let (outcome, bytes_out) = processing_result?;
 
     match &outcome {
         Outcome::Written(None) => {
             // The normal path: the upload must actually have succeeded.
             upload_result?;
+            // Only now are those bytes really at the destination. Counting
+            // them inside the processing block would bill a failed upload's
+            // bytes to `BytesOut` — the object doesn't exist, but the metric
+            // says it was written.
+            metrics.add_bytes_out(bytes_out);
         }
         Outcome::NothingKept | Outcome::Unrecognized => {
             // We deliberately failed the reader `put_stream` was reading
@@ -593,6 +730,7 @@ pub async fn stream_run(
 mod tests {
     use super::*;
     use crate::config::rules::RuleSet;
+    use crate::error::StoreError;
     use crate::process::buffer_run;
     use crate::testing::InMemoryStore;
     use std::sync::Arc;
@@ -831,6 +969,90 @@ rules:
         assert_eq!(
             snapshot.bytes_out, 0,
             "an aborted upload writes nothing, so BytesOut must stay zero"
+        );
+    }
+
+    /// The case the two tests above don't reach: the upload is not aborted by
+    /// us, it simply *fails* — the reader delivered every byte cleanly and the
+    /// store rejected the write anyway (a real `CompleteMultipartUpload`
+    /// failure). `BytesOut` used to be committed inside the processing block,
+    /// before `upload_result?` was even looked at, so those bytes were billed
+    /// as written while the destination stayed empty.
+    #[tokio::test]
+    async fn a_failing_upload_reports_no_bytes_out() {
+        struct RejectingStore;
+
+        #[async_trait::async_trait]
+        impl ObjectStore for RejectingStore {
+            async fn get(&self, _b: &str, _k: &str) -> Result<Bytes, StoreError> {
+                unimplemented!("stream_run never gets through this store")
+            }
+
+            async fn get_stream(
+                &self,
+                _b: &str,
+                _k: &str,
+            ) -> Result<Box<dyn AsyncRead + Send + Unpin>, StoreError> {
+                unimplemented!("stream_run never gets through this store")
+            }
+
+            async fn put(
+                &self,
+                _b: &str,
+                _k: &str,
+                _body: Bytes,
+                _meta: PutMeta,
+            ) -> Result<(), StoreError> {
+                unimplemented!("stream mode never calls put")
+            }
+
+            async fn put_stream(
+                &self,
+                _b: &str,
+                _k: &str,
+                mut body: Box<dyn AsyncRead + Send + Unpin>,
+                _meta: PutMeta,
+            ) -> Result<(), StoreError> {
+                // Drain first, so the failure is "the store said no", not
+                // "the reader was never read" — the processing block must
+                // reach its success arm and hand over every byte.
+                let mut sink = Vec::new();
+                body.read_to_end(&mut sink)
+                    .await
+                    .expect("the reader must deliver a clean EOF in this test");
+                assert!(!sink.is_empty(), "the encoder must have produced bytes");
+                Err(StoreError::Backend("upload rejected".to_string()))
+            }
+        }
+
+        let input = gzip_bytes(br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#);
+        let metrics = Metrics::default();
+        let error = stream_run(
+            reader_over(input.clone()),
+            &no_op_engine(),
+            &Processing::default(),
+            &metrics,
+            &RejectingStore,
+            "bucket",
+            "dest",
+        )
+        .await
+        .expect_err("a rejected upload must surface as an error");
+        assert!(
+            matches!(error, CoreError::Store(_)),
+            "expected the store error to propagate, got {error:?}"
+        );
+
+        let snapshot = metrics.snapshot_and_reset();
+        assert_eq!(
+            snapshot.bytes_in,
+            input.len() as u64,
+            "the bytes were read, so BytesIn must count them"
+        );
+        assert_eq!(
+            snapshot.bytes_out, 0,
+            "the write failed, so nothing reached the destination and \
+             BytesOut must stay zero"
         );
     }
 

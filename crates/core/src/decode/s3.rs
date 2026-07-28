@@ -8,9 +8,14 @@
 //! binary.
 
 use crate::error::DecodeError;
-use crate::model::{ObjectRef, SourceItem};
+use crate::model::ObjectRef;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+
+// `SourceItem` is only built by the two decoders that wrap a whole
+// notification as one item; `decode-sqs` uses the object list directly.
+#[cfg(any(feature = "decode-s3", feature = "decode-sns"))]
+use crate::model::SourceItem;
 
 #[cfg(feature = "decode-s3")]
 use crate::ports::EventDecoder;
@@ -36,13 +41,28 @@ impl Default for S3EventDecoder {
 #[cfg(feature = "decode-s3")]
 impl EventDecoder for S3EventDecoder {
     fn decode(&self, payload: &[u8]) -> Result<Vec<SourceItem>, DecodeError> {
-        parse_s3_notification(payload)
+        Ok(as_source_item(parse_s3_notification(payload)?)
+            .into_iter()
+            .collect())
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct S3Notification {
-    #[serde(rename = "Records", default)]
+    /// Required — deliberately **not** `#[serde(default)]`. With a default,
+    /// any valid JSON object whatsoever deserialized into "zero objects": an
+    /// SNS topic carrying something that is not an S3 notification, or an S3
+    /// notification shape AWS changes under us, decoded to an empty object
+    /// list, produced no `SourceItem` at all on the S3/SNS paths and a clean
+    /// ack on the SQS path — 100% loss with no error, no log and no metric.
+    /// That is the same silent-loss shape as the `sqs.body_format`
+    /// misconfiguration, and it deserves the same treatment: a payload that
+    /// does not carry a `Records` array is a decode *failure*.
+    ///
+    /// The two legitimate zero-object payloads are unaffected: `s3:TestEvent`
+    /// short-circuits above this, and an explicit `{"Records":[]}` still
+    /// deserializes to an empty list.
+    #[serde(rename = "Records")]
     records: Vec<S3RecordEnvelope>,
 }
 
@@ -68,14 +88,26 @@ struct S3Object {
     size: Option<u64>,
 }
 
-/// Parses an S3 bucket notification payload into `SourceItem`s. Shared by
-/// `S3EventDecoder` and, via `sns.rs`, `SnsEventDecoder`.
+/// Parses an S3 bucket notification payload into the objects it references —
+/// **every** `Records` entry, in order. Shared by `S3EventDecoder` and, via
+/// `sns.rs` / `sqs.rs`, the SNS and SQS decoders.
+///
+/// Returns objects rather than `SourceItem`s on purpose. One notification is
+/// always one item (an S3 notification has no per-object ack identity), so a
+/// `Vec<SourceItem>` return gave callers an item dimension that was never
+/// more than one element long — and `sqs.rs` duly collapsed it with
+/// `.into_iter().next()`, a silent object-drop that would activate the moment
+/// this function's fan-out shape changed. With objects as the return type
+/// there is no item dimension to discard: callers that need an item wrap the
+/// whole `Vec` via [`as_source_item`].
 ///
 /// S3 sends a flat `{"Service":"Amazon S3","Event":"s3:TestEvent",...}`
 /// message the first time a notification configuration is saved — no
 /// `Records` array. That is not a decode failure, just an event with no
-/// objects in it, so it decodes to an empty `Vec` rather than an `Err`.
-pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<SourceItem>, DecodeError> {
+/// objects in it, so it decodes to an empty `Vec` rather than an `Err`. Any
+/// *other* payload lacking a `Records` array is an `Err` — see the field
+/// docs on `S3Notification::records`.
+pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<ObjectRef>, DecodeError> {
     let value: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
 
@@ -86,7 +118,7 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<SourceItem>, D
     let notification: S3Notification =
         serde_json::from_value(value).map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
 
-    let objects = notification
+    notification
         .records
         .into_iter()
         .map(|r| {
@@ -96,13 +128,17 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<SourceItem>, D
                 size: r.s3.object.size,
             })
         })
-        .collect::<Result<Vec<_>, DecodeError>>()?;
+        .collect()
+}
 
-    if objects.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    Ok(vec![SourceItem::new(None, objects)])
+/// Wraps a notification's objects as the single ack-less `SourceItem` the
+/// S3 and SNS decoders yield. `None` for an empty notification (an
+/// `s3:TestEvent` or an empty `Records`), so those decode to no items at all
+/// rather than to one item with nothing in it — which the pipeline would
+/// otherwise count as `items_without_objects`.
+#[cfg(any(feature = "decode-s3", feature = "decode-sns"))]
+pub(crate) fn as_source_item(objects: Vec<ObjectRef>) -> Option<SourceItem> {
+    (!objects.is_empty()).then(|| SourceItem::new(None, objects))
 }
 
 /// S3 notification object keys are form-urlencoded
@@ -146,6 +182,34 @@ mod tests {
         );
     }
 
+    /// S3 batches several object notifications into one event's `Records`
+    /// array. Every entry must become an `ObjectRef` on the single item, in
+    /// order: the event is handled as a unit, so an entry dropped here is one
+    /// the pipeline never learns about.
+    #[test]
+    fn every_records_entry_becomes_an_object() {
+        const THREE_OBJECTS: &[u8] = br#"{"Records":[
+          {"s3":{"bucket":{"name":"bucket-a"},"object":{"key":"one.json.gz","size":11}}},
+          {"s3":{"bucket":{"name":"bucket-a"},"object":{"key":"two.json.gz","size":22}}},
+          {"s3":{"bucket":{"name":"bucket-b"},"object":{"key":"three+x.json.gz","size":33}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(THREE_OBJECTS).unwrap();
+        assert_eq!(items.len(), 1, "one notification is exactly one item");
+
+        let keys: Vec<&str> = items[0].objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["one.json.gz", "two.json.gz", "three x.json.gz"],
+            "all three entries must survive, in order, each key decoded"
+        );
+        assert_eq!(items[0].objects[1].size, Some(22));
+        assert_eq!(
+            items[0].objects[2].bucket, "bucket-b",
+            "per-entry bucket must not be taken from the first entry"
+        );
+    }
+
     #[test]
     fn decodes_plus_as_space_in_key() {
         let decoded = decode_form_urlencoded_key("my+file%3Da.json.gz").unwrap();
@@ -184,5 +248,23 @@ mod tests {
     fn garbage_payload_is_a_decode_error() {
         let decoder = S3EventDecoder::new();
         assert!(decoder.decode(b"not json").is_err());
+    }
+
+    /// Valid JSON that is simply not an S3 notification must fail, not decode
+    /// to zero objects. Decoding it to zero objects yielded no `SourceItem`
+    /// at all, so the pipeline loop never ran and the payload vanished with
+    /// no error, no log and no metric — the same silent-loss shape as the
+    /// `sqs.body_format` misconfiguration. The `s3:TestEvent` case below
+    /// proves the legitimate zero-object payload is still not an error.
+    #[test]
+    fn valid_json_without_a_records_array_is_a_decode_error_not_zero_objects() {
+        let decoder = S3EventDecoder::new();
+        let err = decoder
+            .decode(br#"{"Type":"Notification","Message":"something else entirely"}"#)
+            .expect_err("a payload with no Records array must not decode to zero objects");
+        assert!(
+            err.to_string().contains("Records"),
+            "the error must name the missing field, got: {err}"
+        );
     }
 }

@@ -12,6 +12,8 @@ rule, write the survivors to a destination bucket with the same
   [Deployment](deployment.md).
 - **Configuring a deployment?** [Configuration](configuration.md) +
   [Rules](rules.md).
+- **Operating one?** [Metrics](metrics.md) — what to alarm on so a silent
+  failure cannot stay silent.
 - **Working locally?** [CLI](cli.md) + [Development](development.md).
 
 ## Contents
@@ -22,6 +24,7 @@ rule, write the survivors to a destination bucket with the same
 | [configuration.md](configuration.md) | `SETTINGS_URI`, precedence, the settings file, full `CT_*` env-var reference, the YAML quoting trap.      |
 | [rules.md](rules.md)                 | Rules schema, AND-within/OR-across evaluation, the rule index and the `always` bucket, validation.        |
 | [deployment.md](deployment.md)       | Four trigger topologies, building zips and container images, IAM, the SQS data-loss warning, rollout.     |
+| [metrics.md](metrics.md)             | Every emitted metric, the two reconciliation invariants, and what to alarm on.                            |
 | [cli.md](cli.md)                     | `validate` / `validate-settings` / `test` / `filter` reference with examples.                             |
 | [development.md](development.md)     | Everyday commands, Makefile targets, MiniStack tests, CI, the release pipeline, repo secrets.             |
 
