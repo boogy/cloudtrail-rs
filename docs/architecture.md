@@ -154,11 +154,40 @@ flowchart TD
     STR --> OUT
 ```
 
-- **buffer** — decompresses the whole object into memory. Guarded by
-  `CT_MAX_OBJECT_BYTES` (128 MiB default) on the decompressed size. Used by the
+- **buffer** — reads the whole object into memory and decompresses it. Guarded
+  by `CT_MAX_OBJECT_BYTES` (128 MiB default) on both sides: the fetch stops one
+  byte past the cap, and the decompressed body is capped again. Used by the
   CLI's `filter`/`test` as well.
 - **stream** — constant memory; writes the destination with S3 multipart uploads
   of `CT_MULTIPART_PART_BYTES` (8 MiB default) each.
+
+### Parity is an invariant, not a coincidence
+
+The mode an object takes is decided by its **size**, which has nothing to do
+with its contents. So the two modes must agree on everything that is not memory
+usage — the same bytes in must produce the same survivors, the same compressed
+output, the same failure classification, and the same counters — or an object
+silently changes meaning at `stream_threshold_bytes`.
+
+`crates/core/tests/mode_parity.rs` runs every case through both modes and
+asserts exactly that, including both reconciliation identities from
+[Metrics](metrics.md). Three consequences worth knowing when changing either
+module:
+
+- **Nothing is published until the object's fate is decided.** Buffer mode gets
+  this for free — it classifies the whole object before touching a counter.
+  Stream mode has to defer: record counters are tallied locally and committed as
+  one unit only once the object has succeeded, because a failed object is
+  re-driven and re-evaluated whole.
+- **Integrity is verified before the output commits.** `Deserializer::end()`
+  runs before the stream is reported finished, so a truncated gzip trailer or a
+  second concatenated envelope fails the object instead of committing a short
+  one. Decompression is always `MultiGzDecoder`, never `GzDecoder`.
+- **A stream-mode failure aborts the upload by failing the reader.** The error
+  is sent into the output channel, so `put_stream`'s body reader errors, and the
+  adapter issues `AbortMultipartUpload` rather than `CompleteMultipartUpload`.
+  Dropping the channel instead would look like a clean EOF and commit a
+  truncated object — which is why no error path may simply return.
 
 ## Cold start and init-once
 

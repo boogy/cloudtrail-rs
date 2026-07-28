@@ -10,7 +10,7 @@ pub mod uri;
 pub use file_source::FileConfigSource;
 pub use rules::{Match, Rule, RuleSet};
 pub use settings::{
-    Behavior, Destination, MetricsMode, Observability, OnConfigError, OnMissingObject,
+    Behavior, Destination, KeyFilter, MetricsMode, Observability, OnConfigError, OnMissingObject,
     OnUnrecognizedObject, Processing, ProcessingMode, Rules, Settings, Source, Sqs, SqsBodyFormat,
 };
 pub use store::{Compile, ConfigStore};

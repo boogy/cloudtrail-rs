@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-28
+
+Rounds two and three of the data-loss audit: the remaining findings from the
+same review — including two more silent-loss paths and the CLI's divergence
+from production — followed by a critical re-verification pass focused on
+observability, on the principle that a silent failure is only silent because no
+metric names it.
+
+### Changed
+
+- **A payload that is valid JSON but carries no `Records` array is now a decode
+  failure.** `S3Notification::records` was `#[serde(default)]`, so any JSON
+  object whatsoever deserialized to zero objects: an SNS topic carrying
+  something that is not an S3 notification, or a notification shape AWS changes
+  under us, produced no `SourceItem` at all on the S3/SNS paths and a clean ack
+  on SQS — 100% loss with no error, no log and no metric. Such payloads now
+  fail (SQS → DLQ, S3/SNS → invocation error). The two legitimate zero-object
+  payloads are unaffected: `s3:TestEvent` short-circuits earlier, and an
+  explicit `{"Records":[]}` still decodes to an empty list. One operational
+  consequence to plan for: an SNS **`SubscriptionConfirmation`** delivered to an
+  SQS queue now DLQs rather than being acked silently — only
+  `Type: "Notification"` is unwrapped as an SNS envelope.
+- **`sqs.body_format: s3` now fails a message whose body is an SNS
+  `Notification` envelope** instead of acking it. This is a behavior change
+  operators must know about: on a queue actually fed through an SNS topic, that
+  misconfiguration used to ack every message with zero objects fetched — 100%
+  silent loss, no error, no metric. Such messages are now redelivered and land
+  in the DLQ, with an error naming the setting to change (to `sns` or `auto`).
+  A correctly configured queue is unaffected.
+
+### Fixed
+
+- **Stream mode never verified the gzip trailer.** A truncated final gzip member
+  or trailing garbage produced a short object that was written and acked as
+  complete. The JSON deserializer is now ended before the stream is reported
+  finished, so those objects fail instead.
+- **A failed object took its siblings down with it.** When one object in an SQS
+  message failed, the remaining objects in the same message were skipped; on
+  redelivery the poison pill failed first again, so they were never processed.
+  Every object in an item is now attempted.
+- **Only the first S3 notification record in an SQS body was processed.** A
+  message body naming several objects had all but the first dropped, and the
+  message acked. All objects are now returned.
+- **Duplicate `Records` keys are classified identically in both modes.** Buffer
+  mode rejected the object as unrecognized while stream mode streamed both
+  arrays. Both now report unrecognized, so `on_unrecognized_object` (default
+  `copy`) decides, and the two modes cannot disagree on the same bytes.
+- **`BytesOut` counted bytes that never reached the destination.** Three of the
+  four counting sites incremented before the write, so a failed `put` /
+  `put_stream` still billed its bytes. All four now count after the write
+  succeeds.
+- **The CLI diverged from production.** `filter` ignored the settings document
+  entirely, reimplemented the source-key filter with a hardcoded pattern, and
+  buffered every object with one bad object aborting the batch. It now loads
+  settings through the production `Settings::from_parts`, shares the single
+  `KeyFilter` definition with `Settings::validate` and `Pipeline`, selects
+  buffer vs. stream per object exactly as the Lambda does, and accumulates
+  per-object failures instead of stopping at the first.
+- **Two stream-mode error paths could commit a truncated object.** Returning
+  early on a gzip write failure, or on the record producer vanishing, dropped
+  the output channel without the abort sentinel — a clean EOF, which
+  `put_stream` commits. Both paths now send the sentinel so the multipart
+  upload aborts and nothing lands at the destination key.
+- **A whole-payload decode failure moved no counter.** Only per-item (SQS
+  message body) decode failures incremented `DecodeErrors`, even though a
+  whole-payload failure loses every object the invocation carried. Both now
+  count.
+- **`RecordsIn` diverged between the two modes on failure.** Stream mode
+  counted records read before a parse failure; buffer mode counted none. That
+  made `RecordsIn == RecordsKept + RecordsDropped` not an invariant, so it
+  could not be alarmed on. `RecordsIn` is now counted only alongside
+  `RecordsKept`/`RecordsDropped`, and the parity harness asserts both the
+  cross-mode equality and the balance itself.
+- **`RuleDrops` and `ParseErrors` were published for work that was thrown
+  away.** Stream mode counted them as records streamed past, so an object that
+  failed _after_ some of its records had been evaluated left drops attributed
+  to a rule, and parse errors attributed to records, that were never dropped,
+  never kept and never written — and re-counted them on every redelivery of an
+  object that kept failing, while `RecordsDropped` for the same snapshot stayed
+  at zero. Buffer mode reported nothing for the same bytes. Both counters are
+  now tallied locally and committed alongside
+  `RecordsIn`/`RecordsKept`/`RecordsDropped`, only once the object has
+  succeeded. This makes `sum(RuleDrops) == RecordsDropped` a second
+  reconciliation identity, asserted for both modes on every parity case.
+- **`BytesIn` was billed twice for an unrecognized object in stream mode.**
+  `on_unrecognized_object: copy` re-reads the object (once to discover it has
+  no `Records`, once to copy it) and counted both reads, so the same bytes
+  reported double the `BytesIn` above `stream_threshold_bytes` and single
+  below it. The copy no longer re-bills what the filtering read already
+  counted — the same rule the `ObjectTooLarge` auto-retry already followed.
+- **A self-trigger moved no counter.** Refusing to reprocess our own output is
+  a hard, whole-batch failure by design, but it returned without touching a
+  single metric, so its only trace was the AWS `Errors` metric — which cannot
+  distinguish it from a timeout, an OOM, or a permissions failure. It now
+  counts as `ObjectsFailed` and logs the source and destination it refused.
+- **`dry_run` never reported `UnrecognizedObjects`.** It discarded
+  `buffer_run`'s `Outcome`, so the mode meant for previewing a ruleset before
+  enabling it was blind to the one outcome `on_unrecognized_object` acts on.
+- **Three paths fetched a whole object into memory with no size cap.** The
+  `on_config_error: open` passthrough, stream mode's unrecognized-object
+  branch, and buffer mode's own fetch all read the entire object before any
+  limit applied — `max_object_bytes` was enforced only on the decompressed
+  side, reached after the compressed object was already resident. With
+  `panic = "abort"`, an OOM kills the container, and on the S3-direct topology
+  an async invocation is retried twice and then discarded with no DLQ unless an
+  on-failure destination is configured. The passthrough and the
+  unrecognized-object copy now stream source to destination (peak memory: one
+  multipart part, whatever the object weighs); stream mode's unrecognized
+  branch consults `on_unrecognized_object` **before** fetching, so `skip` and
+  `error` — which never look at the bytes — do no I/O at all; and buffer mode's
+  fetch stops one byte past `max_object_bytes`, raising the same
+  `ObjectTooLarge` that `mode: auto` already recovers by retrying through
+  stream mode. Capping the compressed read rejects nothing that would have
+  survived: gzip output is never meaningfully larger than its input.
+
+### Added
+
+- **`ObjectsFailed`.** Under the default `partial_batch_failures: true` a failed
+  object returns `Ok` from the handler — the failure travels via
+  `batchItemFailures` — so AWS's own `Errors` metric stays at zero and every
+  other counter is about objects that succeeded. "Objects are failing and
+  heading for the DLQ" previously had no metric at all, only a log line.
+- **`ObjectsExcludedByKey`.** A wrong `include_key_regex`/`exclude_key_regex`
+  rejects every delivery, and without this counter that state is byte-for-byte
+  identical in metrics to a function receiving no traffic at all.
+- **[`docs/metrics.md`](docs/metrics.md)** — the full metric reference: every
+  counter, both reconciliation invariants, a prioritised alarm table, the
+  silent-failure states each counter closes, and the known limitations (no
+  `FunctionName` dimension, no snapshot on panic, sparse `RuleDrops`).
+- A buffer/stream parity harness (`crates/core/tests/mode_parity.rs`) asserting
+  the two modes agree on survivors, counts, and failure classification for the
+  same input. The mode is chosen by object **size**, so a disagreement means an
+  object silently changes meaning at `stream_threshold_bytes`; the harness is
+  now the required home for any change to either processing module.
+- `docs/deployment.md` documents that `processing.max_object_bytes` is a
+  buffer-mode cap, not an object-size limit — the operational ceiling is the
+  function timeout — and the S3-direct topology's residual risk (an async
+  invocation that keeps timing out is discarded without an on-failure
+  destination).
+
 ## [0.2.0] - 2026-07-28
 
 A workspace-wide test-coverage audit, prioritising anything that could lose a
@@ -23,7 +163,7 @@ surfaced; the suite goes 166 → 200 tests.
   list, and are redelivered.
 - **A wrong `sqs.body_format` discarded 100% of traffic in silence.** Valid
   JSON of the wrong shape decoded to zero objects, acked clean, and emitted
-  neither an error nor a metric. Now counted as `ItemsWithNoObjects`, with a
+  neither an error nor a metric. Now counted as `ItemsWithoutObjects`, with a
   documented alarm.
 - **Stream mode never reported `BytesIn`/`BytesOut`.** Every object above
   `processing.stream_threshold_bytes` contributed zero to both counters —
@@ -113,7 +253,8 @@ processing.stream_threshold_bytes`; `processing.multipart_part_bytes` must
   GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/boogy/cloudtrail-rs/releases/tag/v0.1.0

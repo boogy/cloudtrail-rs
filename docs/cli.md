@@ -95,22 +95,56 @@ cloudtrail-rs test examples/rules.example.yaml sample-cloudtrail-log.json.gz
 # summary: 500 records, 420 kept (84.0%), 80 dropped (16.0%)
 ```
 
-## `filter <source> <dest> --rules <uri>`
+## `filter <source> <dest> --rules <uri> [--settings <path>]`
 
-Filters CloudTrail gzip objects through the exact same `buffer_run` the Lambda
-binaries use. `source` and `dest` are each independently auto-detected:
+Filters CloudTrail gzip objects through the exact same `buffer_run` /
+`stream_run` the Lambda binaries use. `source` and `dest` are each
+independently auto-detected:
 
 - a **local file** — `source` filters that one object to `dest` (a file path);
-- a **local directory** — every `.json.gz` under it is filtered, mirroring each
-  object's relative path into `dest` (a directory, created as needed);
-- an **`s3://bucket/prefix`** — every `.json.gz` under that prefix is filtered,
-  batch-style, same as a local directory.
+- a **local directory** — every in-scope object under it is filtered, mirroring
+  each object's relative path into `dest` (a directory, created as needed);
+- an **`s3://bucket/prefix`** — every in-scope object under that prefix is
+  filtered, batch-style, same as a local directory.
 
 Output is always gzip-faithful `.json.gz` with the canonical
 `application/x-gzip` / `gzip` content-type and content-encoding. Objects where
 every record is dropped are **not written** ("zero empty writes") — neither
 locally nor to S3. Any S3-side `source`/`dest` needs AWS credentials resolved the
 normal SDK way (env, profile, instance role, …).
+
+### `--settings`: filter the way the deployment filters
+
+Pass the deployment's settings document and a backfill selects and processes
+exactly the objects production would. Without it, built-in defaults apply.
+Honoured:
+
+| Setting                             | Effect on `filter`                                                                                                                                                                                              |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.include_key_regex`          | Which objects are **in scope**: batch mode enumerates by these two patterns, not by a hardcoded `.json.gz` rule. A named single file is always processed — you asked for that one object.                       |
+| `source.exclude_key_regex`          | See above; a key is in scope when it matches `include` and not `exclude`.                                                                                                                                       |
+| `processing.mode`                   | `auto` \| `buffer` \| `stream`, per object, by the same rule the pipeline uses.                                                                                                                                 |
+| `processing.stream_threshold_bytes` | Compressed size above which `auto` streams. Local files carry their size; S3 objects do not, so they start in buffer mode.                                                                                      |
+| `processing.max_object_bytes`       | Buffer mode's memory cap (compressed fetch and decompressed body). In `auto`, an object over it is **retried through stream mode** — the same retry the Lambda performs — so nothing the Lambda handles fails a backfill. `mode: buffer` opts out. |
+| `processing.gzip_level`             | Output compression level.                                                                                                                                                                                       |
+| `processing.multipart_part_bytes`   | Part size for a streamed S3 write.                                                                                                                                                                              |
+| `behavior.dry_run`                  | Evaluate and count every record, write nothing.                                                                                                                                                                 |
+| `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                    |
+
+Ignored, because the command line already says it or there is no Lambda around
+it: `destination.*` (`dest` is the destination), `rules.*` (`--rules` is),
+`sqs.*`, `behavior.on_config_error`, `behavior.partial_batch_failures`,
+`behavior.on_missing_object`, `observability.*`.
+
+The document goes through the same `Settings::from_parts` validation
+`validate-settings` and the Lambdas run, `CT_*` overrides included.
+
+### Failures
+
+A batch does **not** stop at the first bad object. Every object is attempted,
+the summary still prints, and the failures are listed afterwards on stderr with
+a non-zero exit — so a large backfill tells you exactly which objects need a
+second pass instead of dying halfway with no report.
 
 **Local → local (see filtering happen with plain folders, no AWS needed):**
 
@@ -120,8 +154,16 @@ cp cloudtrail-sample-*.json.gz in/
 cloudtrail-rs filter in/ out/ --rules examples/rules.example.yaml
 #   a.json.gz -> out/a.json.gz
 #   b.json.gz -> (all records dropped, nothing written)
-# processed 2 object(s): 1 written, 1 fully dropped, 0 copied verbatim
+# processed 2 object(s): 1 written, 1 fully dropped, 0 copied verbatim, 0 skipped, 0 failed
 # records: 4 in, 2 kept, 2 dropped
+```
+
+**Backfill with the deployment's own settings:**
+
+```sh
+cloudtrail-rs filter s3://raw-cloudtrail/AWSLogs/ s3://ct-siem-sync/backfill/ \
+  --rules ssm:///cloudtrail-rs/rules \
+  --settings settings.yaml
 ```
 
 **Local → S3:**

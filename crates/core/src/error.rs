@@ -48,8 +48,8 @@ pub enum CoreError {
     #[error("failed to parse JSON: {0}")]
     Json(String),
     #[error(
-        "decompressed object exceeds max_object_bytes ({limit} bytes): buffer mode refuses to \
-         keep reading rather than risk OOM on an oversized or bomb-like object"
+        "object exceeds max_object_bytes ({limit} bytes), compressed or decompressed: buffer \
+         mode refuses to keep reading rather than risk OOM on an oversized or bomb-like object"
     )]
     ObjectTooLarge { limit: u64 },
     /// Failure decoding the raw Lambda event payload itself (`Pipeline::handle`'s

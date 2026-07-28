@@ -38,6 +38,20 @@ Adapters live in `crates/aws`. If you reach for an AWS type here, it belongs in
   `cli validate` warns about rules that fall into `always`.
 - **Feature-gated decoders.** Adding a source = one decoder behind one
   `decode-*` feature; zero changes to the rest of core.
+- **Buffer/stream parity.** The mode is chosen by object **size**, so the two
+  must agree on survivors, output bytes, failure classification and every
+  counter — otherwise an object changes meaning at `stream_threshold_bytes`.
+  Enforced by `tests/mode_parity.rs`; a change to either module belongs there
+  as a new case.
+- **Nothing is published or committed before the object's fate is decided.**
+  Record counters are committed as one unit only after the object succeeds (a
+  failed object is re-driven and re-evaluated whole); `BytesOut` is counted
+  only after the write returns; `BytesIn` is counted once per object per
+  invocation even on the paths that read it twice.
+- **A stream-mode error must fail the reader, never just return.** The error
+  goes into the output channel so `put_stream`'s reader errors and the upload
+  aborts. Dropping the channel is a clean EOF, and a clean EOF commits a
+  truncated object.
 
 See [`docs/architecture.md`](../../docs/architecture.md) and
 [`docs/rules.md`](../../docs/rules.md) for the full model.

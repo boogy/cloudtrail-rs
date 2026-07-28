@@ -11,13 +11,16 @@
 //!   index. Non-zero exit only on a config/build error — the CI gate.
 //! - `test <rules> <sample.json.gz>`: per-record KEEP/DROP against the
 //!   compiled ruleset, plus a summary, so dead rules are visible.
-//! - `filter <source> <dest> --rules <uri>`: local/backfill filtering, via
-//!   `core::process::buffer_run` directly. Each of `source` and `dest` is
-//!   auto-detected as a local path or an `s3://bucket/prefix` URI; a local
-//!   directory or an `s3://` prefix triggers batch mode (every `.json.gz`
-//!   object filtered into a mirrored destination), so filtering is visible
-//!   on the local filesystem and the same command works against S3 when AWS
-//!   credentials are present.
+//! - `filter <source> <dest> --rules <uri> [--settings <path>]`:
+//!   local/backfill filtering, via `core::process::{buffer_run, stream_run}`
+//!   directly. Each of `source` and `dest` is auto-detected as a local path
+//!   or an `s3://bucket/prefix` URI; a local directory or an `s3://` prefix
+//!   triggers batch mode (every in-scope object filtered into a mirrored
+//!   destination), so filtering is visible on the local filesystem and the
+//!   same command works against S3 when AWS credentials are present.
+//!   `--settings` makes a backfill use the *deployment's* own
+//!   `processing.*`/`source.*`/`behavior.*` values instead of built-in
+//!   defaults — see [`FilterConfig`].
 //! - `validate-settings [path]`: runs a settings document through the exact
 //!   `Settings::from_parts` validation the Lambda binaries run at cold
 //!   start, so a bad value that would otherwise panic mid-invocation is
@@ -28,16 +31,21 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
-use cloudtrail_rs_core::config::{ConfigUri, Processing, RuleSet, Settings};
+use cloudtrail_rs_core::config::{
+    Behavior, ConfigUri, KeyFilter, OnUnrecognizedObject, Processing, ProcessingMode, RuleSet,
+    Settings, Source,
+};
+use cloudtrail_rs_core::error::{CoreError, StoreError};
 use cloudtrail_rs_core::filter::{Decision, Engine};
 use cloudtrail_rs_core::metrics::Metrics;
 use cloudtrail_rs_core::model::PutMeta;
 use cloudtrail_rs_core::ports::{ConfigSource, ObjectStore};
-use cloudtrail_rs_core::process::{Outcome, buffer_run};
+use cloudtrail_rs_core::process::{Outcome, buffer_run, stream_run};
 use flate2::read::MultiGzDecoder;
 
 /// Object metadata for every gzip object this CLI writes to S3, matching the
@@ -75,14 +83,19 @@ enum Command {
         /// Local `.json.gz` sample (a gzip'd `{"Records": [...]}` envelope).
         sample: PathBuf,
     },
-    /// Filter CloudTrail gzip objects through `core::process::buffer_run`.
+    /// Filter CloudTrail gzip objects through `core::process::{buffer_run,
+    /// stream_run}` — the same two processors the Lambda runs.
     ///
     /// `source` and `dest` are each a local path or an `s3://bucket/prefix`
     /// URI. A single local **file** filters that one object to `dest`. A
-    /// local **directory** or any `s3://` prefix filters every `.json.gz`
+    /// local **directory** or any `s3://` prefix filters every in-scope
     /// object under it, mirroring the relative path into `dest` (which may
     /// itself be a local directory or an `s3://` prefix). Objects with all
     /// records dropped are not written ("zero empty writes").
+    ///
+    /// A failing object does not stop the run: the batch continues, the
+    /// summary still prints, and the failures are listed at the end with a
+    /// non-zero exit.
     Filter {
         /// Local file/directory, or `s3://bucket/prefix`.
         source: String,
@@ -91,6 +104,12 @@ enum Command {
         /// `ssm://`, `s3://`, `file://`, or a bare local path.
         #[arg(long)]
         rules: String,
+        /// The deployment's settings YAML, so a backfill uses the same
+        /// `processing.*` (mode, thresholds, gzip level), `source.*` (which
+        /// keys are in scope), and `behavior.*` (dry run, unrecognized-object
+        /// policy) values production does. Omit for built-in defaults.
+        #[arg(long)]
+        settings: Option<PathBuf>,
     },
     /// Load a settings document and run the exact validation the Lambda
     /// binaries run at cold start (`Settings::from_parts`), so a bad value
@@ -134,14 +153,213 @@ impl Location {
     fn is_s3(&self) -> bool {
         matches!(self, Location::S3 { .. })
     }
+
+    /// The bucket to address this side's `ObjectStore` with. Empty for a
+    /// local side: [`LocalObjectStore`] ignores it and treats the key as a
+    /// filesystem path.
+    fn bucket(&self) -> &str {
+        match self {
+            Location::Local(_) => "",
+            Location::S3 { bucket, .. } => bucket,
+        }
+    }
+
+    /// How a `bucket`/`key` on this side is shown in progress lines.
+    fn display(&self, key: &str) -> String {
+        match self {
+            Location::Local(_) => key.to_string(),
+            Location::S3 { bucket, .. } => format!("s3://{bucket}/{key}"),
+        }
+    }
 }
 
-/// One source object queued for filtering: `fetch` is what reads its bytes
-/// (a local path or a full S3 key); `rel` is the path used to mirror it into
-/// the destination.
+/// One source object queued for filtering: `fetch` is the store key that
+/// reads its bytes (a local path or a full S3 key); `rel` is the path used
+/// to mirror it into the destination; `size` is its *compressed* size when
+/// cheaply known, which is what picks buffer vs. stream in `auto` mode.
+///
+/// `size` is `None` for an S3 source: `ListObjectsV2` sizes are not carried
+/// through `S3ObjectStore::list_keys`, and an unknown size means buffer mode
+/// — the same conservative choice `Pipeline::select_mode` makes when an
+/// event carries no size (safety invariant 5). Nothing is lost by it: an
+/// object too large to buffer is retried through stream mode below, exactly
+/// as the pipeline retries it.
 struct SrcObject {
     fetch: String,
     rel: String,
+    size: Option<u64>,
+}
+
+/// The parts of a settings document `filter` honours, resolved once per run.
+///
+/// Scope is deliberate — these are the settings that change *what a backfill
+/// selects and writes*:
+/// - `processing.*` — mode, `stream_threshold_bytes`, `max_object_bytes`,
+///   `multipart_part_bytes`, `gzip_level`.
+/// - `source.*` — via [`KeyFilter`], which objects are in scope at all.
+/// - `behavior.dry_run` — evaluate and report, write nothing.
+/// - `behavior.on_unrecognized_object` — copy / skip / error.
+///
+/// The rest is Lambda-only and ignored here: `destination.*` (the `dest`
+/// argument is the destination), `rules.*` (`--rules` is), `sqs.*`,
+/// `behavior.on_config_error` and `behavior.partial_batch_failures` (no
+/// event source, no batch to fail), `behavior.on_missing_object` (objects
+/// are enumerated, not named by an event), and `observability.*`.
+struct FilterConfig {
+    processing: Processing,
+    keys: KeyFilter,
+    dry_run: bool,
+    on_unrecognized: OnUnrecognizedObject,
+}
+
+impl FilterConfig {
+    /// `Some(path)` runs the document through the exact production
+    /// `Settings::from_parts` validation (`CT_*` overrides included);
+    /// `None` is built-in defaults. Defaults are assembled from the same
+    /// `Default` impls `Settings` parses into rather than through
+    /// `from_parts`, because `from_parts` requires a `destination.bucket`
+    /// that a CLI run has no use for — `dest` is the destination.
+    fn resolve(path: Option<&Path>) -> anyhow::Result<Self> {
+        let (source, processing, behavior) = match path {
+            Some(p) => {
+                let s = load_and_validate_settings(Some(p))?;
+                (s.source, s.processing, s.behavior)
+            }
+            None => (
+                Source::default(),
+                Processing::default(),
+                Behavior::default(),
+            ),
+        };
+        Ok(Self {
+            keys: KeyFilter::compile(&source)?,
+            processing,
+            dry_run: behavior.dry_run,
+            on_unrecognized: behavior.on_unrecognized_object,
+        })
+    }
+
+    /// Buffer vs. stream for an object of (compressed) `size` — the same
+    /// decision `Pipeline::select_mode` makes, including the missing-size
+    /// fallback to buffer.
+    fn select_mode(&self, size: Option<u64>) -> Mode {
+        match self.processing.mode {
+            ProcessingMode::Buffer => Mode::Buffer,
+            ProcessingMode::Stream => Mode::Stream,
+            ProcessingMode::Auto => match size {
+                Some(sz) if sz > self.processing.stream_threshold_bytes => Mode::Stream,
+                _ => Mode::Buffer,
+            },
+        }
+    }
+}
+
+/// The resolved per-object mode: `auto` is a decision, not a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Buffer,
+    Stream,
+}
+
+/// `core`'s `ObjectStore` port over the local filesystem, so the local side
+/// of a `filter` run is addressed exactly like the S3 side and `stream_run`
+/// — which writes through the port — works against a local destination too.
+/// `bucket` is meaningless locally and ignored; `key` is the path.
+struct LocalObjectStore;
+
+impl LocalObjectStore {
+    fn create_parent(key: &str) -> Result<(), StoreError> {
+        if let Some(parent) = Path::new(key).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StoreError::Backend(format!("failed to create directory {parent:?}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn io_error(key: &str, what: &str, e: std::io::Error) -> StoreError {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StoreError::NotFound {
+                bucket: String::new(),
+                key: key.to_string(),
+            }
+        } else {
+            StoreError::Backend(format!("failed to {what} {key:?}: {e}"))
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LocalObjectStore {
+    async fn get(&self, _bucket: &str, key: &str) -> Result<Bytes, StoreError> {
+        tokio::fs::read(key)
+            .await
+            .map(Bytes::from)
+            .map_err(|e| Self::io_error(key, "read", e))
+    }
+
+    async fn get_stream(
+        &self,
+        _bucket: &str,
+        key: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+        let file = tokio::fs::File::open(key)
+            .await
+            .map_err(|e| Self::io_error(key, "open", e))?;
+        Ok(Box::new(file))
+    }
+
+    async fn put(
+        &self,
+        _bucket: &str,
+        key: &str,
+        body: Bytes,
+        _meta: PutMeta,
+    ) -> Result<(), StoreError> {
+        Self::create_parent(key)?;
+        tokio::fs::write(key, &body)
+            .await
+            .map_err(|e| Self::io_error(key, "write", e))
+    }
+
+    /// Writes through a temporary sibling and renames on success, so an
+    /// aborted stream leaves *nothing* at `key`. `stream_run` signals
+    /// "abandon this upload" by failing the reader mid-flight (all records
+    /// dropped, an unrecognized object, a parse failure); writing `key`
+    /// directly would leave a truncated or zero-record object behind, which
+    /// the whole design exists to prevent.
+    async fn put_stream(
+        &self,
+        _bucket: &str,
+        key: &str,
+        mut body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        _meta: PutMeta,
+    ) -> Result<(), StoreError> {
+        Self::create_parent(key)?;
+        let partial = format!("{key}.{}.partial", std::process::id());
+
+        let mut file = tokio::fs::File::create(&partial)
+            .await
+            .map_err(|e| Self::io_error(&partial, "create", e))?;
+
+        let copied = tokio::io::copy(&mut body, &mut file).await;
+        // Close before renaming: the rename must not race the last write.
+        drop(file);
+
+        match copied {
+            Ok(_) => tokio::fs::rename(&partial, key)
+                .await
+                .map_err(|e| Self::io_error(key, "rename into", e)),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&partial).await;
+                Err(StoreError::Backend(format!(
+                    "streaming write to {key:?} aborted: {e}"
+                )))
+            }
+        }
+    }
 }
 
 /// Resolves a rules `uri` to raw bytes. A bare path with no `scheme://` is
@@ -278,16 +496,6 @@ async fn cmd_test(rules_uri: &str, sample_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether a key should be filtered: a `.json.gz` object that is not a
-/// CloudTrail digest or Insight file. Mirrors the intent of the pipeline's
-/// default `source.include_key_regex`/`exclude_key_regex`, applied here to
-/// batch enumeration so digest/Insight objects cost nothing.
-fn is_candidate_key(key: &str) -> bool {
-    key.ends_with(".json.gz")
-        && !key.contains("CloudTrail-Digest")
-        && !key.contains("CloudTrail-Insight")
-}
-
 /// The "directory" portion of an S3 prefix — everything up to and including
 /// its last `/`. Stripping this from a listed key yields the relative key to
 /// mirror into the destination, so both a directory-style prefix
@@ -308,23 +516,31 @@ fn join_key(prefix: &str, rel: &str) -> String {
     }
 }
 
-/// Recursively collects candidate `.json.gz` objects under `dir`, recording
-/// each one's path relative to `root` (with `/` separators) as its `rel`.
-fn collect_local(root: &Path, dir: &Path, out: &mut Vec<SrcObject>) -> anyhow::Result<()> {
+/// Recursively collects in-scope objects under `dir`, recording each one's
+/// path relative to `root` (with `/` separators) as its `rel`. `rel` is what
+/// `keys` is matched against — locally there is no S3 key, and `rel` is the
+/// closest analogue of one.
+fn collect_local(
+    root: &Path,
+    dir: &Path,
+    keys: &KeyFilter,
+    out: &mut Vec<SrcObject>,
+) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("failed to read dir {dir:?}"))? {
         let path = entry?.path();
         if path.is_dir() {
-            collect_local(root, &path, out)?;
+            collect_local(root, &path, keys, out)?;
         } else {
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if is_candidate_key(&rel) {
+            if keys.allows(&rel) {
                 out.push(SrcObject {
                     fetch: path.to_string_lossy().into_owned(),
                     rel,
+                    size: std::fs::metadata(&path).ok().map(|m| m.len()),
                 });
             }
         }
@@ -332,14 +548,20 @@ fn collect_local(root: &Path, dir: &Path, out: &mut Vec<SrcObject>) -> anyhow::R
     Ok(())
 }
 
-/// Enumerates every candidate source object under a batch source (a local
+/// Enumerates every in-scope source object under a batch source (a local
 /// directory or an `s3://` prefix), sorted by relative key for deterministic
-/// output.
-async fn enumerate(src: &Location, s3: &Option<S3ObjectStore>) -> anyhow::Result<Vec<SrcObject>> {
+/// output. In scope means exactly what it means in production: the
+/// deployment's `source.include_key_regex`/`exclude_key_regex`, compiled
+/// into the same [`KeyFilter`] the pipeline applies before any `GetObject`.
+async fn enumerate(
+    src: &Location,
+    keys: &KeyFilter,
+    s3: &Option<S3ObjectStore>,
+) -> anyhow::Result<Vec<SrcObject>> {
     let mut objs = match src {
         Location::Local(root) => {
             let mut objs = Vec::new();
-            collect_local(root, root, &mut objs)?;
+            collect_local(root, root, keys, &mut objs)?;
             objs
         }
         Location::S3 { bucket, prefix } => {
@@ -349,96 +571,23 @@ async fn enumerate(src: &Location, s3: &Option<S3ObjectStore>) -> anyhow::Result
                 .list_keys(bucket, prefix)
                 .await?
                 .into_iter()
-                .filter(|k| is_candidate_key(k))
+                .filter(|k| keys.allows(k))
                 .map(|k| {
                     let rel = k
                         .strip_prefix(dir.as_str())
                         .unwrap_or(k.as_str())
                         .to_string();
-                    SrcObject { fetch: k, rel }
+                    SrcObject {
+                        fetch: k,
+                        rel,
+                        size: None,
+                    }
                 })
                 .collect()
         }
     };
     objs.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(objs)
-}
-
-/// Reads a source object's bytes (`fetch` is a local path or a full S3 key).
-async fn read_source(
-    src: &Location,
-    fetch: &str,
-    s3: &Option<S3ObjectStore>,
-) -> anyhow::Result<Vec<u8>> {
-    match src {
-        Location::Local(_) => {
-            std::fs::read(fetch).with_context(|| format!("failed to read {fetch:?}"))
-        }
-        Location::S3 { bucket, .. } => {
-            let store = s3.as_ref().expect("s3 store built when a side is s3");
-            Ok(store.get(bucket, fetch).await?.to_vec())
-        }
-    }
-}
-
-/// Writes `bytes` to the batch destination under relative key `rel`,
-/// returning a human-readable location for the progress line.
-async fn write_dest(
-    dst: &Location,
-    rel: &str,
-    bytes: &[u8],
-    s3: &Option<S3ObjectStore>,
-) -> anyhow::Result<String> {
-    match dst {
-        Location::Local(root) => {
-            let path = root.join(rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {parent:?}"))?;
-            }
-            std::fs::write(&path, bytes).with_context(|| format!("failed to write {path:?}"))?;
-            Ok(path.display().to_string())
-        }
-        Location::S3 { bucket, prefix } => {
-            let key = join_key(prefix, rel);
-            let store = s3.as_ref().expect("s3 store built when a side is s3");
-            store
-                .put(bucket, &key, Bytes::copy_from_slice(bytes), GZIP_META)
-                .await?;
-            Ok(format!("s3://{bucket}/{key}"))
-        }
-    }
-}
-
-/// Writes a single-object destination (source was one local file). Local:
-/// the exact path given. S3: the prefix is taken as the full object key.
-async fn write_single(
-    dst: &Location,
-    bytes: &[u8],
-    s3: &Option<S3ObjectStore>,
-) -> anyhow::Result<String> {
-    match dst {
-        Location::Local(path) => {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {parent:?}"))?;
-            }
-            std::fs::write(path, bytes).with_context(|| format!("failed to write {path:?}"))?;
-            Ok(path.display().to_string())
-        }
-        Location::S3 { bucket, prefix } => {
-            if prefix.is_empty() {
-                anyhow::bail!("s3 destination for a single file needs a key, not just a bucket");
-            }
-            let store = s3.as_ref().expect("s3 store built when a side is s3");
-            store
-                .put(bucket, prefix, Bytes::copy_from_slice(bytes), GZIP_META)
-                .await?;
-            Ok(format!("s3://{bucket}/{prefix}"))
-        }
-    }
 }
 
 /// Builds one S3 client (credential chain resolved once) if either side is
@@ -452,87 +601,306 @@ async fn build_s3_if_needed(src: &Location, dst: &Location) -> Option<S3ObjectSt
     }
 }
 
-async fn cmd_filter(source: &str, dest: &str, rules_uri: &str) -> anyhow::Result<()> {
+/// What became of one object. Every variant carries enough to print the
+/// object's progress line without re-deriving where it went.
+enum ObjectOutcome {
+    Written(String),
+    NothingKept,
+    Copied(String),
+    Skipped,
+    DryRun,
+}
+
+/// The batch destination key for a source object's relative key.
+fn batch_dest_key(dst: &Location, rel: &str) -> String {
+    match dst {
+        Location::Local(root) => root.join(rel).to_string_lossy().into_owned(),
+        Location::S3 { prefix, .. } => join_key(prefix, rel),
+    }
+}
+
+/// The destination key when the source was a single named file. Local: the
+/// exact path given. S3: the prefix is the full object key.
+fn single_dest_key(dst: &Location) -> anyhow::Result<String> {
+    match dst {
+        Location::Local(path) => Ok(path.to_string_lossy().into_owned()),
+        Location::S3 { prefix, .. } => {
+            if prefix.is_empty() {
+                anyhow::bail!("s3 destination for a single file needs a key, not just a bucket");
+            }
+            Ok(prefix.clone())
+        }
+    }
+}
+
+/// Everything a `filter` run needs to process one object, so the single-file
+/// and batch paths share one implementation — and so that implementation can
+/// mirror `Pipeline`'s per-object policy (mode selection, the auto-mode
+/// stream retry, the unrecognized-object policy) instead of approximating it.
+struct Filterer {
+    engine: Engine,
+    cfg: FilterConfig,
+    metrics: Metrics,
+    src: Location,
+    dst: Location,
+    local: LocalObjectStore,
+    s3: Option<S3ObjectStore>,
+}
+
+impl Filterer {
+    fn store(&self, loc: &Location) -> &dyn ObjectStore {
+        match loc {
+            Location::Local(_) => &self.local,
+            Location::S3 { .. } => self.s3.as_ref().expect("s3 store built when a side is s3"),
+        }
+    }
+
+    async fn process(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+        size: Option<u64>,
+    ) -> anyhow::Result<ObjectOutcome> {
+        if self.cfg.dry_run {
+            // Mirrors `Pipeline::process_dry_run`: every record is still
+            // evaluated (so the record counts report what *would* be
+            // filtered) through buffer semantics, and the result is
+            // discarded — nothing is written.
+            let bytes = self
+                .store(&self.src)
+                .get(self.src.bucket(), src_key)
+                .await?;
+            buffer_run(&bytes, &self.engine, &self.cfg.processing, &self.metrics)?;
+            return Ok(ObjectOutcome::DryRun);
+        }
+
+        match self.cfg.select_mode(size) {
+            Mode::Stream => self.process_stream(src_key, dst_key).await,
+            Mode::Buffer => {
+                let bytes = self
+                    .store(&self.src)
+                    .get(self.src.bucket(), src_key)
+                    .await?;
+                let result = buffer_run(&bytes, &self.engine, &self.cfg.processing, &self.metrics);
+                match result {
+                    // The same retry `Pipeline::process_object` performs:
+                    // `stream_threshold_bytes` is a compressed-size estimate,
+                    // so a highly compressible object can be routed to buffer
+                    // mode and still blow `max_object_bytes` (buffer mode's
+                    // memory cap, applied to the fetch and the decompressed
+                    // body alike). Stream mode has no such cap. Only in
+                    // `auto`: an explicit `mode: buffer` means the operator
+                    // opted out of streaming, so the error must surface.
+                    Err(CoreError::ObjectTooLarge { limit })
+                        if self.cfg.processing.mode == ProcessingMode::Auto =>
+                    {
+                        eprintln!(
+                            "  note: {src_key} exceeds max_object_bytes ({limit}); \
+                             retrying via stream mode"
+                        );
+                        self.process_stream(src_key, dst_key).await
+                    }
+                    Err(e) => Err(e.into()),
+                    Ok(Outcome::Written(Some(out))) => {
+                        Ok(ObjectOutcome::Written(self.put(dst_key, out).await?))
+                    }
+                    Ok(Outcome::NothingKept) => Ok(ObjectOutcome::NothingKept),
+                    Ok(Outcome::Unrecognized) => self.unrecognized(src_key, dst_key, bytes).await,
+                    Ok(Outcome::Written(None)) => {
+                        unreachable!("buffer_run returns Written(Some(_)) when it writes")
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_stream(&self, src_key: &str, dst_key: &str) -> anyhow::Result<ObjectOutcome> {
+        let reader = self
+            .store(&self.src)
+            .get_stream(self.src.bucket(), src_key)
+            .await?;
+        let outcome = stream_run(
+            reader,
+            &self.engine,
+            &self.cfg.processing,
+            &self.metrics,
+            self.store(&self.dst),
+            self.dst.bucket(),
+            dst_key,
+        )
+        .await?;
+
+        match outcome {
+            Outcome::Written(None) => Ok(ObjectOutcome::Written(self.dst.display(dst_key))),
+            // `stream_run` aborted the upload: nothing landed at `dst_key`.
+            Outcome::NothingKept => Ok(ObjectOutcome::NothingKept),
+            Outcome::Unrecognized => {
+                // The upload is already aborted, and the policy needs the
+                // whole object — re-fetch it, exactly as
+                // `Pipeline::process_stream` does.
+                let bytes = self
+                    .store(&self.src)
+                    .get(self.src.bucket(), src_key)
+                    .await?;
+                self.unrecognized(src_key, dst_key, bytes).await
+            }
+            Outcome::Written(Some(_)) => {
+                unreachable!("stream_run never returns Written(Some(_))")
+            }
+        }
+    }
+
+    /// `behavior.on_unrecognized_object` for an object that parsed as JSON
+    /// but carried no `Records` array. The default is `copy` — forward
+    /// verbatim, never discard.
+    async fn unrecognized(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+        bytes: Bytes,
+    ) -> anyhow::Result<ObjectOutcome> {
+        match self.cfg.on_unrecognized {
+            OnUnrecognizedObject::Copy => {
+                Ok(ObjectOutcome::Copied(self.put(dst_key, bytes).await?))
+            }
+            OnUnrecognizedObject::Skip => Ok(ObjectOutcome::Skipped),
+            OnUnrecognizedObject::Error => anyhow::bail!(
+                "{src_key}: no Records array, and behavior.on_unrecognized_object is \"error\""
+            ),
+        }
+    }
+
+    async fn put(&self, dst_key: &str, bytes: Bytes) -> anyhow::Result<String> {
+        self.store(&self.dst)
+            .put(self.dst.bucket(), dst_key, bytes, GZIP_META)
+            .await?;
+        Ok(self.dst.display(dst_key))
+    }
+}
+
+async fn cmd_filter(
+    source: &str,
+    dest: &str,
+    rules_uri: &str,
+    settings_path: Option<&Path>,
+) -> anyhow::Result<()> {
     let (engine, _rule_set) = load_engine(rules_uri).await?;
-    let cfg = Processing::default();
-    let metrics = Metrics::default();
+    let cfg = FilterConfig::resolve(settings_path)?;
 
     let src = Location::parse(source)?;
     let dst = Location::parse(dest)?;
     let s3 = build_s3_if_needed(&src, &dst).await;
 
-    // Single local file → filter exactly that object to `dest`.
-    if let Location::Local(p) = &src {
-        if p.is_file() {
-            let input = std::fs::read(p).with_context(|| format!("failed to read {p:?}"))?;
-            match buffer_run(&input, &engine, &cfg, &metrics)? {
-                Outcome::Written(Some(bytes)) => {
-                    let at = write_single(&dst, bytes.as_ref(), &s3).await?;
-                    println!("wrote {} bytes to {at}", bytes.len());
-                }
-                Outcome::Written(None) => {
-                    unreachable!("buffer_run returns Written(Some(_)) when it writes")
-                }
-                Outcome::NothingKept => println!("all records dropped; no output written"),
-                Outcome::Unrecognized => {
-                    // No `Records` array: default `on_unrecognized_object` is
-                    // `copy` — forward verbatim, never discard.
-                    let at = write_single(&dst, &input, &s3).await?;
-                    println!(
-                        "object shape not recognized (no Records array); copied verbatim to {at}"
-                    );
-                }
-            }
-            return Ok(());
-        }
-        if !p.exists() {
-            anyhow::bail!("source path {p:?} does not exist");
-        }
-    }
+    // Single local file → filter exactly that object to `dest`. The key
+    // filter deliberately does not apply: the operator named this file.
+    let single = match &src {
+        Location::Local(p) if p.is_file() => Some(p.clone()),
+        Location::Local(p) if !p.exists() => anyhow::bail!("source path {p:?} does not exist"),
+        _ => None,
+    };
 
-    // Batch: a local directory or an s3:// prefix.
-    let objects = enumerate(&src, &s3).await?;
+    let objects = match &single {
+        Some(p) => vec![SrcObject {
+            fetch: p.to_string_lossy().into_owned(),
+            rel: String::new(),
+            size: std::fs::metadata(p).ok().map(|m| m.len()),
+        }],
+        None => enumerate(&src, &cfg.keys, &s3).await?,
+    };
     if objects.is_empty() {
-        println!("no .json.gz objects found under {source}");
+        println!("no in-scope objects found under {source}");
         return Ok(());
     }
 
-    let (mut written, mut fully_dropped, mut copied) = (0usize, 0usize, 0usize);
+    let single_dst = match &single {
+        Some(_) => Some(single_dest_key(&dst)?),
+        None => None,
+    };
+
+    let f = Filterer {
+        engine,
+        cfg,
+        metrics: Metrics::default(),
+        src,
+        dst,
+        local: LocalObjectStore,
+        s3,
+    };
+
+    let (mut written, mut fully_dropped, mut copied, mut skipped) =
+        (0usize, 0usize, 0usize, 0usize);
+    // A failing object must not abandon the objects after it: the run
+    // continues, and every failure is reported together at the end with a
+    // non-zero exit. Aborting on the first error left an operator with a
+    // half-finished backfill and no summary saying how far it got.
+    let mut failures: Vec<(String, String)> = Vec::new();
+
     for obj in &objects {
-        let input = read_source(&src, &obj.fetch, &s3).await?;
-        match buffer_run(&input, &engine, &cfg, &metrics)? {
-            Outcome::Written(Some(bytes)) => {
-                let at = write_dest(&dst, &obj.rel, bytes.as_ref(), &s3).await?;
+        let dst_key = match &single_dst {
+            Some(key) => key.clone(),
+            None => batch_dest_key(&f.dst, &obj.rel),
+        };
+        // The single-file path has no relative key; name the object by what
+        // was fetched instead.
+        let label = if single_dst.is_some() {
+            obj.fetch.as_str()
+        } else {
+            obj.rel.as_str()
+        };
+
+        match f.process(&obj.fetch, &dst_key, obj.size).await {
+            Ok(ObjectOutcome::Written(at)) => {
                 written += 1;
-                println!("  {} -> {at}", obj.rel);
+                println!("  {label} -> {at}");
             }
-            Outcome::Written(None) => {
-                unreachable!("buffer_run returns Written(Some(_)) when it writes")
-            }
-            Outcome::NothingKept => {
+            Ok(ObjectOutcome::NothingKept) => {
                 fully_dropped += 1;
-                println!("  {} -> (all records dropped, nothing written)", obj.rel);
+                println!("  {label} -> (all records dropped, nothing written)");
             }
-            Outcome::Unrecognized => {
-                let at = write_dest(&dst, &obj.rel, &input, &s3).await?;
+            Ok(ObjectOutcome::Copied(at)) => {
                 copied += 1;
-                println!(
-                    "  {} -> {at} (unrecognized shape, copied verbatim)",
-                    obj.rel
-                );
+                println!("  {label} -> {at} (unrecognized shape, copied verbatim)");
+            }
+            Ok(ObjectOutcome::Skipped) => {
+                skipped += 1;
+                println!("  {label} -> (unrecognized shape, skipped)");
+            }
+            Ok(ObjectOutcome::DryRun) => {
+                println!("  {label} -> (dry run, nothing written)");
+            }
+            Err(e) => {
+                eprintln!("  {label} -> FAILED: {e:#}");
+                failures.push((label.to_string(), format!("{e:#}")));
             }
         }
     }
 
-    let snap = metrics.snapshot_and_reset();
-    println!(
-        "processed {} object(s): {written} written, {fully_dropped} fully dropped, {copied} copied verbatim",
-        objects.len()
-    );
+    let snap = f.metrics.snapshot_and_reset();
+    if f.cfg.dry_run {
+        println!(
+            "dry run: {} object(s) evaluated, nothing written",
+            objects.len()
+        );
+    } else {
+        println!(
+            "processed {} object(s): {written} written, {fully_dropped} fully dropped, \
+             {copied} copied verbatim, {skipped} skipped, {} failed",
+            objects.len(),
+            failures.len()
+        );
+    }
     println!(
         "records: {} in, {} kept, {} dropped",
         snap.records_in, snap.records_kept, snap.records_dropped
     );
+
+    if !failures.is_empty() {
+        eprintln!("{} object(s) failed:", failures.len());
+        for (label, err) in &failures {
+            eprintln!("  {label}: {err}");
+        }
+        anyhow::bail!("{} of {} object(s) failed", failures.len(), objects.len());
+    }
     Ok(())
 }
 
@@ -598,7 +966,8 @@ async fn main() -> anyhow::Result<()> {
             source,
             dest,
             rules,
-        } => cmd_filter(&source, &dest, &rules).await,
+            settings,
+        } => cmd_filter(&source, &dest, &rules, settings.as_deref()).await,
         Command::ValidateSettings { path } => cmd_validate_settings(path.as_deref()),
     };
 

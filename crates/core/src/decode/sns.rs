@@ -1,7 +1,7 @@
 //! Decodes SNS notifications wrapping an S3 event notification message
 //! (feature `decode-sns`).
 
-use crate::decode::s3::parse_s3_notification;
+use crate::decode::s3::{as_source_item, parse_s3_notification};
 use crate::error::DecodeError;
 use crate::model::SourceItem;
 use crate::ports::EventDecoder;
@@ -49,7 +49,8 @@ impl EventDecoder for SnsEventDecoder {
 
         let mut items = Vec::new();
         for record in notification.records {
-            items.extend(parse_s3_notification(record.sns.message.as_bytes())?);
+            let objects = parse_s3_notification(record.sns.message.as_bytes())?;
+            items.extend(as_source_item(objects));
         }
         Ok(items)
     }
@@ -75,6 +76,38 @@ mod tests {
         );
         assert_eq!(items[0].objects[0].key, "b21b84d653bb07b05b1e6b33684dc11b");
         assert_eq!(items[0].objects[0].size, Some(1305107));
+    }
+
+    /// SNS fan-out can deliver several notifications in one event, and a
+    /// single notification can name several objects. Both dimensions must
+    /// survive: one item per SNS record, every object within each.
+    #[test]
+    fn every_sns_record_becomes_its_own_item_with_all_its_objects() {
+        let notification = |keys: &[&str]| {
+            let records: Vec<_> = keys
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "s3": {"bucket": {"name": "bkt"}, "object": {"key": k, "size": 1}}
+                    })
+                })
+                .collect();
+            serde_json::json!({ "Records": records }).to_string()
+        };
+        let event = serde_json::json!({
+            "Records": [
+                { "Sns": { "Message": notification(&["first.json.gz"]) } },
+                { "Sns": { "Message": notification(&["second.json.gz", "third.json.gz"]) } },
+            ]
+        })
+        .to_string();
+
+        let items = SnsEventDecoder::new().decode(event.as_bytes()).unwrap();
+
+        assert_eq!(items.len(), 2, "each SNS record is its own item");
+        assert_eq!(items[0].objects[0].key, "first.json.gz");
+        let second: Vec<&str> = items[1].objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(second, ["second.json.gz", "third.json.gz"]);
     }
 
     #[test]

@@ -74,21 +74,37 @@ impl EventDecoder for SqsEventDecoder {
 
 /// Unwraps `body_format` and hands the resulting S3-notification bytes to
 /// [`parse_s3_notification`]. `auto` sniffs the body's `Type` field for a
-/// bare SNS `Notification` envelope; `s3`/`sns` skip the sniff entirely.
+/// bare SNS `Notification` envelope; `s3`/`sns` skip the sniff for *routing*
+/// — `s3` still sniffs to *reject*, see below.
 fn decode_body(body: &str, format: SqsBodyFormat) -> Result<Vec<ObjectRef>, DecodeError> {
     let s3_payload: Cow<[u8]> = match format {
+        // `s3` on an SNS-wrapped body is a misconfiguration
+        // (`sqs.body_format: s3` on a queue actually fed through an SNS
+        // topic), and it used to be a *silent* one: the bare SNS envelope has
+        // no `Records` array, so `parse_s3_notification` returned zero objects
+        // and the message was acked with the object it named never fetched —
+        // data loss on every message in the queue, with no error and no
+        // metric. Fail the message instead: it stays on the queue / lands in
+        // the DLQ, and the operator sees the setting to fix. Not silently
+        // unwrapped, because then `s3` and `auto` would be the same thing and
+        // an explicit format would mean nothing.
+        SqsBodyFormat::S3 if looks_like_sns_notification(body) => {
+            return Err(DecodeError::InvalidPayload(
+                "sqs.body_format is `s3` but this message body is an SNS Notification envelope; \
+                 set sqs.body_format to `sns` (or `auto`)"
+                    .to_string(),
+            ));
+        }
         SqsBodyFormat::S3 => Cow::Borrowed(body.as_bytes()),
         SqsBodyFormat::Sns => Cow::Owned(unwrap_sns(body)?),
         SqsBodyFormat::Auto if looks_like_sns_notification(body) => Cow::Owned(unwrap_sns(body)?),
         SqsBodyFormat::Auto => Cow::Borrowed(body.as_bytes()),
     };
 
-    let items = parse_s3_notification(&s3_payload)?;
-    Ok(items
-        .into_iter()
-        .next()
-        .map(|i| i.objects)
-        .unwrap_or_default())
+    // Every object in the notification, not just the first: one SQS message
+    // carries one notification, and the whole message is acked as a unit, so
+    // any object dropped here is acked without ever being processed.
+    parse_s3_notification(&s3_payload)
 }
 
 fn looks_like_sns_notification(body: &str) -> bool {
@@ -179,17 +195,41 @@ mod tests {
         );
     }
 
+    /// `s3` on an SNS-wrapped body must fail the message, not ack it empty.
+    /// It is neither unwrapped (that would make an explicit `s3` mean the same
+    /// as `auto`) nor decoded to zero objects (that acked a message whose
+    /// object was never fetched — silent loss on every message in the queue).
     #[test]
-    fn sns_body_is_not_unwrapped_when_format_is_s3() {
-        // Forcing `s3` on an SNS-wrapped body hands it straight to the S3
-        // parser, which finds no `Records` array in the bare SNS envelope
-        // shape — same as any unrecognized-shape JSON, so this decodes to
-        // zero objects for the message rather than unwrapping the SNS
-        // envelope or erroring.
+    fn sns_body_with_s3_format_is_an_undecodable_message_not_an_empty_ack() {
         let decoder = SqsEventDecoder::new(SqsBodyFormat::S3);
         let items = decoder.decode(SQS_SNS_EVENT).unwrap();
+
+        assert_eq!(items.len(), 1, "the message must survive as an item");
+        assert_eq!(
+            items[0].ack_id,
+            Some("2e1424d4-f796-459a-8184-9c92662be6da".to_string()),
+            "it must carry its ack_id so the pipeline can fail *this* message"
+        );
+        assert!(items[0].objects.is_empty());
+        let error = items[0]
+            .decode_error
+            .as_deref()
+            .expect("must be marked undecodable, not acked clean");
+        assert!(
+            error.contains("body_format"),
+            "the error must name the setting to fix, got: {error}"
+        );
+    }
+
+    /// The mirror case, which was already correct: `sns` on a raw S3 body has
+    /// no `Message` field to unwrap, so it fails rather than acking empty.
+    #[test]
+    fn s3_body_with_sns_format_is_an_undecodable_message() {
+        let decoder = SqsEventDecoder::new(SqsBodyFormat::Sns);
+        let items = decoder.decode(SQS_S3_EVENT).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].objects.is_empty());
+        assert!(items[0].decode_error.is_some());
     }
 
     #[test]
@@ -221,6 +261,32 @@ mod tests {
         assert_eq!(items[2].objects[0].key, "second-sibling-object.json.gz");
         assert_eq!(items[2].objects[0].bucket, "ct-siem-sync");
         assert!(items[2].decode_error.is_none());
+    }
+
+    /// One message body can name several objects. The message is acked as a
+    /// unit, so every object in it must reach the pipeline — truncating to the
+    /// first (which `decode_body` used to do at the item level) acks the
+    /// message with the rest never fetched.
+    #[test]
+    fn every_object_in_one_message_body_survives_decoding() {
+        let body = r#"{"Records":[
+          {"s3":{"bucket":{"name":"bkt"},"object":{"key":"a.json.gz","size":1}}},
+          {"s3":{"bucket":{"name":"bkt"},"object":{"key":"b.json.gz","size":2}}},
+          {"s3":{"bucket":{"name":"bkt"},"object":{"key":"c.json.gz","size":3}}}
+        ]}"#;
+        let event = serde_json::json!({
+            "Records": [{ "messageId": "m-1", "body": body }]
+        })
+        .to_string();
+
+        let items = SqsEventDecoder::new(SqsBodyFormat::S3)
+            .decode(event.as_bytes())
+            .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].ack_id, Some("m-1".to_string()));
+        let keys: Vec<&str> = items[0].objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a.json.gz", "b.json.gz", "c.json.gz"]);
     }
 
     #[test]

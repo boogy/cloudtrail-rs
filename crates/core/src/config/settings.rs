@@ -7,7 +7,7 @@
 //! the override step is a pure function of an injected `env` lookup:
 //! `Settings::load()` is the only place that closes over `std::env::var`.
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 
 use crate::config::rules::REGEX_SIZE_LIMIT;
 use crate::error::ConfigError;
@@ -227,6 +227,47 @@ impl Default for Source {
             exclude_key_regex: default_exclude_key_regex(),
         }
     }
+}
+
+/// The compiled [`Source`] pair, and the single definition of "is this key
+/// in scope" in the workspace.
+///
+/// One type rather than three call sites compiling their own regexes,
+/// because the three consumers must agree exactly on which objects exist:
+/// `Settings::validate` (pre-deploy), `Pipeline` (production), and the CLI's
+/// `filter` batch enumeration (backfill). A backfill that selected a
+/// different object set than production would either skip objects the
+/// operator believes were re-filtered, or write objects production never
+/// touches — both invisible until someone audits the destination bucket.
+#[derive(Debug, Clone)]
+pub struct KeyFilter {
+    include: Regex,
+    exclude: Regex,
+}
+
+impl KeyFilter {
+    /// Compiles both patterns under [`REGEX_SIZE_LIMIT`] — the same limit
+    /// the rules document uses, so a pattern accepted here cannot be
+    /// rejected there.
+    pub fn compile(source: &Source) -> Result<Self, ConfigError> {
+        Ok(Self {
+            include: compile_key_regex(&source.include_key_regex, "source.include_key_regex")?,
+            exclude: compile_key_regex(&source.exclude_key_regex, "source.exclude_key_regex")?,
+        })
+    }
+
+    /// Include wins nothing on its own: a key is in scope only when it
+    /// matches `include_key_regex` *and* does not match `exclude_key_regex`.
+    pub fn allows(&self, key: &str) -> bool {
+        self.include.is_match(key) && !self.exclude.is_match(key)
+    }
+}
+
+fn compile_key_regex(pattern: &str, field: &str) -> Result<Regex, ConfigError> {
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| ConfigError::Parse(format!("{field} {pattern:?} is not a valid regex: {e}")))
 }
 
 /// Where survivors are written. `bucket` is the one field with no usable
@@ -486,27 +527,11 @@ impl Document {
         // Fix B (F4): compile both key regexes here, at load time. Left
         // uncompiled, an invalid pattern panics inside `Pipeline::new` —
         // a cold-start crash loop unreachable from pre-deploy validation.
-        // Discarded once built: this is validation only, `Pipeline::new`
-        // compiles its own copy. Same size limit as the rules path so a
-        // pattern that passes here is guaranteed to also compile there.
-        RegexBuilder::new(&self.source.include_key_regex)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .build()
-            .map_err(|e| {
-                ConfigError::Parse(format!(
-                    "source.include_key_regex {:?} is not a valid regex: {e}",
-                    self.source.include_key_regex
-                ))
-            })?;
-        RegexBuilder::new(&self.source.exclude_key_regex)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .build()
-            .map_err(|e| {
-                ConfigError::Parse(format!(
-                    "source.exclude_key_regex {:?} is not a valid regex: {e}",
-                    self.source.exclude_key_regex
-                ))
-            })?;
+        // Discarded once built: this is validation only. It is the same
+        // `KeyFilter` — same patterns, same size limit — that `Pipeline::new`
+        // and the CLI's `filter` build for real, so a pattern accepted here
+        // is guaranteed to compile in both.
+        KeyFilter::compile(&self.source)?;
 
         // Fix A (F3): flate2's rust_backend panics on a gzip level above 9
         // (`gzip_level` is `u32`, so a negative value is already impossible).
@@ -521,12 +546,12 @@ impl Document {
 
         // Fix C (F5): stream_threshold_bytes is a COMPRESSED-size estimate
         // that routes an object to buffer vs. stream mode; max_object_bytes
-        // is buffer mode's DECOMPRESSED-size cap. If max_object_bytes is
-        // smaller, every object routed to buffer mode is guaranteed to blow
-        // the cap.
+        // is buffer mode's memory cap, applied to both the compressed fetch
+        // and the decompressed body. If max_object_bytes is smaller, every
+        // object routed to buffer mode is guaranteed to blow the cap.
         if self.processing.max_object_bytes < self.processing.stream_threshold_bytes {
             return Err(ConfigError::Parse(format!(
-                "processing.max_object_bytes ({} bytes, buffer mode's decompressed-size cap) is \
+                "processing.max_object_bytes ({} bytes, buffer mode's memory cap) is \
                  smaller than processing.stream_threshold_bytes ({} bytes, the compressed-size \
                  estimate that selects buffer vs. stream mode): any object routed to buffer mode \
                  is guaranteed to exceed max_object_bytes",
