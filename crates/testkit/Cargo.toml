@@ -12,7 +12,11 @@ publish.workspace = true
 # across crate boundaries without publishing it.
 
 [dependencies]
-cloudtrail-rs-core = { path = "../core" }
+# `testing` for the CloudTrail corpus re-exported as `testkit::corpus`. The
+# corpus lives in `core` because core's own integration tests need it and core
+# must not dev-depend on this crate — that would pull the AWS SDK into the
+# dependency graph of the one crate whose defining property is not having it.
+cloudtrail-rs-core = { path = "../core", features = ["testing"] }
 aws-config = { version = "1", default-features = false }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-sdk-ssm = { version = "1", default-features = false, features = ["rt-tokio"] }
