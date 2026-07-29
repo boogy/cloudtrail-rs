@@ -27,7 +27,7 @@ Adapters live in `crates/aws`. If you reach for an AWS type here, it belongs in
 | `config/`     | `Settings`, `CT_*` env overlay, `ConfigUri`, `RuleSet`, `FileConfigSource`.         |
 | `model.rs`    | CloudTrail record/envelope types.                                                   |
 | `metrics.rs`  | `Metrics`, `EmfMetricsSink`, `NoopMetricsSink`.                                     |
-| `testing.rs`  | In-crate test helpers (`testing` feature).                                          |
+| `testing/`    | Port doubles + `corpus` (realistic CloudTrail records), `testing` feature.          |
 
 ## Invariants
 
@@ -41,8 +41,16 @@ Adapters live in `crates/aws`. If you reach for an AWS type here, it belongs in
 - **Buffer/stream parity.** The mode is chosen by object **size**, so the two
   must agree on survivors, output bytes, failure classification and every
   counter — otherwise an object changes meaning at `stream_threshold_bytes`.
-  Enforced by `tests/mode_parity.rs`; a change to either module belongs there
-  as a new case.
+  Enforced by one oracle in `tests/common/mod.rs`, driven from two files:
+  `tests/mode_parity.rs` (minimal envelopes, one structural property each) and
+  `tests/corpus_parity.rs` (realistic records from `testing::corpus`). A change
+  to either mode belongs in the first; a change to record _interpretation_
+  (dot-path resolution, indexing, verbatim survival) belongs in the second.
+- **Survivors are copied, never re-serialized.** A kept record is emitted as
+  its original bytes (`RawValue::get()`). `testing::corpus` deliberately holds
+  records serde would re-render differently (escapes, `1.0`, `1.5e-7`,
+  `9007199254740993`); do not "tidy" them — that is what makes the claim
+  falsifiable.
 - **Nothing is published or committed before the object's fate is decided.**
   Record counters are committed as one unit only after the object succeeds (a
   failed object is re-driven and re-evaluated whole); `BytesOut` is counted

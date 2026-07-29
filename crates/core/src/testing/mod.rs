@@ -2,6 +2,11 @@
 //! feature so they never ship in a Lambda binary. `StaticConfigSource` and
 //! `RecordingSink` arrived with task-12; `InMemoryStore` arrives here
 //! (task-13), needed to assert what `stream_run` leaves at a destination key.
+//!
+//! [`corpus`] holds the realistic CloudTrail *data* these doubles are fed:
+//! records with the shape and byte-level irregularity of production logs.
+
+pub mod corpus;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
