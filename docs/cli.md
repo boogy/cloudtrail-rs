@@ -113,23 +113,29 @@ every record is dropped are **not written** ("zero empty writes") — neither
 locally nor to S3. Any S3-side `source`/`dest` needs AWS credentials resolved the
 normal SDK way (env, profile, instance role, …).
 
+`filter` **refuses to write an object over its own source** (`filter ./logs
+./logs`, or an S3 source and destination that resolve to the same key) — the
+CLI's equivalent of the pipeline's self-trigger guard. Filtering in place
+destroys the original, and there is no undo for it. `behavior.dry_run` writes
+nothing, so it is exempt.
+
 ### `--settings`: filter the way the deployment filters
 
 Pass the deployment's settings document and a backfill selects and processes
 exactly the objects production would. Without it, built-in defaults apply.
 Honoured:
 
-| Setting                             | Effect on `filter`                                                                                                                                                                                              |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source.include_key_regex`          | Which objects are **in scope**: batch mode enumerates by these two patterns, not by a hardcoded `.json.gz` rule. A named single file is always processed — you asked for that one object.                       |
-| `source.exclude_key_regex`          | See above; a key is in scope when it matches `include` and not `exclude`.                                                                                                                                       |
-| `processing.mode`                   | `auto` \| `buffer` \| `stream`, per object, by the same rule the pipeline uses.                                                                                                                                 |
-| `processing.stream_threshold_bytes` | Compressed size above which `auto` streams. Local files carry their size; S3 objects do not, so they start in buffer mode.                                                                                      |
+| Setting                             | Effect on `filter`                                                                                                                                                                                                                                 |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.include_key_regex`          | Which objects are **in scope**: batch mode enumerates by these two patterns, not by a hardcoded `.json.gz` rule. A named single file is always processed — you asked for that one object.                                                          |
+| `source.exclude_key_regex`          | See above; a key is in scope when it matches `include` and not `exclude`.                                                                                                                                                                          |
+| `processing.mode`                   | `auto` \| `buffer` \| `stream`, per object, by the same rule the pipeline uses.                                                                                                                                                                    |
+| `processing.stream_threshold_bytes` | Compressed size above which `auto` streams. Local files carry their size; S3 objects do not, so they start in buffer mode.                                                                                                                         |
 | `processing.max_object_bytes`       | Buffer mode's memory cap (compressed fetch and decompressed body). In `auto`, an object over it is **retried through stream mode** — the same retry the Lambda performs — so nothing the Lambda handles fails a backfill. `mode: buffer` opts out. |
-| `processing.gzip_level`             | Output compression level.                                                                                                                                                                                       |
-| `processing.multipart_part_bytes`   | Part size for a streamed S3 write.                                                                                                                                                                              |
-| `behavior.dry_run`                  | Evaluate and count every record, write nothing.                                                                                                                                                                 |
-| `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                    |
+| `processing.gzip_level`             | Output compression level.                                                                                                                                                                                                                          |
+| `processing.multipart_part_bytes`   | Part size for a streamed S3 write.                                                                                                                                                                                                                 |
+| `behavior.dry_run`                  | Evaluate and count every record, write nothing. Selects the destination, not the mode: an object that would stream is still previewed through stream mode (into a discard destination), so the preview's verdict is the real run's verdict.        |
+| `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                                                       |
 
 Ignored, because the command line already says it or there is no Lambda around
 it: `destination.*` (`dest` is the destination), `rules.*` (`--rules` is),

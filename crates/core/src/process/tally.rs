@@ -13,7 +13,7 @@
 //! until [`RecordTally::commit`], which the caller invokes only on the far
 //! side of the write. That keeps the counters describing objects that were
 //! actually accounted for, which is what makes `RecordsIn == RecordsKept +
-//! RecordsDropped` and `sum(RuleDrops) <= RecordsDropped` hold — the two
+//! RecordsDropped` and `sum(RuleDrops) == RecordsDropped` hold — the two
 //! identities `docs/metrics.md` tells an operator to alarm on.
 //!
 //! One type shared by both modes rather than one per mode: the buffer/stream

@@ -13,7 +13,10 @@ Rounds two and three of the data-loss audit: the remaining findings from the
 same review — including two more silent-loss paths and the CLI's divergence
 from production — followed by a critical re-verification pass focused on
 observability, on the principle that a silent failure is only silent because no
-metric names it.
+metric names it. Round four then swept the result for contradictions, data loss
+and metric correctness: most of what it found was in the CLI — the parts of it
+that had drifted from the `Pipeline` they are supposed to mirror — plus four
+places where the documentation and the code disagreed about what the code does.
 
 ### Changed
 
@@ -36,6 +39,18 @@ metric names it.
   silent loss, no error, no metric. Such messages are now redelivered and land
   in the DLQ, with an error naming the setting to change (to `sns` or `auto`).
   A correctly configured queue is unaffected.
+- **`dry_run` selects the destination, not the mode.** Both the pipeline and the
+  CLI short-circuited to a buffer-mode evaluation before consulting
+  `select_mode`, so an object large enough to stream in a real run was previewed
+  through buffer mode instead, and an object over `max_object_bytes` failed the
+  preview outright — the `mode: auto` retry through stream mode never ran,
+  because the retry lives on the path the short-circuit skipped. A preview that
+  fails an object the real run would have processed is worse than no preview: it
+  argues against a ruleset that works. Dry run now picks the same mode the real
+  run would pick and executes the real `stream_run` against a new
+  `DiscardStore` — a destination that drains the reader to EOF and propagates
+  its errors — so the preview's verdict, counters and failure classification are
+  the real run's.
 
 ### Fixed
 
@@ -138,6 +153,49 @@ metric names it.
   `ObjectTooLarge` that `mode: auto` already recovers by retrying through
   stream mode. Capping the compressed read rejects nothing that would have
   survived: gzip output is never meaningfully larger than its input.
+- **The CLI had the same two uncapped/eager-fetch bugs, in its own copy of those
+  paths.** Its buffer fetch was uncapped although its own comment and
+  [`docs/cli.md`](docs/cli.md) both claimed `max_object_bytes` bounded the
+  compressed read, so a backfill pointed at an unexpectedly large object could
+  exhaust memory on a workstation; and its stream-mode unrecognized branch
+  re-fetched the whole object before asking `on_unrecognized_object` what to do
+  with it, so `skip` and `error` paid for a full read they never look at. The
+  fetch now stops one byte past the cap and raises the same `ObjectTooLarge`
+  that `mode: auto` recovers through stream mode, the policy is consulted before
+  any I/O, and `copy` streams source to destination.
+- **The CLI would filter an object over its own source.** With source and
+  destination resolving to the same S3 key or the same local path, `filter`
+  wrote the filtered object onto its own original — an unrecoverable destructive
+  write, and the one thing the pipeline's self-trigger guard exists to prevent.
+  Both sides are now compared (S3 by bucket and key, local by canonicalized
+  path) and the run is refused before anything is written; `dry_run` writes
+  nothing, so it is exempt.
+- **The CLI's dry-run summary never reported unrecognized objects either.** It
+  discarded the `Outcome` exactly as `Pipeline::process_dry_run` did. The
+  summary now names them, from the metrics snapshot rather than a second,
+  re-derived count.
+- **`BytesIn` was billed twice for an over-cap object in a dry run.** Once the
+  preview gained the `auto` retry, an `ObjectTooLarge` from the buffer attempt
+  was billed by `process_dry_run` and again by the stream preview that reads the
+  object itself. Dry run now applies the same one-object-one-`BytesIn` rule
+  `process_buffer` does.
+- **`docs/metrics.md` named the metrics-mode environment variable
+  `CT_METRICS_MODE`.** It is `CT_METRICS`; the documented name silently did
+  nothing.
+- **`docs/metrics.md` and `RecordTally` documented
+  `sum(RuleDrops) <= RecordsDropped`.** The relation is `==` — a dropped record
+  always names the rule that dropped it — and the weaker claim would have
+  admitted exactly the accounting bug the invariant exists to catch.
+- **`pipeline.rs` described `max_object_bytes` as a _decompressed_-size cap**, in
+  a comment left over from before the fetch itself was capped.
+
+### Removed
+
+- `Metrics::record_rule_drop`, which had no production callers. Every rule drop
+  reaches the counters through `RecordTally`, which commits per-rule and
+  aggregate drops as one unit after the object's write is confirmed; a second,
+  uncommitted path to the same counter could only ever break the
+  `sum(RuleDrops) == RecordsDropped` identity.
 
 ### Added
 
@@ -163,6 +221,12 @@ metric names it.
   function timeout — and the S3-direct topology's residual risk (an async
   invocation that keeps timing out is discarded without an on-failure
   destination).
+- `docs/metrics.md` documents that the two modes bill `BytesIn` differently on a
+  **failed** object, deliberately: buffer mode has the whole compressed object in
+  hand before it filters anything and bills the full length, while stream mode
+  bills only what it had read when it aborted. A successful object bills the same
+  either way. Alarms on `BytesIn` should expect it to dip when a large object
+  fails in stream mode.
 
 ## [0.2.0] - 2026-07-28
 

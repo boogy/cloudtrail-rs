@@ -45,7 +45,7 @@ use cloudtrail_rs_core::filter::{Decision, Engine};
 use cloudtrail_rs_core::metrics::Metrics;
 use cloudtrail_rs_core::model::PutMeta;
 use cloudtrail_rs_core::ports::{ConfigSource, ObjectStore};
-use cloudtrail_rs_core::process::{Outcome, buffer_run, stream_run};
+use cloudtrail_rs_core::process::{DiscardStore, Outcome, RecordTally, buffer_run, stream_run};
 use flate2::read::MultiGzDecoder;
 
 /// Object metadata for every gzip object this CLI writes to S3, matching the
@@ -655,36 +655,115 @@ impl Filterer {
         }
     }
 
+    /// Refuses to filter an object over itself.
+    ///
+    /// `Pipeline` has `CoreError::SelfTrigger` for the deployment shape this
+    /// mirrors (destination bucket == source bucket, same key), because
+    /// writing the filtered object back over its input destroys the original
+    /// and — in the Lambda's case — re-triggers itself. The CLI had no such
+    /// guard, so `filter ./logs ./logs` rewrote a directory of CloudTrail
+    /// objects in place, unrecoverably.
+    ///
+    /// Local paths are compared canonically (the destination need not exist
+    /// yet, so its parent is canonicalized and the file name re-joined) —
+    /// `./logs/x.gz` and `logs/x.gz` are the same file, and a string compare
+    /// would have missed it.
+    fn overwrites_source(&self, src_key: &str, dst_key: &str) -> bool {
+        match (&self.src, &self.dst) {
+            (Location::S3 { bucket: sb, .. }, Location::S3 { bucket: db, .. }) => {
+                sb == db && src_key == dst_key
+            }
+            (Location::Local(_), Location::Local(_)) => {
+                let canonical = |p: &Path| -> Option<PathBuf> {
+                    std::fs::canonicalize(p).ok().or_else(|| {
+                        let parent = std::fs::canonicalize(p.parent()?).ok()?;
+                        Some(parent.join(p.file_name()?))
+                    })
+                };
+                match (canonical(Path::new(src_key)), canonical(Path::new(dst_key))) {
+                    (Some(s), Some(d)) => s == d,
+                    _ => false,
+                }
+            }
+            // Different backends: a local path and an S3 key are never the
+            // same object.
+            _ => false,
+        }
+    }
+
+    /// Reads the source object with `processing.max_object_bytes` applied to
+    /// the **fetch**, not merely to the decompressed body.
+    ///
+    /// `ObjectStore::get` is uncapped: it buffers whatever the object is.
+    /// Using it here meant the CLI's own comment ("applied to the fetch and
+    /// the decompressed body alike") and `docs/cli.md` described a cap that
+    /// the code did not apply, and a multi-gigabyte object OOM-killed the
+    /// process before `buffer_run` ever got the chance to reject it. This is
+    /// the read `Pipeline::fetch_with_missing_policy` performs.
+    async fn fetch_capped(&self, src_key: &str) -> Result<Bytes, CoreError> {
+        use tokio::io::AsyncReadExt;
+
+        let limit = self.cfg.processing.max_object_bytes;
+        let bucket = self.src.bucket();
+        let reader = self.store(&self.src).get_stream(bucket, src_key).await?;
+        // `limit + 1` so exceeding the cap is detectable without ever holding
+        // more than one byte past it.
+        let mut buf = Vec::new();
+        reader
+            .take(limit + 1)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| {
+                CoreError::Store(StoreError::Backend(format!("reading {src_key}: {e}")))
+            })?;
+        if buf.len() as u64 > limit {
+            return Err(CoreError::ObjectTooLarge { limit });
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    /// The buffer-mode evaluation, up to but not including the write. Split
+    /// out so the `auto` `ObjectTooLarge` → stream retry can match on one
+    /// `CoreError` covering both the capped fetch and `buffer_run` — the two
+    /// places that cap can be hit.
+    async fn buffer_eval(&self, src_key: &str) -> Result<(Bytes, Outcome, RecordTally), CoreError> {
+        let bytes = self.fetch_capped(src_key).await?;
+        let (outcome, tally) = buffer_run(&bytes, &self.engine, &self.cfg.processing)?;
+        Ok((bytes, outcome, tally))
+    }
+
     async fn process(
         &self,
         src_key: &str,
         dst_key: &str,
         size: Option<u64>,
     ) -> anyhow::Result<ObjectOutcome> {
-        if self.cfg.dry_run {
-            // Mirrors `Pipeline::process_dry_run`: every record is still
-            // evaluated (so the record counts report what *would* be
-            // filtered) through buffer semantics, and the result is
-            // discarded — nothing is written.
-            let bytes = self
-                .store(&self.src)
-                .get(self.src.bucket(), src_key)
-                .await?;
-            let (_outcome, tally) = buffer_run(&bytes, &self.engine, &self.cfg.processing)?;
-            // Nothing is written, so the object's fate is decided as soon as
-            // `buffer_run` returns — commit the record counters here.
-            tally.commit(&self.metrics, &self.engine);
-            return Ok(ObjectOutcome::DryRun);
+        if !self.cfg.dry_run && self.overwrites_source(src_key, dst_key) {
+            anyhow::bail!(
+                "refusing to write {} over its own source: pick a destination that is not \
+                 the source",
+                self.dst.display(dst_key)
+            );
         }
 
+        // `dry_run` selects the *destination*, not the mode. It used to
+        // short-circuit here into buffer-mode evaluation, which made the one
+        // setting meant for a pre-flight check the one setting whose verdict
+        // could differ from the real run's: an object `mode: auto` would have
+        // streamed failed the preview with `ObjectTooLarge`. Both dry run and
+        // the real run now take the same `select_mode` and the same retry.
+        let dry_run = self.cfg.dry_run;
+
         match self.cfg.select_mode(size) {
-            Mode::Stream => self.process_stream(src_key, dst_key).await,
+            Mode::Stream => {
+                if dry_run {
+                    self.process_dry_run_stream(src_key).await
+                } else {
+                    self.process_stream(src_key, dst_key).await
+                }
+            }
             Mode::Buffer => {
-                let bytes = self
-                    .store(&self.src)
-                    .get(self.src.bucket(), src_key)
-                    .await?;
-                let result = buffer_run(&bytes, &self.engine, &self.cfg.processing);
+                let result = self.buffer_eval(src_key).await;
                 match result {
                     // The same retry `Pipeline::process_object` performs:
                     // `stream_threshold_bytes` is a compressed-size estimate,
@@ -701,20 +780,38 @@ impl Filterer {
                             "  note: {src_key} exceeds max_object_bytes ({limit}); \
                              retrying via stream mode"
                         );
-                        self.process_stream(src_key, dst_key).await
+                        if dry_run {
+                            self.process_dry_run_stream(src_key).await
+                        } else {
+                            self.process_stream(src_key, dst_key).await
+                        }
                     }
                     Err(e) => Err(e.into()),
-                    Ok((outcome, tally)) => {
-                        let object_outcome = match outcome {
-                            Outcome::Written(Some(out)) => {
-                                ObjectOutcome::Written(self.put(dst_key, out).await?)
+                    Ok((bytes, outcome, tally)) => {
+                        let object_outcome = if dry_run {
+                            // Nothing is written, so the object's fate is
+                            // decided the moment `buffer_run` returns — but
+                            // the outcome is still classified, so a preview
+                            // reports the unrecognized objects the real run
+                            // would copy or skip.
+                            if matches!(outcome, Outcome::Unrecognized) {
+                                self.metrics.add_unrecognized_objects(1);
                             }
-                            Outcome::NothingKept => ObjectOutcome::NothingKept,
-                            Outcome::Unrecognized => {
-                                self.unrecognized(src_key, dst_key, bytes).await?
-                            }
-                            Outcome::Written(None) => {
-                                unreachable!("buffer_run returns Written(Some(_)) when it writes")
+                            ObjectOutcome::DryRun
+                        } else {
+                            match outcome {
+                                Outcome::Written(Some(out)) => {
+                                    ObjectOutcome::Written(self.put(dst_key, out).await?)
+                                }
+                                Outcome::NothingKept => ObjectOutcome::NothingKept,
+                                Outcome::Unrecognized => {
+                                    self.unrecognized(src_key, dst_key, Some(bytes)).await?
+                                }
+                                Outcome::Written(None) => {
+                                    unreachable!(
+                                        "buffer_run returns Written(Some(_)) when it writes"
+                                    )
+                                }
                             }
                         };
                         // Past the `put`, exactly as `Pipeline::process_buffer`
@@ -726,6 +823,51 @@ impl Filterer {
                 }
             }
         }
+    }
+
+    /// `behavior.dry_run` in stream mode: the real `stream_run`, pointed at a
+    /// [`DiscardStore`], so the preview reaches its verdict by taking the live
+    /// run's path rather than through a second evaluator.
+    ///
+    /// `stream_run` publishes straight to the `Metrics` it is handed, so it is
+    /// handed a scratch one and everything except `BytesOut` is folded back —
+    /// those bytes went nowhere.
+    async fn process_dry_run_stream(&self, src_key: &str) -> anyhow::Result<ObjectOutcome> {
+        let reader = self
+            .store(&self.src)
+            .get_stream(self.src.bucket(), src_key)
+            .await?;
+
+        let scratch = Metrics::default();
+        let outcome = stream_run(
+            reader,
+            &self.engine,
+            &self.cfg.processing,
+            &scratch,
+            &DiscardStore,
+            "",
+            "",
+        )
+        .await;
+
+        // Folded back before `?`: an object that failed mid-stream still read
+        // the bytes it read. The record counters cannot leak from a failure —
+        // `stream_run` commits its tally only past its own upload check, so a
+        // failed object leaves the scratch counters at zero by construction.
+        let snapshot = scratch.snapshot_and_reset();
+        self.metrics.add_bytes_in(snapshot.bytes_in);
+        self.metrics.add_records_in(snapshot.records_in);
+        self.metrics.add_records_kept(snapshot.records_kept);
+        self.metrics.add_records_dropped(snapshot.records_dropped);
+        self.metrics.add_parse_errors(snapshot.parse_errors);
+        for (rule, n) in &snapshot.rule_drops {
+            self.metrics.record_rule_drops(rule, *n);
+        }
+
+        if matches!(outcome?, Outcome::Unrecognized) {
+            self.metrics.add_unrecognized_objects(1);
+        }
+        Ok(ObjectOutcome::DryRun)
     }
 
     async fn process_stream(&self, src_key: &str, dst_key: &str) -> anyhow::Result<ObjectOutcome> {
@@ -748,16 +890,13 @@ impl Filterer {
             Outcome::Written(None) => Ok(ObjectOutcome::Written(self.dst.display(dst_key))),
             // `stream_run` aborted the upload: nothing landed at `dst_key`.
             Outcome::NothingKept => Ok(ObjectOutcome::NothingKept),
-            Outcome::Unrecognized => {
-                // The upload is already aborted, and the policy needs the
-                // whole object — re-fetch it, exactly as
-                // `Pipeline::process_stream` does.
-                let bytes = self
-                    .store(&self.src)
-                    .get(self.src.bucket(), src_key)
-                    .await?;
-                self.unrecognized(src_key, dst_key, bytes).await
-            }
+            // The upload is already aborted. Hand the policy no bytes: it
+            // decides *first*, exactly as `Pipeline::process_stream` does, and
+            // only `copy` re-reads the object — as a stream, straight into the
+            // destination. Buffering the whole object up front undid stream
+            // mode's entire reason for existing, on the one path reached by
+            // objects too big to buffer.
+            Outcome::Unrecognized => self.unrecognized(src_key, dst_key, None).await,
             Outcome::Written(Some(_)) => {
                 unreachable!("stream_run never returns Written(Some(_))")
             }
@@ -767,21 +906,47 @@ impl Filterer {
     /// `behavior.on_unrecognized_object` for an object that parsed as JSON
     /// but carried no `Records` array. The default is `copy` — forward
     /// verbatim, never discard.
+    ///
+    /// `bytes` is the already-buffered source object when the caller happens
+    /// to hold it (buffer mode always does); `None` makes the `copy` branch
+    /// stream source → destination instead, so the streaming caller never has
+    /// to materialize the object.
     async fn unrecognized(
         &self,
         src_key: &str,
         dst_key: &str,
-        bytes: Bytes,
+        bytes: Option<Bytes>,
     ) -> anyhow::Result<ObjectOutcome> {
         match self.cfg.on_unrecognized {
             OnUnrecognizedObject::Copy => {
-                Ok(ObjectOutcome::Copied(self.put(dst_key, bytes).await?))
+                self.metrics.add_unrecognized_objects(1);
+                let at = match bytes {
+                    Some(b) => self.put(dst_key, b).await?,
+                    None => self.stream_copy(src_key, dst_key).await?,
+                };
+                Ok(ObjectOutcome::Copied(at))
             }
-            OnUnrecognizedObject::Skip => Ok(ObjectOutcome::Skipped),
+            OnUnrecognizedObject::Skip => {
+                self.metrics.add_unrecognized_objects(1);
+                Ok(ObjectOutcome::Skipped)
+            }
             OnUnrecognizedObject::Error => anyhow::bail!(
                 "{src_key}: no Records array, and behavior.on_unrecognized_object is \"error\""
             ),
         }
+    }
+
+    /// Copies the source object to the destination verbatim without ever
+    /// holding it in memory — `Pipeline::stream_copy`'s counterpart.
+    async fn stream_copy(&self, src_key: &str, dst_key: &str) -> anyhow::Result<String> {
+        let reader = self
+            .store(&self.src)
+            .get_stream(self.src.bucket(), src_key)
+            .await?;
+        self.store(&self.dst)
+            .put_stream(self.dst.bucket(), dst_key, reader, GZIP_META)
+            .await?;
+        Ok(self.dst.display(dst_key))
     }
 
     async fn put(&self, dst_key: &str, bytes: Bytes) -> anyhow::Result<String> {
@@ -891,9 +1056,15 @@ async fn cmd_filter(
 
     let snap = f.metrics.snapshot_and_reset();
     if f.cfg.dry_run {
+        // The unrecognized count is what a preview is *for* on this axis: it
+        // is the number of objects the real run would hand to
+        // `behavior.on_unrecognized_object` — copied verbatim, skipped, or
+        // (under `error`) failed. Reporting only the record counts hid it.
         println!(
-            "dry run: {} object(s) evaluated, nothing written",
-            objects.len()
+            "dry run: {} object(s) evaluated ({} unrecognized, {} failed), nothing written",
+            objects.len(),
+            snap.unrecognized_objects,
+            failures.len()
         );
     } else {
         println!(
