@@ -92,15 +92,46 @@ mod tests {
         content_encoding: "gzip",
     };
 
+    /// Asserting `is_ok()` would pass against a `put_stream` that ignored the
+    /// reader entirely, which is the one thing this type must not do — the
+    /// producer has to run to completion for the preview to mean anything. So
+    /// count what was actually read.
     #[tokio::test]
     async fn put_stream_drains_the_whole_reader() {
-        let body = vec![b'x'; 1 << 16];
-        assert!(
-            DiscardStore
-                .put_stream("b", "k", Box::new(io::Cursor::new(body)), META)
-                .await
-                .is_ok()
-        );
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting {
+            inner: io::Cursor<Vec<u8>>,
+            read: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncRead for Counting {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                let before = buf.filled().len();
+                let me = &mut *self;
+                let poll = std::pin::Pin::new(&mut me.inner).poll_read(cx, buf);
+                me.read
+                    .fetch_add(buf.filled().len() - before, Ordering::Relaxed);
+                poll
+            }
+        }
+
+        let len = 1 << 16;
+        let read = Arc::new(AtomicUsize::new(0));
+        let body = Counting {
+            inner: io::Cursor::new(vec![b'x'; len]),
+            read: Arc::clone(&read),
+        };
+
+        DiscardStore
+            .put_stream("b", "k", Box::new(body), META)
+            .await
+            .expect("draining a readable body must succeed");
+        assert_eq!(read.load(Ordering::Relaxed), len, "reader not drained");
     }
 
     /// The property that makes this a stand-in for a real destination rather
