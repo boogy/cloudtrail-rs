@@ -8,7 +8,7 @@ that hold between them, and what to alarm on.
 
 `Pipeline::handle` calls `Metrics::snapshot_and_reset()` and hands the result to
 the `MetricsSink` **before returning — success or failure**. Two sinks exist,
-selected by `observability.metrics` (`CT_METRICS_MODE`):
+selected by `observability.metrics` (`CT_METRICS`):
 
 | Mode   | Sink              | Behaviour                                    |
 | ------ | ----------------- | -------------------------------------------- |
@@ -106,6 +106,18 @@ that read an object twice:
 Without that rule the same object reports double the `BytesIn` on one side of
 `stream_threshold_bytes` and single on the other, for reasons unrelated to what
 was written.
+
+**On a _failed_ object the two modes bill `BytesIn` differently**, and
+deliberately: buffer mode has the whole compressed object in hand before it
+filters anything, so it bills the full length; stream mode bills only what it
+had read when it aborted. Both report what was actually ingested — a stream that
+died on record 3 of 10,000 genuinely did not read the rest. A successful object
+bills the same `BytesIn` either way; only a failure diverges. (The buffer/stream
+parity oracle in `crates/core/tests/common/mod.rs` compares every counter
+**except** `bytes_in` for a related reason: the counter is not published at the
+same layer in the two modes — stream mode counts it as it reads, buffer mode
+leaves it to `pipeline.rs`, which holds the buffer.) If you alarm on `BytesIn`,
+expect it to dip when a large object fails in stream mode.
 
 The two byte-for-byte copy paths — the `on_config_error: open` passthrough and
 an `on_unrecognized_object: copy` in stream mode — stream source to destination

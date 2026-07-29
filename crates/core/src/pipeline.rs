@@ -19,7 +19,7 @@ use crate::filter::Engine;
 use crate::metrics::Metrics;
 use crate::model::{ObjectRef, PutMeta, SourceItem};
 use crate::ports::{EventDecoder, MetricsSink, ObjectStore};
-use crate::process::{Outcome, buffer_run, stream_run};
+use crate::process::{DiscardStore, Outcome, buffer_run, stream_run};
 
 /// Canonical output metadata: every
 /// write this module performs — filtered output, a fail-open raw copy, or an
@@ -484,27 +484,38 @@ impl Pipeline {
         dest_bucket: &str,
         dest_key: &str,
     ) -> Result<(), CoreError> {
-        if self.settings.behavior.dry_run {
-            return self
-                .process_dry_run(engine, object, dest_bucket, dest_key)
-                .await;
-        }
+        // `dry_run` selects the *destination*, not the mode. It used to
+        // short-circuit here, straight into buffer-mode evaluation, which
+        // made the one setting meant for a pre-flight check the one setting
+        // whose verdict could differ from the live run's: buffer mode's
+        // `max_object_bytes` applies to the fetch and the decompressed body,
+        // so an object `mode: auto` would have streamed successfully failed
+        // the preview with `ObjectTooLarge` (and counted `ObjectsFailed`).
+        // Routing dry run through the same `select_mode` and the same retry
+        // below means the preview reaches the live run's verdict by taking
+        // the live run's path.
+        let dry_run = self.settings.behavior.dry_run;
 
         match self.select_mode(object.size) {
             ObjectMode::Buffer => {
-                let result = self
-                    .process_buffer(engine, object, dest_bucket, dest_key)
-                    .await;
+                let result = if dry_run {
+                    self.process_dry_run(engine, object).await
+                } else {
+                    self.process_buffer(engine, object, dest_bucket, dest_key)
+                        .await
+                };
                 match result {
                     // Auto mode picked Buffer off `object.size` vs.
                     // `stream_threshold_bytes` (a *compressed*-size
-                    // estimate); `max_object_bytes` (buffer-mode's
-                    // *decompressed*-size cap) can still be blown by a
-                    // highly compressible object. Without this retry that
-                    // object fails identically on every redelivery — a
-                    // permanent poison pill. Stream mode has no size cap by
-                    // design (bounded-memory), so it always succeeds where
-                    // buffer mode overflowed. Only in Auto: an explicit
+                    // estimate); `max_object_bytes` (buffer mode's memory
+                    // cap, applied to the compressed fetch *and* the
+                    // decompressed body) can still be blown by a highly
+                    // compressible object — or by one that arrived with no
+                    // size at all. Without this retry that object fails
+                    // identically on every redelivery — a permanent poison
+                    // pill. Stream mode has no size cap by design
+                    // (bounded-memory), so it always succeeds where buffer
+                    // mode overflowed. Only in Auto: an explicit
                     // `mode: buffer` config means the operator opted out of
                     // stream mode, so ObjectTooLarge there must still surface.
                     Err(CoreError::ObjectTooLarge { limit })
@@ -514,37 +525,44 @@ impl Pipeline {
                             bucket = %object.bucket,
                             key = %object.key,
                             limit,
+                            dry_run,
                             "buffer mode exceeded max_object_bytes in auto mode; retrying via \
                              stream mode (bounded memory, no size cap)"
                         );
-                        self.process_stream(engine, object, dest_bucket, dest_key)
-                            .await
+                        if dry_run {
+                            self.process_dry_run_stream(engine, object).await
+                        } else {
+                            self.process_stream(engine, object, dest_bucket, dest_key)
+                                .await
+                        }
                     }
                     other => other,
                 }
             }
             ObjectMode::Stream => {
-                self.process_stream(engine, object, dest_bucket, dest_key)
-                    .await
+                if dry_run {
+                    self.process_dry_run_stream(engine, object).await
+                } else {
+                    self.process_stream(engine, object, dest_bucket, dest_key)
+                        .await
+                }
             }
         }
     }
 
-    /// `behavior.dry_run`: a true no-op against the destination. Every record
-    /// is still evaluated through `engine` so `RecordsDropped`/`RuleDrops`
-    /// report exactly what *would* be filtered, but nothing is ever written —
-    /// no `put`, no `BytesOut`. Dry-run's purpose is to preview a ruleset
-    /// against live traffic without touching the destination bucket, so it uses
-    /// buffer semantics (cheap full-object evaluation) and discards the result.
+    /// `behavior.dry_run` in buffer mode: a true no-op against the
+    /// destination. Every record is still evaluated through `engine` so
+    /// `RecordsDropped`/`RuleDrops` report exactly what *would* be filtered,
+    /// but nothing is ever written — no `put`, no `BytesOut`.
     ///
-    /// `dest_bucket`/`dest_key` are unused: they exist only to keep the
-    /// signature uniform with the buffer/stream paths this dispatches from.
+    /// Reached through the same `select_mode` the live path uses, and its
+    /// `ObjectTooLarge` is retried through [`Pipeline::process_dry_run_stream`]
+    /// by the same `auto`-mode rule, so the preview cannot fail an object the
+    /// live run would have handled.
     async fn process_dry_run(
         &self,
         engine: &Arc<Engine>,
         object: &ObjectRef,
-        _dest_bucket: &str,
-        _dest_key: &str,
     ) -> Result<(), CoreError> {
         let Some(bytes) = self
             .fetch_with_missing_policy(&object.bucket, &object.key)
@@ -552,7 +570,17 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        self.metrics.add_bytes_in(bytes.len() as u64);
+        let result = buffer_run(&bytes, engine, &self.settings.processing);
+
+        // The same one-object-one-`BytesIn` rule `process_buffer` applies, for
+        // the same reason: an `ObjectTooLarge` in auto mode is retried through
+        // `process_dry_run_stream`, which counts the bytes it reads itself.
+        // Billing here too would report a preview ingesting the object twice.
+        let retried_via_stream = matches!(result, Err(CoreError::ObjectTooLarge { .. }))
+            && self.settings.processing.mode == ProcessingMode::Auto;
+        if !retried_via_stream {
+            self.metrics.add_bytes_in(bytes.len() as u64);
+        }
 
         // Evaluation only: updates RecordsIn/RecordsKept/RecordsDropped/
         // RuleDrops via `metrics` so the operator sees what would be filtered.
@@ -563,13 +591,75 @@ impl Pipeline {
         // run, so the one setting meant for a pre-flight check was blind to
         // the one outcome an operator most needs to see before enabling
         // `on_unrecognized_object`.
-        let (outcome, tally) = buffer_run(&bytes, engine, &self.settings.processing)?;
+        let (outcome, tally) = result?;
         if matches!(outcome, Outcome::Unrecognized) {
             self.metrics.add_unrecognized_objects(1);
         }
         // Dry run writes nothing, so there is no write to wait on: the
         // object's fate is decided the moment `buffer_run` returns.
         tally.commit(&self.metrics, engine);
+
+        self.metrics.add_objects_processed(1);
+        Ok(())
+    }
+
+    /// `behavior.dry_run` in stream mode: the real `stream_run`, pointed at a
+    /// [`DiscardStore`].
+    ///
+    /// Not a second evaluator — that is the point. A dry run that reimplemented
+    /// streaming evaluation would be a preview of code the live run does not
+    /// execute; this runs the identical producer, encoder and
+    /// `Deserializer::end()` trailer check, and only the destination differs.
+    ///
+    /// `stream_run` publishes straight to the `Metrics` it is handed, so it is
+    /// handed a scratch one and everything except `BytesOut` is folded back:
+    /// bytes were genuinely read, records were genuinely evaluated, but nothing
+    /// reached a destination and `BytesOut` must stay zero.
+    async fn process_dry_run_stream(
+        &self,
+        engine: &Arc<Engine>,
+        object: &ObjectRef,
+    ) -> Result<(), CoreError> {
+        let Some(reader) = self
+            .open_with_missing_policy(&object.bucket, &object.key)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let scratch = Metrics::default();
+        let outcome = stream_run(
+            reader,
+            engine,
+            &self.settings.processing,
+            &scratch,
+            &DiscardStore,
+            "",
+            "",
+        )
+        .await;
+
+        // Fold back before `?`: an object that failed mid-stream still read
+        // the bytes it read, and `BytesIn` is billed on failure in buffer mode
+        // too. The record counters cannot leak from a failure — `stream_run`
+        // commits its tally only past its own upload check, so a failed object
+        // leaves the scratch counters at zero by construction.
+        let snapshot = scratch.snapshot_and_reset();
+        self.metrics.add_bytes_in(snapshot.bytes_in);
+        self.metrics.add_records_in(snapshot.records_in);
+        self.metrics.add_records_kept(snapshot.records_kept);
+        self.metrics.add_records_dropped(snapshot.records_dropped);
+        self.metrics.add_parse_errors(snapshot.parse_errors);
+        for (rule, n) in &snapshot.rule_drops {
+            self.metrics.record_rule_drops(rule, *n);
+        }
+        // `snapshot.bytes_out` is deliberately dropped: those bytes went into
+        // `DiscardStore`, and `BytesOut` means bytes that reached a real
+        // destination.
+
+        if matches!(outcome?, Outcome::Unrecognized) {
+            self.metrics.add_unrecognized_objects(1);
+        }
 
         self.metrics.add_objects_processed(1);
         Ok(())
@@ -2152,6 +2242,100 @@ rules:
         assert!(
             store.object("dest-bucket", "weird.json.gz").is_none(),
             "dry run must leave the destination untouched"
+        );
+    }
+
+    /// `dry_run` selects the *destination*, not the mode.
+    ///
+    /// It used to short-circuit before `select_mode` straight into buffer-mode
+    /// evaluation, which made the one setting meant for a pre-flight check the
+    /// one setting whose verdict could differ from the live run's: this object
+    /// exceeds `max_object_bytes`, so the preview failed it (and counted
+    /// `ObjectsFailed`) while `auto` would have streamed it without complaint.
+    /// An operator reads that as "enabling this will break", and it will not.
+    ///
+    /// The preview now takes the live run's path — the real `stream_run`
+    /// against a `DiscardStore` — so it reaches the live run's verdict.
+    #[tokio::test]
+    async fn dry_run_previews_an_over_cap_object_through_the_stream_retry() {
+        // The same fixture as `auto_mode_retries_via_stream_when_buffer_mode_
+        // hits_max_object_bytes`, so the two differ only in `dry_run` — which
+        // is exactly the claim: the verdict must not depend on it.
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&[
+            "ConsoleLogin",
+            "AssumeRole",
+            "StopInstances",
+        ]));
+        store.seed("src-bucket", "file.json.gz", body.clone());
+        assert!(
+            gunzip(&body).len() > body.len(),
+            "the fixture must decompress to more than its compressed length, \
+             or the cap below is not the one being tested"
+        );
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.processing.mode = ProcessingMode::Auto;
+        // Exactly the compressed length: the *fetch* fits under the cap, so
+        // the buffer attempt gets far enough to bill `BytesIn` before the
+        // decompressed body blows the same cap. That is the only shape that
+        // exercises the retry's double-billing guard — a cap below the
+        // compressed size fails in the fetch and never bills at all.
+        settings.processing.max_object_bytes = body.len() as u64;
+        settings.behavior.dry_run = true;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink.clone(),
+        );
+
+        pipeline
+            .handle(b"{}")
+            .await
+            .expect("a dry run must not fail an object the live run streams successfully");
+
+        assert!(
+            store.object("dest-bucket", "file.json.gz").is_none(),
+            "the streamed preview must still write nothing"
+        );
+
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].objects_failed, 0,
+            "the preview must not report a failure the live run does not have"
+        );
+        assert_eq!(snapshots[0].objects_processed, 1);
+        // The counters survive the scratch `Metrics` the discard path runs
+        // through — the preview is worthless if it evaluates and reports
+        // nothing.
+        assert_eq!(
+            snapshots[0].records_in, 3,
+            "every record must still be evaluated"
+        );
+        assert_eq!(snapshots[0].records_kept, 3);
+        assert_eq!(
+            snapshots[0].bytes_out, 0,
+            "nothing reached a destination, so BytesOut must stay zero"
+        );
+        // One object, one ingest: the failed buffer attempt bills nothing
+        // because the stream retry counts the bytes it reads itself.
+        assert_eq!(
+            snapshots[0].bytes_in,
+            body.len() as u64,
+            "BytesIn must count the previewed object once, not once per attempt"
         );
     }
 

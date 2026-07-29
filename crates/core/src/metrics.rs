@@ -113,14 +113,16 @@ impl Metrics {
         self.items_without_objects.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Records one dropped record attributed to `rule_name` (the `RuleDrops`
-    /// metric's `Rule` dimension).
-    pub fn record_rule_drop(&self, rule_name: &str) {
-        self.record_rule_drops(rule_name, 1);
-    }
-
-    /// Bulk form of [`Metrics::record_rule_drop`]: attributes `n` drops to
-    /// `rule_name` under one lock acquisition.
+    /// Attributes `n` dropped records to `rule_name` (the `RuleDrops`
+    /// metric's `Rule` dimension) under one lock acquisition.
+    ///
+    /// Bulk-only, deliberately: there is no singular `record_rule_drop`,
+    /// because a caller that has one drop to report is a caller reporting
+    /// drops as they happen — which is the shape [`RecordTally`] exists to
+    /// prevent. Every drop reaches here through `RecordTally::commit`, past
+    /// the write.
+    ///
+    /// [`RecordTally`]: crate::process::RecordTally
     ///
     /// Exists for `stream_run`, which tallies drops per rule locally while it
     /// streams and commits them here only once the object as a whole is known
@@ -368,9 +370,9 @@ mod tests {
     #[test]
     fn rule_drops_are_recorded_per_rule_and_reset_after_snapshot() {
         let metrics = Metrics::default();
-        metrics.record_rule_drop("block-kms-decrypt");
-        metrics.record_rule_drop("block-kms-decrypt");
-        metrics.record_rule_drop("allow-console-noise");
+        metrics.record_rule_drops("block-kms-decrypt", 1);
+        metrics.record_rule_drops("block-kms-decrypt", 1);
+        metrics.record_rule_drops("allow-console-noise", 1);
 
         let mut rule_drops = metrics.snapshot_and_reset().rule_drops;
         rule_drops.sort();

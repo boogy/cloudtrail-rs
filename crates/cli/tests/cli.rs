@@ -37,6 +37,17 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// Gzip with the deflate compressor switched off (stored blocks), so the
+/// object is *larger* compressed than decompressed by a known ~23 bytes. That
+/// is what makes an object over `max_object_bytes` on the wire but under it
+/// once decompressed — the only shape that can tell a capped fetch from an
+/// uncapped one.
+fn gzip_stored(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
 fn gunzip(input: &[u8]) -> Vec<u8> {
     let mut decoder = MultiGzDecoder::new(input);
     let mut out = Vec::new();
@@ -904,4 +915,315 @@ fn filter_settings_on_unrecognized_object_skip_does_not_copy() {
     std::fs::remove_file(&settings_path).unwrap();
     std::fs::remove_file(&input_path).unwrap();
     std::fs::remove_file(&copied_path).unwrap();
+}
+
+/// The fixture the `max_object_bytes` tests share: a JSON envelope whose
+/// *decompressed* body fits under 1024 bytes but whose *compressed* form does
+/// not. Returns `(gzip bytes, decompressed length)`.
+fn over_cap_on_the_wire() -> Vec<u8> {
+    let shell =
+        r#"{"Records":[{"eventName":"ConsoleLogin","userAgent":""},{"eventName":"Decrypt"}]}"#;
+    let pad = "a".repeat(1010 - shell.len());
+    let body = format!(
+        r#"{{"Records":[{{"eventName":"ConsoleLogin","userAgent":"{pad}"}},{{"eventName":"Decrypt"}}]}}"#
+    );
+    let gz = gzip_stored(body.as_bytes());
+    assert!(
+        body.len() <= 1024,
+        "the decompressed body must fit under the cap ({} bytes)",
+        body.len()
+    );
+    assert!(
+        gz.len() > 1024,
+        "the compressed object must exceed the cap ({} bytes)",
+        gz.len()
+    );
+    gz
+}
+
+/// `processing.max_object_bytes` is buffer mode's memory cap, and the docs and
+/// the code's own comment say it applies to the **fetch** as well as to the
+/// decompressed body — the `Pipeline` applies it there. The CLI read through
+/// the uncapped `ObjectStore::get`, so the cap only ever caught the
+/// decompressed size and a multi-gigabyte object was pulled fully into memory
+/// before anything could reject it.
+///
+/// Falsifiable: this object is under the cap decompressed, so with an uncapped
+/// fetch `mode: buffer` succeeds and writes output. It must fail instead.
+#[test]
+fn filter_buffer_mode_caps_the_fetch_not_only_the_decompressed_body() {
+    let rules_path = drop_decrypt_rules("filter-fetchcap-rules");
+    let input_path = temp_path("filter-fetchcap-input.json.gz");
+    std::fs::write(&input_path, over_cap_on_the_wire()).unwrap();
+
+    let caps = "processing:\n  stream_threshold_bytes: 1024\n  max_object_bytes: 1024\n  mode: ";
+    let buffer_settings = write_settings(
+        "filter-fetchcap-buffer.yaml",
+        &format!("version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}buffer\n"),
+    );
+    let output_path = temp_path("filter-fetchcap-output.json.gz");
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&buffer_settings)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        !output.status.success(),
+        "an object over max_object_bytes on the wire must fail buffer mode, not be fetched \
+         whole into memory first"
+    );
+    assert!(!output_path.exists());
+
+    // Same object, same cap, `auto`: the retry through stream mode carries it,
+    // exactly as the pipeline's does. The cap is a buffer-mode cap, not a
+    // ceiling on what a backfill can process.
+    let auto_settings = write_settings(
+        "filter-fetchcap-auto.yaml",
+        &format!("version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}auto\n"),
+    );
+    let auto_out = temp_path("filter-fetchcap-auto-output.json.gz");
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&auto_out)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&auto_settings)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "auto must retry the over-cap fetch through stream mode, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        kept_event_names(&std::fs::read(&auto_out).expect("the retry must write the object")),
+        vec!["ConsoleLogin"]
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&buffer_settings).unwrap();
+    std::fs::remove_file(&auto_settings).unwrap();
+    std::fs::remove_file(&input_path).unwrap();
+    std::fs::remove_file(&auto_out).unwrap();
+}
+
+/// `behavior.dry_run` selects the destination, not the mode. It used to
+/// short-circuit into buffer-mode evaluation, which made the one setting meant
+/// for a pre-flight check the one setting whose verdict could differ from the
+/// real run's: this object fails buffer mode's cap and streams fine, so the
+/// preview reported a failure the real run does not have.
+///
+/// Falsifiable: with the old short-circuit the dry run exits non-zero on an
+/// object the very next line proves a real run writes.
+#[test]
+fn filter_dry_run_previews_an_oversized_object_through_stream_mode() {
+    let rules_path = drop_decrypt_rules("filter-dryrun-stream-rules");
+    let input_path = temp_path("filter-dryrun-stream-input.json.gz");
+    std::fs::write(&input_path, over_cap_on_the_wire()).unwrap();
+
+    let caps =
+        "processing:\n  stream_threshold_bytes: 1024\n  max_object_bytes: 1024\n  mode: auto\n";
+    let settings_path = write_settings(
+        "filter-dryrun-stream-settings.yaml",
+        &format!(
+            "version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}\
+             behavior:\n  dry_run: true\n"
+        ),
+    );
+    let output_path = temp_path("filter-dryrun-stream-output.json.gz");
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "a dry run must reach the same verdict as the real run, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_path.exists(), "a dry run must write nothing");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The record counters must survive the trip through the discard
+    // destination: `stream_run` publishes to a scratch `Metrics`, and
+    // everything except `BytesOut` is folded back.
+    assert!(
+        stdout.contains("records: 2 in, 1 kept, 1 dropped"),
+        "the streamed preview must still report what would be filtered, got stdout: {stdout}"
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_file(&input_path).unwrap();
+}
+
+/// A dry run discarded its own outcome classification, so the number of
+/// objects the real run would hand to `behavior.on_unrecognized_object` —
+/// copied verbatim, skipped, or under `error` *failed* — was invisible in the
+/// one mode whose entire job is to say what the real run will do.
+///
+/// Falsifiable: the count is not printed at all without the fix.
+#[test]
+fn filter_dry_run_reports_unrecognized_objects() {
+    let rules_path = drop_decrypt_rules("filter-dryrun-unrec-rules");
+    let settings_path = write_settings(
+        "filter-dryrun-unrec-settings.yaml",
+        "version: 1\n\
+         destination:\n  bucket: unused-by-the-cli\n\
+         behavior:\n  dry_run: true\n",
+    );
+
+    let in_dir = temp_path("filter-dryrun-unrec-in");
+    let out_dir = temp_path("filter-dryrun-unrec-out");
+    std::fs::create_dir_all(&in_dir).unwrap();
+    std::fs::write(
+        in_dir.join("a.json.gz"),
+        gzip_bytes(br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        in_dir.join("b.json.gz"),
+        gzip_bytes(br#"{"someOtherShape":true}"#),
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&in_dir)
+        .arg(&out_dir)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("2 object(s) evaluated (1 unrecognized, 0 failed)"),
+        "a dry run must report the objects the real run would treat as \
+         unrecognized, got stdout: {stdout}"
+    );
+    assert!(!out_dir.exists(), "a dry run must write nothing");
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_dir_all(&in_dir).unwrap();
+}
+
+/// `Pipeline` refuses to reprocess its own output (`CoreError::SelfTrigger`);
+/// the CLI had no equivalent, so `filter ./logs ./logs` rewrote a directory of
+/// CloudTrail objects in place and destroyed every original.
+///
+/// Falsifiable: without the guard the run exits zero and the source objects on
+/// disk are the filtered ones.
+#[test]
+fn filter_refuses_to_write_over_its_own_source() {
+    let rules_path = drop_decrypt_rules("filter-selfoverwrite-rules");
+    let dir = temp_path("filter-selfoverwrite-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#;
+    std::fs::write(dir.join("a.json.gz"), gzip_bytes(body)).unwrap();
+    let before = std::fs::read(dir.join("a.json.gz")).unwrap();
+
+    // The same directory, spelled differently on each side: a string compare
+    // would not have caught this one.
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&dir)
+        .arg(dir.join("."))
+        .arg("--rules")
+        .arg(&rules_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        !output.status.success(),
+        "filtering a directory over itself must fail, not rewrite the originals"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("a.json.gz")).unwrap(),
+        before,
+        "the source object must be untouched"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("over its own source"),
+        "the refusal must say why, got stderr: {stderr}"
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Stream mode reaches `on_unrecognized_object` with the upload already
+/// aborted and nothing buffered. It used to re-fetch the whole object before
+/// even consulting the policy — buffering, on the one path reached by objects
+/// too large to buffer, and reading an object `skip` and `error` never need.
+/// It now decides first and, for `copy`, streams source → destination.
+///
+/// Guards the new streaming copy: the object must arrive byte-identical.
+#[test]
+fn filter_stream_mode_copies_an_unrecognized_object_verbatim() {
+    let rules_path = drop_decrypt_rules("filter-stream-unrec-rules");
+    let source = br#"{"someOtherShape":true,"nested":{"a":[1,2,3]}}"#;
+    let input_path = temp_path("filter-stream-unrec-input.json.gz");
+    let raw = gzip_bytes(source);
+    std::fs::write(&input_path, &raw).unwrap();
+
+    let settings_path = write_settings(
+        "filter-stream-unrec-settings.yaml",
+        "version: 1\n\
+         destination:\n  bucket: unused-by-the-cli\n\
+         processing:\n  mode: stream\n",
+    );
+    let output_path = temp_path("filter-stream-unrec-output.json.gz");
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output_path).expect("copy must write the object"),
+        raw,
+        "an unrecognized object must be forwarded byte-for-byte, gzip framing included"
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_file(&input_path).unwrap();
+    std::fs::remove_file(&output_path).unwrap();
 }
