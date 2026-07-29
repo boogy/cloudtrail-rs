@@ -4,6 +4,8 @@
 
 mod buffer;
 mod stream;
+mod tally;
 
 pub use buffer::{Outcome, buffer_run};
 pub use stream::stream_run;
+pub use tally::RecordTally;

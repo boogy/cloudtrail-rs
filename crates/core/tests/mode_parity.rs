@@ -164,16 +164,27 @@ fn run_buffer(
     cfg: &Processing,
 ) -> (Verdict, Option<Vec<u8>>, MetricSnapshot) {
     let metrics = Metrics::default();
-    let verdict = match buffer_run(input, engine, cfg, &metrics) {
-        Ok(Outcome::Written(Some(bytes))) => (
-            Verdict::Written(String::from_utf8_lossy(&gunzip(&bytes)).into_owned()),
-            Some(bytes.to_vec()),
-        ),
-        Ok(Outcome::Written(None)) => {
-            unreachable!("buffer_run always returns Written(Some(_))")
+    let verdict = match buffer_run(input, engine, cfg) {
+        Ok((outcome, tally)) => {
+            // `buffer_run` publishes nothing itself — its caller commits the
+            // tally once the object's fate is decided. This harness stands in
+            // for that caller, so the snapshot below sees what
+            // `Pipeline::process_buffer` would have published for a successful
+            // object. Stream mode's equivalent commit happens inside
+            // `stream_run`, past its own upload check.
+            tally.commit(&metrics, engine);
+            match outcome {
+                Outcome::Written(Some(bytes)) => (
+                    Verdict::Written(String::from_utf8_lossy(&gunzip(&bytes)).into_owned()),
+                    Some(bytes.to_vec()),
+                ),
+                Outcome::Written(None) => {
+                    unreachable!("buffer_run always returns Written(Some(_))")
+                }
+                Outcome::NothingKept => (Verdict::NothingKept, None),
+                Outcome::Unrecognized => (Verdict::Unrecognized, None),
+            }
         }
-        Ok(Outcome::NothingKept) => (Verdict::NothingKept, None),
-        Ok(Outcome::Unrecognized) => (Verdict::Unrecognized, None),
         Err(e) => (classify(&e), None),
     };
     (verdict.0, verdict.1, metrics.snapshot_and_reset())

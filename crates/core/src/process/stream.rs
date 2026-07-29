@@ -36,7 +36,6 @@
 //! from (delivering an `Err` instead of a clean EOF) — no new `ObjectStore`
 //! port method is added for this.
 
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -52,7 +51,7 @@ use serde_json::value::RawValue;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::sync::mpsc;
 
-use super::Outcome;
+use super::{Outcome, RecordTally};
 use crate::config::Processing;
 use crate::error::CoreError;
 use crate::filter::{Decision, Engine};
@@ -437,36 +436,9 @@ fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
 /// Unlike `buffer_run`, this performs the write itself (its signature takes
 /// a `store` and destination) — buffer mode instead hands its caller a
 /// `Bytes` to `put`, because stream mode can't wait until the end to know
-/// the destination is worth writing.
-/// Publishes an object's per-record counters as one unit, once the object's
-/// fate is known.
-///
-/// Called from exactly the two places `stream_run` can say "this object had a
-/// recognised `Records` array and did not fail". Everything about a record —
-/// that it arrived, that a rule dropped it, that it would not parse — is
-/// observable only from inside the streaming loop, but none of it is *true*
-/// until the object finishes: an object that fails halfway is re-driven whole
-/// and re-evaluated from scratch. Committing here keeps the counters
-/// describing objects that were actually accounted for, which is what makes
-/// `RecordsIn == RecordsKept + RecordsDropped` and `sum(RuleDrops) <=
-/// RecordsDropped` hold in stream mode as they do in buffer mode.
-fn commit_record_counters(
-    metrics: &Metrics,
-    engine: &Engine,
-    records_in: u64,
-    kept: u64,
-    parse_errors: u64,
-    rule_drops: &HashMap<usize, u64>,
-) {
-    metrics.add_records_in(records_in);
-    metrics.add_records_kept(kept);
-    metrics.add_records_dropped(records_in - kept);
-    metrics.add_parse_errors(parse_errors);
-    for (rule_idx, n) in rule_drops {
-        metrics.record_rule_drops(engine.rule_name(*rule_idx), *n);
-    }
-}
-
+/// the destination is worth writing. It therefore also commits its own
+/// [`RecordTally`], which it can only do once `put_stream` has returned;
+/// buffer mode hands its tally back for the caller to commit after the `put`.
 pub async fn stream_run(
     input: Box<dyn AsyncRead + Send + Unpin>,
     engine: &Engine,
@@ -511,20 +483,14 @@ pub async fn stream_run(
         }
 
         let mut first = true;
-        let mut kept: u64 = 0;
-        let mut records_in: u64 = 0;
-        // Tallied locally, committed to `metrics` only alongside
-        // `RecordsIn`/`RecordsKept`/`RecordsDropped` — see the comment above
-        // the `match finish` below. Buffer mode gets this for free: it decides
-        // the object's fate before it touches a counter. Stream mode has to
-        // evaluate records *before* it can know the object parses, so counting
-        // as it went published per-rule drops and parse errors for objects
-        // that then failed and were re-driven in full: `sum(RuleDrops)` and
-        // `ParseErrors` reported work on records that were never dropped and
-        // will be re-counted on every retry, while `RecordsDropped` for the
-        // same snapshot stayed at zero.
-        let mut parse_errors: u64 = 0;
-        let mut rule_drops: HashMap<usize, u64> = HashMap::new();
+        // Every per-record counter is tallied locally here and committed to
+        // `metrics` in one place — `stream_run`, on the far side of
+        // `upload_result?`. Counting as it went published per-rule drops and
+        // parse errors for objects that then failed and were re-driven in
+        // full: `sum(RuleDrops)` and `ParseErrors` reported work on records
+        // that were never dropped and will be re-counted on every retry,
+        // while `RecordsDropped` for the same snapshot stayed at zero.
+        let mut tally = RecordTally::default();
         // Compressed bytes handed to `put_stream` so far. Accumulated rather
         // than reported as it goes, because every non-`Written` outcome
         // aborts the upload — nothing lands at the destination, so nothing
@@ -537,20 +503,20 @@ pub async fn stream_run(
         let finish = loop {
             match raw_rx.recv().await {
                 Some(StreamMsg::Record(raw)) => {
-                    records_in += 1;
+                    tally.record_in();
                     let text = raw.get();
                     let keep = match serde_json::from_str::<Value>(text) {
                         Ok(value) => match engine.evaluate(&value) {
                             Decision::Keep => true,
                             Decision::Drop { rule_idx } => {
-                                *rule_drops.entry(rule_idx).or_insert(0) += 1;
+                                tally.drop_by_rule(rule_idx);
                                 false
                             }
                         },
                         Err(_) => {
                             // Unparseable individual record: kept, never
                             // dropped — parity with buffer_run.
-                            parse_errors += 1;
+                            tally.parse_error();
                             true
                         }
                     };
@@ -580,7 +546,7 @@ pub async fn stream_run(
                             return Err(CoreError::Gzip(e.to_string()));
                         }
                         first = false;
-                        kept += 1;
+                        tally.keep();
                     }
 
                     if encoder.get_ref().len() >= OUTPUT_FLUSH_THRESHOLD {
@@ -610,8 +576,13 @@ pub async fn stream_run(
         };
 
         // Every per-record counter — `RecordsIn`, `RecordsKept`,
-        // `RecordsDropped`, `ParseErrors`, `RuleDrops` — is reported in one
-        // place, the two `RecordsFound` arms below, and nowhere else.
+        // `RecordsDropped`, `ParseErrors`, `RuleDrops` — leaves here inside
+        // `tally` and is reported in exactly one place: `stream_run`, once
+        // `upload_result?` has proven the object's fate. Not here, because
+        // "the gzip trailer was handed to the channel" is not "the object is
+        // at the destination" — a `put_stream` that fails after the last
+        // record was evaluated would otherwise publish that object's records
+        // as kept, and publish them again on every redelivery.
         //
         // Reporting `RecordsIn` here instead made stream mode publish
         // `RecordsIn > 0` with kept and dropped both zero for an object that
@@ -633,7 +604,7 @@ pub async fn stream_run(
         // See `MetricSnapshot::records_balance` and the metric-parity cases
         // in `tests/mode_parity.rs`.
         match finish {
-            FinishKind::RecordsFound if kept > 0 => {
+            FinishKind::RecordsFound if tally.kept_count() > 0 => {
                 if let Err(e) = encoder.write_all(b"]}") {
                     let _ = out_tx
                         .send(Err(io::Error::other("aborting: gzip write failed")))
@@ -646,15 +617,7 @@ pub async fn stream_run(
                             bytes_out += tail.len() as u64;
                             let _ = out_tx.send(Ok(Bytes::from(tail))).await;
                         }
-                        commit_record_counters(
-                            metrics,
-                            engine,
-                            records_in,
-                            kept,
-                            parse_errors,
-                            &rule_drops,
-                        );
-                        Ok((Outcome::Written(None), bytes_out))
+                        Ok((Outcome::Written(None), bytes_out, tally))
                     }
                     Err(e) => {
                         let _ = out_tx
@@ -669,17 +632,30 @@ pub async fn stream_run(
                 // mode must never leave a zero-record object at the
                 // destination ("never leave a zero-record object") —
                 // abort the upload instead of committing one.
-                commit_record_counters(metrics, engine, records_in, 0, parse_errors, &rule_drops);
+                //
+                // The tally still travels back and is still committed: this
+                // object's fate *is* decided — writing nothing is the correct
+                // outcome, not a failure — and its records were genuinely
+                // dropped. `kept` is 0 here by the guard above, so `commit`
+                // derives `RecordsDropped == RecordsIn`.
                 let _ = out_tx
                     .send(Err(io::Error::other("aborting: all records dropped")))
                     .await;
-                Ok((Outcome::NothingKept, 0))
+                Ok((Outcome::NothingKept, 0, tally))
             }
             FinishKind::Unrecognized => {
                 let _ = out_tx
                     .send(Err(io::Error::other("aborting: no Records array")))
                     .await;
-                Ok((Outcome::Unrecognized, 0))
+                // The tally is *discarded*, not committed. An object can be
+                // ruled unrecognized only after some of its records were
+                // already emitted and evaluated — `{"Records":[…],
+                // "Records":[…]}` is unrecognized because of the second key,
+                // by which point the first array's records are counted.
+                // Buffer mode never sees those records at all and reports
+                // 0/0/0 for the same bytes, so publishing them here would
+                // make an object measure differently based only on its size.
+                Ok((Outcome::Unrecognized, 0, RecordTally::default()))
             }
             FinishKind::Error(failure) => {
                 let _ = out_tx
@@ -700,7 +676,7 @@ pub async fn stream_run(
         CoreError::Json(format!("stream_run: record extraction task panicked: {e}"))
     })?;
 
-    let (outcome, bytes_out) = processing_result?;
+    let (outcome, bytes_out, tally) = processing_result?;
 
     match &outcome {
         Outcome::Written(None) => {
@@ -722,6 +698,14 @@ pub async fn stream_run(
             unreachable!("stream_run never returns Outcome::Written(Some(_))")
         }
     }
+
+    // Past every `?`: this object's fate is decided, so its records are now
+    // true and may be published. The `upload_result?` above is the one that
+    // matters — reaching here on the `Written` path means the multipart
+    // upload completed, and returning early through it means nothing landed
+    // and nothing is counted, leaving the redelivery to re-count the object
+    // whole.
+    tally.commit(metrics, engine);
 
     Ok(outcome)
 }
@@ -785,13 +769,8 @@ rules:
         ]}"#;
         let input = gzip_bytes(body);
 
-        let buffered = buffer_run(
-            &input,
-            &drop_decrypt_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("buffer_run must succeed");
+        let (buffered, _tally) = buffer_run(&input, &drop_decrypt_engine(), &Processing::default())
+            .expect("buffer_run must succeed");
         let expected = match buffered {
             Outcome::Written(Some(b)) => b,
             other => panic!("expected Outcome::Written(Some(_)), got {other:?}"),
@@ -978,53 +957,102 @@ rules:
     /// failure). `BytesOut` used to be committed inside the processing block,
     /// before `upload_result?` was even looked at, so those bytes were billed
     /// as written while the destination stayed empty.
-    #[tokio::test]
-    async fn a_failing_upload_reports_no_bytes_out() {
-        struct RejectingStore;
+    /// A store that reads the whole body and *then* rejects the write, so the
+    /// processing block reaches its success arm and hands over every byte
+    /// before anything fails — a real `CompleteMultipartUpload` failure, not
+    /// one of our own deliberate aborts.
+    struct RejectingStore;
 
-        #[async_trait::async_trait]
-        impl ObjectStore for RejectingStore {
-            async fn get(&self, _b: &str, _k: &str) -> Result<Bytes, StoreError> {
-                unimplemented!("stream_run never gets through this store")
-            }
-
-            async fn get_stream(
-                &self,
-                _b: &str,
-                _k: &str,
-            ) -> Result<Box<dyn AsyncRead + Send + Unpin>, StoreError> {
-                unimplemented!("stream_run never gets through this store")
-            }
-
-            async fn put(
-                &self,
-                _b: &str,
-                _k: &str,
-                _body: Bytes,
-                _meta: PutMeta,
-            ) -> Result<(), StoreError> {
-                unimplemented!("stream mode never calls put")
-            }
-
-            async fn put_stream(
-                &self,
-                _b: &str,
-                _k: &str,
-                mut body: Box<dyn AsyncRead + Send + Unpin>,
-                _meta: PutMeta,
-            ) -> Result<(), StoreError> {
-                // Drain first, so the failure is "the store said no", not
-                // "the reader was never read" — the processing block must
-                // reach its success arm and hand over every byte.
-                let mut sink = Vec::new();
-                body.read_to_end(&mut sink)
-                    .await
-                    .expect("the reader must deliver a clean EOF in this test");
-                assert!(!sink.is_empty(), "the encoder must have produced bytes");
-                Err(StoreError::Backend("upload rejected".to_string()))
-            }
+    #[async_trait::async_trait]
+    impl ObjectStore for RejectingStore {
+        async fn get(&self, _b: &str, _k: &str) -> Result<Bytes, StoreError> {
+            unimplemented!("stream_run never gets through this store")
         }
 
+        async fn get_stream(
+            &self,
+            _b: &str,
+            _k: &str,
+        ) -> Result<Box<dyn AsyncRead + Send + Unpin>, StoreError> {
+            unimplemented!("stream_run never gets through this store")
+        }
+
+        async fn put(
+            &self,
+            _b: &str,
+            _k: &str,
+            _body: Bytes,
+            _meta: PutMeta,
+        ) -> Result<(), StoreError> {
+            unimplemented!("stream mode never calls put")
+        }
+
+        async fn put_stream(
+            &self,
+            _b: &str,
+            _k: &str,
+            mut body: Box<dyn AsyncRead + Send + Unpin>,
+            _meta: PutMeta,
+        ) -> Result<(), StoreError> {
+            // Drain first, so the failure is "the store said no", not
+            // "the reader was never read" — the processing block must
+            // reach its success arm and hand over every byte.
+            let mut sink = Vec::new();
+            body.read_to_end(&mut sink)
+                .await
+                .expect("the reader must deliver a clean EOF in this test");
+            assert!(!sink.is_empty(), "the encoder must have produced bytes");
+            Err(StoreError::Backend("upload rejected".to_string()))
+        }
+    }
+
+    /// An upload that fails *after* every record was evaluated must publish no
+    /// per-record counters at all. `commit_record_counters` used to run inside
+    /// the processing block, before `upload_result?` was looked at, so an
+    /// object that never reached the destination still reported its records as
+    /// read, kept and dropped — and reported them again on every redelivery,
+    /// because a failed object is re-driven and re-evaluated whole.
+    #[tokio::test]
+    async fn a_failing_upload_publishes_no_record_counters() {
+        let input = gzip_bytes(
+            br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"},{"broken":"\uD800"}]}"#,
+        );
+        let metrics = Metrics::default();
+
+        stream_run(
+            reader_over(input),
+            &drop_decrypt_engine(),
+            &Processing::default(),
+            &metrics,
+            &RejectingStore,
+            "bucket",
+            "dest",
+        )
+        .await
+        .expect_err("a rejected upload must surface as an error");
+
+        let snapshot = metrics.snapshot_and_reset();
+        assert_eq!(
+            (
+                snapshot.records_in,
+                snapshot.records_kept,
+                snapshot.records_dropped,
+                snapshot.parse_errors,
+            ),
+            (0, 0, 0, 0),
+            "the object never landed, so none of its records may be counted — \
+             the redelivery re-evaluates it whole and would count them twice"
+        );
+        assert!(
+            snapshot.rule_drops.is_empty(),
+            "a drop attributed to a rule for an object that was never written \
+             is a drop that did not happen, got {:?}",
+            snapshot.rule_drops
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_upload_reports_no_bytes_out() {
         let input = gzip_bytes(br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#);
         let metrics = Metrics::default();
         let error = stream_run(

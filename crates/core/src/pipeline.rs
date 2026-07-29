@@ -563,10 +563,13 @@ impl Pipeline {
         // run, so the one setting meant for a pre-flight check was blind to
         // the one outcome an operator most needs to see before enabling
         // `on_unrecognized_object`.
-        let outcome = buffer_run(&bytes, engine, &self.settings.processing, &self.metrics)?;
+        let (outcome, tally) = buffer_run(&bytes, engine, &self.settings.processing)?;
         if matches!(outcome, Outcome::Unrecognized) {
             self.metrics.add_unrecognized_objects(1);
         }
+        // Dry run writes nothing, so there is no write to wait on: the
+        // object's fate is decided the moment `buffer_run` returns.
+        tally.commit(&self.metrics, engine);
 
         self.metrics.add_objects_processed(1);
         Ok(())
@@ -585,7 +588,7 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        let result = buffer_run(&bytes, engine, &self.settings.processing, &self.metrics);
+        let result = buffer_run(&bytes, engine, &self.settings.processing);
 
         // `BytesIn` is skipped for exactly one case: an `ObjectTooLarge` in
         // auto mode, which `process_object` retries through `process_stream`.
@@ -597,7 +600,7 @@ impl Pipeline {
         if !retried_via_stream {
             self.metrics.add_bytes_in(bytes.len() as u64);
         }
-        let outcome = result?;
+        let (outcome, tally) = result?;
 
         match outcome {
             Outcome::Written(Some(out_bytes)) => {
@@ -620,6 +623,15 @@ impl Pipeline {
             }
             Outcome::Written(None) => unreachable!("buffer_run always returns Written(Some(_))"),
         }
+
+        // Past every `?` above — in particular the `put` — so this object's
+        // records are now true. `buffer_run` evaluated them long before the
+        // write; committing there billed records as kept to an object whose
+        // `put` then failed, leaving nothing at the destination and a
+        // redelivery that counts the same records again. Same ordering as
+        // `BytesOut` directly above, and as `stream_run`'s commit past
+        // `upload_result?`.
+        tally.commit(&self.metrics, engine);
 
         self.metrics.add_objects_processed(1);
         Ok(())
@@ -1357,6 +1369,63 @@ rules:
             snapshots[0].bytes_out, 0,
             "the put failed, so nothing reached the destination and BytesOut \
              must stay zero"
+        );
+    }
+
+    /// The record-counter twin of the test above. `buffer_run` evaluates every
+    /// record long before `process_buffer` calls `put`, and it used to publish
+    /// `RecordsIn`/`RecordsKept`/`RecordsDropped`/`ParseErrors`/`RuleDrops`
+    /// itself as it went. A rejected `put` therefore left the destination
+    /// empty while the metrics claimed the records had been filtered — and the
+    /// redelivery, which re-evaluates the object whole, counted them again.
+    #[tokio::test]
+    async fn a_failed_write_publishes_no_record_counters_in_buffer_mode() {
+        let store = put_rejecting_store(
+            "file.json.gz",
+            gzip_bytes(&cloudtrail_body(&["ConsoleLogin", "Decrypt"])),
+        );
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(drop_decrypt_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let pipeline = Pipeline::new(
+            Arc::new(base_settings()),
+            decoder,
+            store,
+            config,
+            metrics,
+            sink.clone(),
+        );
+
+        let err = pipeline
+            .handle(b"{}")
+            .await
+            .expect_err("a rejected put must fail the object");
+        assert!(matches!(err, CoreError::Store(_)), "got {err:?}");
+
+        let snapshots = sink.snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            (
+                snapshots[0].records_in,
+                snapshots[0].records_kept,
+                snapshots[0].records_dropped,
+                snapshots[0].parse_errors,
+            ),
+            (0, 0, 0, 0),
+            "the put failed, so no record of this object may be counted — the \
+             redelivery re-evaluates it whole and would count them twice"
+        );
+        assert!(
+            snapshots[0].rule_drops.is_empty(),
+            "a drop attributed to a rule for an object that was never written \
+             is a drop that did not happen, got {:?}",
+            snapshots[0].rule_drops
         );
     }
 

@@ -670,7 +670,10 @@ impl Filterer {
                 .store(&self.src)
                 .get(self.src.bucket(), src_key)
                 .await?;
-            buffer_run(&bytes, &self.engine, &self.cfg.processing, &self.metrics)?;
+            let (_outcome, tally) = buffer_run(&bytes, &self.engine, &self.cfg.processing)?;
+            // Nothing is written, so the object's fate is decided as soon as
+            // `buffer_run` returns — commit the record counters here.
+            tally.commit(&self.metrics, &self.engine);
             return Ok(ObjectOutcome::DryRun);
         }
 
@@ -681,7 +684,7 @@ impl Filterer {
                     .store(&self.src)
                     .get(self.src.bucket(), src_key)
                     .await?;
-                let result = buffer_run(&bytes, &self.engine, &self.cfg.processing, &self.metrics);
+                let result = buffer_run(&bytes, &self.engine, &self.cfg.processing);
                 match result {
                     // The same retry `Pipeline::process_object` performs:
                     // `stream_threshold_bytes` is a compressed-size estimate,
@@ -701,13 +704,24 @@ impl Filterer {
                         self.process_stream(src_key, dst_key).await
                     }
                     Err(e) => Err(e.into()),
-                    Ok(Outcome::Written(Some(out))) => {
-                        Ok(ObjectOutcome::Written(self.put(dst_key, out).await?))
-                    }
-                    Ok(Outcome::NothingKept) => Ok(ObjectOutcome::NothingKept),
-                    Ok(Outcome::Unrecognized) => self.unrecognized(src_key, dst_key, bytes).await,
-                    Ok(Outcome::Written(None)) => {
-                        unreachable!("buffer_run returns Written(Some(_)) when it writes")
+                    Ok((outcome, tally)) => {
+                        let object_outcome = match outcome {
+                            Outcome::Written(Some(out)) => {
+                                ObjectOutcome::Written(self.put(dst_key, out).await?)
+                            }
+                            Outcome::NothingKept => ObjectOutcome::NothingKept,
+                            Outcome::Unrecognized => {
+                                self.unrecognized(src_key, dst_key, bytes).await?
+                            }
+                            Outcome::Written(None) => {
+                                unreachable!("buffer_run returns Written(Some(_)) when it writes")
+                            }
+                        };
+                        // Past the `put`, exactly as `Pipeline::process_buffer`
+                        // does it: a write that failed must leave the records
+                        // uncounted rather than report them as filtered.
+                        tally.commit(&self.metrics, &self.engine);
+                        Ok(object_outcome)
                     }
                 }
             }
