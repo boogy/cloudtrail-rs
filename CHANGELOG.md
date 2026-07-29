@@ -91,6 +91,23 @@ metric names it.
   `RecordsIn`/`RecordsKept`/`RecordsDropped`, only once the object has
   succeeded. This makes `sum(RuleDrops) == RecordsDropped` a second
   reconciliation identity, asserted for both modes on every parity case.
+- **Record counters were published before the object's write was confirmed.**
+  `RuleDrops`/`ParseErrors` had already been deferred to the end of the object,
+  but the commit itself still ran before the destination write was checked:
+  stream mode committed before `put_stream`'s result was inspected, and buffer
+  mode committed inside `buffer_run`, before `Pipeline` had even attempted the
+  `put`. A failed write therefore left `RecordsIn`/`RecordsKept`/
+  `RecordsDropped`/`ParseErrors`/`RuleDrops` already counted for records that
+  never reached the destination — and counted them again on every redelivery,
+  since a failed object is re-driven and re-evaluated whole. Both modes now
+  accumulate into a shared `RecordTally` and commit it as one unit only past
+  every `?`, alongside `BytesOut`: stream mode after `put_stream` returns,
+  buffer mode after the `put`. Sharing one tally type is what keeps the two
+  modes' arithmetic identical rather than merely similar. Dry-run commits
+  immediately (nothing is written, so the fate is decided at once), and stream
+  mode's unrecognized path discards the tally, since buffer mode never sees
+  those records. Guarded in both modes by a test that fails if the commit moves
+  back ahead of the write.
 - **`BytesIn` was billed twice for an unrecognized object in stream mode.**
   `on_unrecognized_object: copy` re-reads the object (once to discover it has
   no `Records`, once to copy it) and counted both reads, so the same bytes

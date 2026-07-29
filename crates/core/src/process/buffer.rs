@@ -19,7 +19,7 @@ use serde_json::value::RawValue;
 use crate::config::Processing;
 use crate::error::CoreError;
 use crate::filter::{Decision, Engine};
-use crate::metrics::Metrics;
+use crate::process::RecordTally;
 
 /// Result of running one object's body through `buffer_run` (or, later,
 /// `stream_run`).
@@ -81,13 +81,22 @@ fn gzip_compress(body: &[u8], level: u32) -> Result<Vec<u8>, CoreError> {
 ///
 /// `max_object_bytes` (buffer mode only) bounds the decompressed
 /// size; exceeding it is an `Err`, not an out-of-memory buffer growth.
+///
+/// Publishes **no** metrics. The per-record counters come back in the
+/// [`RecordTally`], which the caller commits only once it has decided the
+/// object's fate — for buffer mode, once the `put` of the returned bytes has
+/// returned. Reporting them from in here billed records as kept to an object
+/// whose write then failed, leaving nothing at the destination and a
+/// redelivery that counts them all over again. Stream mode defers the same
+/// counters the same way; see [`crate::process::tally`].
 pub fn buffer_run(
     input: &[u8],
     engine: &Engine,
     cfg: &Processing,
-    metrics: &Metrics,
-) -> Result<Outcome, CoreError> {
+) -> Result<(Outcome, RecordTally), CoreError> {
     let decompressed = decompress_capped(input, cfg.max_object_bytes)?;
+
+    let mut tally = RecordTally::default();
 
     let records = match serde_json::from_slice::<Envelope>(&decompressed) {
         Ok(envelope) => envelope.records,
@@ -98,22 +107,26 @@ pub fn buffer_run(
             // `on_unrecognized_object` policy applies — never DLQ on an
             // unanticipated shape).
             return match serde_json::from_slice::<Value>(&decompressed) {
-                Ok(_) => Ok(Outcome::Unrecognized),
+                // An empty tally, not the records seen so far: there were
+                // none, and stream mode reports 0/0/0 for these same bytes.
+                Ok(_) => Ok((Outcome::Unrecognized, tally)),
                 Err(e) => Err(CoreError::Json(e.to_string())),
             };
         }
     };
 
-    metrics.add_records_in(records.len() as u64);
-
     let mut survivors: Vec<&str> = Vec::with_capacity(records.len());
     for raw in &records {
+        tally.record_in();
         let text = raw.get();
         match serde_json::from_str::<Value>(text) {
             Ok(value) => match engine.evaluate(&value) {
-                Decision::Keep => survivors.push(text),
+                Decision::Keep => {
+                    tally.keep();
+                    survivors.push(text);
+                }
                 Decision::Drop { rule_idx } => {
-                    metrics.record_rule_drop(engine.rule_name(rule_idx));
+                    tally.drop_by_rule(rule_idx);
                 }
             },
             Err(_) => {
@@ -123,29 +136,28 @@ pub fn buffer_run(
                 // was itself syntactically well-formed enough to capture —
                 // e.g. a lone UTF-16 surrogate escape parses as a span but
                 // fails full decode into a `Value`.
-                metrics.add_parse_errors(1);
+                tally.parse_error();
+                tally.keep();
                 survivors.push(text);
             }
         }
     }
 
     if survivors.is_empty() {
-        metrics.add_records_dropped(records.len() as u64);
-        return Ok(Outcome::NothingKept);
+        // `kept` is 0, so `commit` derives `RecordsDropped == RecordsIn`.
+        return Ok((Outcome::NothingKept, tally));
     }
-
-    metrics.add_records_kept(survivors.len() as u64);
-    metrics.add_records_dropped((records.len() - survivors.len()) as u64);
 
     let body = format!("{{\"Records\":[{}]}}", survivors.join(","));
     let gzipped = gzip_compress(body.as_bytes(), cfg.gzip_level)?;
-    Ok(Outcome::Written(Some(Bytes::from(gzipped))))
+    Ok((Outcome::Written(Some(Bytes::from(gzipped))), tally))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::rules::RuleSet;
+    use crate::metrics::Metrics;
 
     fn engine_from_yaml(yaml: &[u8]) -> Engine {
         let rule_set = RuleSet::parse(yaml).expect("ruleset must parse");
@@ -206,13 +218,8 @@ rules:
         let body = format!(r#"{{"Records":[{record}]}}"#);
         let input = gzip_bytes(body.as_bytes());
 
-        let outcome = buffer_run(
-            &input,
-            &no_op_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("must succeed");
+        let (outcome, _tally) =
+            buffer_run(&input, &no_op_engine(), &Processing::default()).expect("must succeed");
         let bytes = written_bytes(outcome);
         let out = gunzip(&bytes);
         let out_str = String::from_utf8(out).expect("output must be valid utf8");
@@ -231,13 +238,8 @@ rules:
         ]}"#;
         let input = gzip_bytes(body);
 
-        let outcome = buffer_run(
-            &input,
-            &drop_decrypt_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("must succeed");
+        let (outcome, _tally) = buffer_run(&input, &drop_decrypt_engine(), &Processing::default())
+            .expect("must succeed");
         let bytes = written_bytes(outcome);
         assert_eq!(
             kept_event_names(&bytes),
@@ -256,7 +258,7 @@ rules:
             ..Processing::default()
         };
 
-        let err = buffer_run(&input, &no_op_engine(), &cfg, &Metrics::default())
+        let err = buffer_run(&input, &no_op_engine(), &cfg)
             .expect_err("oversized decompressed object must be an error, not OOM");
         assert!(
             matches!(err, CoreError::ObjectTooLarge { limit: 100 }),
@@ -269,13 +271,8 @@ rules:
         let body = br#"{"Records":[{"eventName":"Decrypt"},{"eventName":"Decrypt"}]}"#;
         let input = gzip_bytes(body);
 
-        let outcome = buffer_run(
-            &input,
-            &drop_decrypt_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("must succeed");
+        let (outcome, _tally) = buffer_run(&input, &drop_decrypt_engine(), &Processing::default())
+            .expect("must succeed");
         assert!(
             matches!(outcome, Outcome::NothingKept),
             "expected NothingKept, got {outcome:?}"
@@ -287,13 +284,8 @@ rules:
         let body = br#"{"Records":[]}"#;
         let input = gzip_bytes(body);
 
-        let outcome = buffer_run(
-            &input,
-            &no_op_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("empty Records must not be an error");
+        let (outcome, _tally) = buffer_run(&input, &no_op_engine(), &Processing::default())
+            .expect("empty Records must not be an error");
         assert!(
             matches!(outcome, Outcome::NothingKept),
             "expected NothingKept, got {outcome:?}"
@@ -305,13 +297,8 @@ rules:
         let body = br#"{"foo":"bar"}"#;
         let input = gzip_bytes(body);
 
-        let outcome = buffer_run(
-            &input,
-            &no_op_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("valid JSON with no Records key must not be an error");
+        let (outcome, _tally) = buffer_run(&input, &no_op_engine(), &Processing::default())
+            .expect("valid JSON with no Records key must not be an error");
         assert!(
             matches!(outcome, Outcome::Unrecognized),
             "expected Unrecognized, got {outcome:?}"
@@ -323,13 +310,8 @@ rules:
         let body = b"not json at all {{{";
         let input = gzip_bytes(body);
 
-        let err = buffer_run(
-            &input,
-            &no_op_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect_err("bad JSON must be a data error");
+        let err = buffer_run(&input, &no_op_engine(), &Processing::default())
+            .expect_err("bad JSON must be a data error");
         assert!(matches!(err, CoreError::Json(_)), "got {err:?}");
     }
 
@@ -344,8 +326,9 @@ rules:
         let input = gzip_bytes(body);
         let metrics = Metrics::default();
 
-        let outcome = buffer_run(&input, &no_op_engine(), &Processing::default(), &metrics)
+        let (outcome, tally) = buffer_run(&input, &no_op_engine(), &Processing::default())
             .expect("an unparseable individual record must not fail the whole object");
+        tally.commit(&metrics, &no_op_engine());
         let bytes = written_bytes(outcome);
         let out = gunzip(&bytes);
         let out_str = String::from_utf8(out).expect("output must be valid utf8");
@@ -383,13 +366,8 @@ rules:
             "fixture sanity check: a single-member decoder must truncate at the first member"
         );
 
-        let outcome = buffer_run(
-            &input,
-            &no_op_engine(),
-            &Processing::default(),
-            &Metrics::default(),
-        )
-        .expect("a concatenated multi-member gzip must be fully read");
+        let (outcome, _tally) = buffer_run(&input, &no_op_engine(), &Processing::default())
+            .expect("a concatenated multi-member gzip must be fully read");
         let bytes = written_bytes(outcome);
         assert_eq!(
             kept_event_names(&bytes),
