@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Releases are tagged on merged `main`, via `make tag`.** The GitHub Release
+  already asked for auto-generated notes (`generate_release_notes: true` plus
+  the categories in `.github/release.yml`), but v0.2.0 shipped with an empty
+  "What's Changed": it was tagged on the PR branch before the squash-merge, and
+  GitHub builds that section from the pull requests merged inside the tag's
+  commit range — a branch head has none. `make tag` now refuses to tag off
+  `main`, on a dirty tree, or when local `main` has drifted from `origin/main`.
+  The version bump goes through a PR like any other change.
+- `.github/workflows/pr-label.yml` labels each PR from its conventional-commit
+  title prefix (`fix:`, `feat:`, `docs:`, `ci:`, `build:`), so it files under
+  the right release-notes heading instead of "Other Changes".
+
 ## [0.3.0] - 2026-07-28
 
 Rounds two and three of the data-loss audit: the remaining findings from the

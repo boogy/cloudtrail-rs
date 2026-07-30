@@ -94,7 +94,7 @@ Images are published for `lambda-s3`, `lambda-sns`, `lambda-sqs`, and
 
 ```mermaid
 flowchart LR
-    TAG["git tag v1.2.3"] --> GR["Release workflow (CI)"]
+    TAG["make tag on merged main<br/>git push origin v1.2.3"] --> GR["Release workflow (CI)"]
     GR --> IMG["multi-arch image<br/>ghcr.io/boogy/cloudtrail-rs:lambda-s3-1.2.3"]
     IMG --> FN["Lambda function<br/>PackageType: Image<br/>arch: arm64 | x86_64"]
     FN -.pulls matching arch.-> IMG

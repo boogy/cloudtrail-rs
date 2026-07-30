@@ -49,10 +49,17 @@ deployment, cli, development. The root [`README.md`](README.md) is the user-faci
    [`crates/lambda-sqs/CLAUDE.md`](crates/lambda-sqs/CLAUDE.md).
 6. **One version, and it equals the tag.** No crate carries its own `version` —
    all eight inherit `[workspace.package] version` via `version.workspace = true`.
-   Release = `make bump VERSION=x.y.z` → commit → `git tag vx.y.z`.
+   Release = `make bump VERSION=x.y.z` → commit on a branch → **merge the PR** →
+   `git checkout main && git pull && make tag` → `git push origin vx.y.z`.
    `make version-check` (release.yml's `setup` job, which gates every other
    job) fails the release if a crate breaks inheritance or the tag disagrees.
    The tag is what `crates/core/build.rs` bakes into the binaries.
+7. **Tags live on merged `main`, and every change arrives by PR.** GitHub builds
+   the release's "What's Changed" from the pull requests merged inside the tag's
+   commit range. A tag on an un-merged branch head has none in range and ships an
+   empty changelog (v0.2.0 did exactly this). `make tag` refuses to tag anywhere
+   but an up-to-date `main`; don't route around it with a bare `git tag`.
+   Work pushed straight to `main` also never appears — it has no PR to list.
 
 ## Build / test
 

@@ -116,7 +116,36 @@ bump: ## Set the workspace version and refresh Cargo.lock (make bump VERSION=1.2
 	' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
 	@$(CARGO) update --workspace --quiet
 	@$(MAKE) --no-print-directory version-check TAG=v$(VERSION)
-	@echo "next: git commit -am 'chore: release v$(VERSION)' && git tag v$(VERSION) && git push --follow-tags"
+	@echo "next: git commit -am 'release: v$(VERSION)' && git push -u origin HEAD"
+	@echo "      open a PR, get it merged, then: git checkout main && git pull && make tag"
+
+# Tagging happens on merged main, never on a branch. GitHub builds a release's
+# "What's Changed" from the pull requests merged inside the tag's commit range;
+# a tag sitting on an un-merged branch head has zero merged PRs in that range,
+# so the release ships with an empty changelog (this is what happened to v0.2.0,
+# tagged on fix/aws-config-ring-http-client before the squash-merge). Everything
+# below is that invariant made enforceable.
+.PHONY: tag
+tag: ## Tag merged main with the workspace version (refuses to tag anywhere else)
+	@set -eu; \
+	vers="$$($(CARGO) metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]' | head -1)"; \
+	branch="$$(git rev-parse --abbrev-ref HEAD)"; \
+	if [ "$$branch" != "main" ]; then \
+		echo "FAIL: on '$$branch' — release tags must sit on main, or the release"; \
+		echo "  notes come out empty. Merge the release PR, then:"; \
+		echo "    git checkout main && git pull && make tag"; exit 1; \
+	fi; \
+	if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "FAIL: working tree is dirty — commit or stash before tagging"; exit 1; \
+	fi; \
+	git fetch --quiet origin main; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
+		echo "FAIL: local main is not origin/main — run 'git pull' first"; exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory version-check TAG="v$$vers"; \
+	git tag "v$$vers"; \
+	echo "tagged v$$vers at $$(git rev-parse --short HEAD) on main"; \
+	echo "next: git push origin v$$vers"
 
 # ---- release ----------------------------------------------------------
 # The release pipeline lives entirely in .github/workflows/release.yml: native
