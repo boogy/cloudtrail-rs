@@ -61,6 +61,7 @@ make install-tools
 | `version`                         | Print the one workspace version.                                                   |
 | `version-check`                   | Fail if crates disagree, or if `TAG` != the workspace version (release gate).      |
 | `bump`                            | `make bump VERSION=1.2.3` — set the workspace version + refresh `Cargo.lock`.      |
+| `tag`                             | Tag merged `main` with the workspace version; refuses to tag off `main`.           |
 | `release-musl`                    | Local static-musl `dist`-profile build of the whole workspace for one target.      |
 | `validate`                        | Validate the example ruleset (prints always-bucket warnings).                      |
 | `sample`                          | Show KEEP/DROP breakdown for the sample fixture.                                   |
@@ -125,9 +126,14 @@ binary is built.
 ## Release process
 
 ```sh
+git switch -c release/v1.2.3
 make bump VERSION=1.2.3        # sets [workspace.package] version + Cargo.lock
-git commit -am "chore: release v1.2.3"
-git tag v1.2.3 && git push --follow-tags
+git commit -am "release: v1.2.3"
+git push -u origin HEAD        # open the PR, merge it
+
+git checkout main && git pull
+make tag                       # tags v1.2.3 on merged main
+git push origin v1.2.3
 ```
 
 `make bump` refuses non-semver input, runs `version-check` on the result, and
@@ -135,13 +141,33 @@ prints those next steps. Skipping it is not a silent mistake: the tag push fails
 in `setup`. The `Cargo.lock` refresh matters — release builds use
 `cargo build --locked`, which errors on a stale lockfile.
 
+### Why the PR and the `main` checkout are not optional
+
+GitHub generates the release's **"What's Changed"** section from the pull
+requests merged inside the tag's commit range (`generate_release_notes: true`,
+grouped by [`.github/release.yml`](../.github/release.yml)). Two things make that
+list come out empty, and both are procedural rather than configuration:
+
+- **Tagging a branch.** v0.2.0 was tagged on `fix/aws-config-ring-http-client`
+  before the squash-merge, so its range held eleven un-merged commits and zero
+  merged PRs. The release shipped with nothing but a Full Changelog link.
+- **Pushing straight to `main`.** A commit that never had a PR has nothing to
+  list, however good its message is.
+
+`make tag` enforces the first: it refuses to run off `main`, on a dirty tree, or
+when local `main` has drifted from `origin/main`. The second is a habit —
+everything lands by PR, and [`pr-label.yml`](../.github/workflows/pr-label.yml)
+labels each one from its conventional-commit title so it files under the right
+heading instead of "Other Changes".
+
 Everything after the tag is automated by
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub
 Actions, no goreleaser and no zig.
 
 ```mermaid
 flowchart TD
-    BUMP["make bump VERSION=1.2.3<br/>commit"] --> TAG["git tag v1.2.3<br/>git push --follow-tags"]
+    BUMP["make bump VERSION=1.2.3<br/>commit on a branch"] --> PR["release PR<br/>merged into main"]
+    PR --> TAG["make tag (on merged main)<br/>git push origin v1.2.3"]
     TAG --> GATE["setup job<br/>make version-check TAG=$GITHUB_REF_NAME<br/>(gates every job below)"]
     GATE --> B["build job (matrix)<br/>x86_64 + aarch64 native runners"]
     GATE --> BM["build-macos job<br/>aarch64-apple-darwin<br/>(native macOS runner)"]
