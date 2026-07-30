@@ -125,6 +125,12 @@ bump: ## Set the workspace version and refresh Cargo.lock (make bump VERSION=1.2
 # so the release ships with an empty changelog (this is what happened to v0.2.0,
 # tagged on fix/aws-config-ring-http-client before the squash-merge). Everything
 # below is that invariant made enforceable.
+#
+# The tag is signed (`git tag -s`), not lightweight: the repo's `tags` ruleset
+# has required_signatures active, and a bare `git tag` creates a ref with no tag
+# object and therefore nothing to sign. `-m` is mandatory too — signing forces an
+# annotated tag, and without a message `git tag` either opens an editor or dies
+# with "fatal: no tag message?" in any non-interactive run.
 .PHONY: tag
 tag: ## Tag merged main with the workspace version (refuses to tag anywhere else)
 	@set -eu; \
@@ -142,8 +148,12 @@ tag: ## Tag merged main with the workspace version (refuses to tag anywhere else
 	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
 		echo "FAIL: local main is not origin/main — run 'git pull' first"; exit 1; \
 	fi; \
+	if [ -z "$$(git config --get user.signingkey)" ]; then \
+		echo "FAIL: no user.signingkey configured — release tags must be signed"; \
+		echo "  the repo's 'tags' ruleset rejects an unsigned tag"; exit 1; \
+	fi; \
 	$(MAKE) --no-print-directory version-check TAG="v$$vers"; \
-	git tag "v$$vers"; \
+	git tag -s "v$$vers" -m "release v$$vers"; \
 	echo "tagged v$$vers at $$(git rev-parse --short HEAD) on main"; \
 	echo "next: git push origin v$$vers"
 
