@@ -9,7 +9,7 @@
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::config::rules::{REGEX_SIZE_LIMIT, RuleSet};
+use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
 use crate::filter::index::RuleIndex;
 use crate::filter::path::{Path, Segment, parse_path, visit_values};
@@ -94,25 +94,47 @@ impl Engine {
         for rule in rules.rules {
             let mut matches = Vec::with_capacity(rule.matches.len());
             for m in rule.matches {
-                let regex = RegexBuilder::new(&m.regex)
-                    .size_limit(REGEX_SIZE_LIMIT)
-                    .build()
-                    .map_err(|e| {
-                        ConfigError::Parse(format!(
-                            "rule {:?}: invalid regex {:?}: {e}",
-                            rule.name, m.regex
-                        ))
-                    })?;
-                let path = parse_path(&m.field_name).map_err(|e| {
+                let op = match m.op {
+                    MatchOp::Regex(pattern) => Op::Regex(
+                        RegexBuilder::new(&pattern)
+                            .size_limit(REGEX_SIZE_LIMIT)
+                            .build()
+                            .map_err(|e| {
+                                ConfigError::Parse(format!(
+                                    "rule {:?}: invalid regex {:?}: {e}",
+                                    rule.name, pattern
+                                ))
+                            })?,
+                    ),
+                    MatchOp::Equals(_) => {
+                        return Err(ConfigError::Parse(format!(
+                            "rule {:?}: field {:?}: operator \"equals\" not supported yet",
+                            rule.name, m.field
+                        )));
+                    }
+                    MatchOp::AnyOf(_) => {
+                        return Err(ConfigError::Parse(format!(
+                            "rule {:?}: field {:?}: operator \"any_of\" not supported yet",
+                            rule.name, m.field
+                        )));
+                    }
+                    MatchOp::Absent(_) => {
+                        return Err(ConfigError::Parse(format!(
+                            "rule {:?}: field {:?}: operator \"absent\" not supported yet",
+                            rule.name, m.field
+                        )));
+                    }
+                };
+                let path = parse_path(&m.field).map_err(|e| {
                     ConfigError::Parse(format!(
                         "rule {:?}: invalid field path {:?}: {e}",
-                        rule.name, m.field_name
+                        rule.name, m.field
                     ))
                 })?;
                 matches.push(CompiledMatch {
                     path,
-                    op: Op::Regex(regex),
-                    negate: false,
+                    op,
+                    negate: m.negate,
                 });
             }
             matches.sort_by_key(|m| match &m.op {
