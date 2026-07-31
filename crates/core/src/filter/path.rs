@@ -106,6 +106,46 @@ pub fn parse_path(s: &str) -> Result<Path, PathParseError> {
     Ok(Path { segments })
 }
 
+/// Call `f` with every scalar `path` resolves to against `v`, stopping at the
+/// first call that returns `true`. Returns whether any call returned `true`.
+///
+/// A wildcard-free path yields at most one value and is therefore exactly
+/// equivalent to `resolve` (enforced by test). A wildcard path is
+/// *existential*: the caller's predicate is satisfied if any element satisfies
+/// it. Scalar coercion is identical to `resolve` -- string as-is, bool and
+/// number stringified, null/object/array yield nothing -- so a missing or
+/// uncoercible field can never satisfy a condition.
+pub fn visit_values<'a>(
+    v: &'a Value,
+    path: &Path,
+    f: &mut impl FnMut(Cow<'a, str>) -> bool,
+) -> bool {
+    walk(v, &path.segments, f)
+}
+
+fn walk<'a>(
+    current: &'a Value,
+    segments: &[Segment],
+    f: &mut impl FnMut(Cow<'a, str>) -> bool,
+) -> bool {
+    let Some((segment, rest)) = segments.split_first() else {
+        return match current {
+            Value::String(s) => f(Cow::Borrowed(s.as_str())),
+            Value::Bool(b) => f(Cow::Owned(b.to_string())),
+            Value::Number(n) => f(Cow::Owned(n.to_string())),
+            Value::Null | Value::Object(_) | Value::Array(_) => false,
+        };
+    };
+    match (segment, current) {
+        (Segment::Key(k), Value::Object(map)) => map.get(k).is_some_and(|next| walk(next, rest, f)),
+        (Segment::Index(i), Value::Array(items)) => {
+            items.get(*i).is_some_and(|next| walk(next, rest, f))
+        }
+        (Segment::Wildcard, Value::Array(items)) => items.iter().any(|next| walk(next, rest, f)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +255,86 @@ mod tests {
             assert!(
                 parse_path(bad).is_err(),
                 "{bad:?} must be rejected, not silently accepted"
+            );
+        }
+    }
+
+    /// Collect every value a path resolves to, for assertions.
+    fn collect(v: &Value, path: &str) -> Vec<String> {
+        let parsed = parse_path(path).expect("test path must parse");
+        let mut out = Vec::new();
+        visit_values(v, &parsed, &mut |value| {
+            out.push(value.into_owned());
+            false // never short-circuit: collect them all
+        });
+        out
+    }
+
+    #[test]
+    fn visit_values_matches_resolve_for_wildcard_free_paths() {
+        let record = sample_record();
+        for path in [
+            "eventSource",
+            "userIdentity.type",
+            "userIdentity.sessionContext.sessionIssuer.arn",
+            "missingField",
+            "eventSource.notAnObject",
+        ] {
+            let via_resolve: Vec<String> = resolve(&record, path)
+                .map(|c| c.into_owned())
+                .into_iter()
+                .collect();
+            assert_eq!(collect(&record, path), via_resolve, "path {path:?}");
+        }
+    }
+
+    /// Spec finding F2: this is the case that is impossible today.
+    #[test]
+    fn visit_values_traverses_arrays() {
+        let record = json!({
+            "resources": [
+                { "ARN": "arn:aws:s3:::noisy-bucket", "type": "AWS::S3::Bucket" },
+                { "ARN": "arn:aws:s3:::other-bucket", "type": "AWS::S3::Bucket" }
+            ]
+        });
+        assert_eq!(
+            collect(&record, "resources[0].ARN"),
+            ["arn:aws:s3:::noisy-bucket"]
+        );
+        assert_eq!(
+            collect(&record, "resources[1].ARN"),
+            ["arn:aws:s3:::other-bucket"]
+        );
+        assert!(collect(&record, "resources[9].ARN").is_empty());
+        assert_eq!(
+            collect(&record, "resources[*].ARN"),
+            ["arn:aws:s3:::noisy-bucket", "arn:aws:s3:::other-bucket"]
+        );
+    }
+
+    #[test]
+    fn visit_values_short_circuits() {
+        let record = json!({ "resources": [{ "ARN": "a" }, { "ARN": "b" }] });
+        let parsed = parse_path("resources[*].ARN").unwrap();
+        let mut seen = 0usize;
+        let any = visit_values(&record, &parsed, &mut |_| {
+            seen += 1;
+            true // stop at the first value
+        });
+        assert!(any, "a matching value exists");
+        assert_eq!(seen, 1, "must stop at the first value that satisfies");
+    }
+
+    #[test]
+    fn visit_values_coerces_scalars_like_resolve() {
+        let record =
+            json!({ "readOnly": true, "count": 42, "nothing": null, "obj": {}, "arr": [] });
+        assert_eq!(collect(&record, "readOnly"), ["true"]);
+        assert_eq!(collect(&record, "count"), ["42"]);
+        for non_scalar in ["nothing", "obj", "arr"] {
+            assert!(
+                collect(&record, non_scalar).is_empty(),
+                "{non_scalar} is not a scalar"
             );
         }
     }
