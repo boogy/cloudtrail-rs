@@ -35,6 +35,77 @@ pub fn resolve<'a>(v: &'a Value, path: &str) -> Option<Cow<'a, str>> {
     }
 }
 
+/// One step in a parsed field path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    /// An object key: the `userIdentity` in `userIdentity.type`.
+    Key(String),
+    /// A fixed array index: the `[0]` in `resources[0].ARN`.
+    Index(usize),
+    /// Every element of an array: the `[*]` in `resources[*].ARN`.
+    Wildcard,
+}
+
+/// A parsed field path. Built once at config load, never per record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Path {
+    pub segments: Vec<Segment>,
+}
+
+/// Why a field path could not be parsed. Fatal at config load, like an
+/// uncompilable regex -- a malformed path must never silently become a
+/// literal key that simply never matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathParseError(pub String);
+
+impl std::fmt::Display for PathParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Parse a dot path with optional array subscripts:
+/// `resources[0].ARN`, `resources[*].ARN`, `userIdentity.sessionContext.sessionIssuer.arn`.
+///
+/// An empty path, an empty segment (`a..b`, `.a`, `a.`), an unclosed `[`, or a
+/// subscript that is neither `*` nor a non-negative integer is an error.
+pub fn parse_path(s: &str) -> Result<Path, PathParseError> {
+    if s.is_empty() {
+        return Err(PathParseError("empty field path".into()));
+    }
+    let mut segments = Vec::new();
+    for part in s.split('.') {
+        let (name, mut rest) = match part.find('[') {
+            Some(i) => part.split_at(i),
+            None => (part, ""),
+        };
+        if name.is_empty() {
+            return Err(PathParseError(format!("empty path segment in {s:?}")));
+        }
+        segments.push(Segment::Key(name.to_string()));
+        while !rest.is_empty() {
+            if !rest.starts_with('[') {
+                return Err(PathParseError(format!(
+                    "unexpected text {rest:?} after subscript in {s:?}"
+                )));
+            }
+            let close = rest
+                .find(']')
+                .ok_or_else(|| PathParseError(format!("unclosed '[' in {s:?}")))?;
+            let inner = &rest[1..close];
+            segments.push(if inner == "*" {
+                Segment::Wildcard
+            } else {
+                Segment::Index(inner.parse::<usize>().map_err(|_| {
+                    PathParseError(format!("invalid array subscript {inner:?} in {s:?}"))
+                })?)
+            });
+            rest = &rest[close + 1..];
+        }
+    }
+    Ok(Path { segments })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +161,61 @@ mod tests {
         match resolve(&record, "eventSource") {
             Some(Cow::Borrowed(s)) => assert_eq!(s, "kms.amazonaws.com"),
             other => panic!("expected Cow::Borrowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_object_and_array_segments() {
+        let cases: &[(&str, Vec<Segment>)] = &[
+            ("eventName", vec![Segment::Key("eventName".into())]),
+            (
+                "userIdentity.type",
+                vec![
+                    Segment::Key("userIdentity".into()),
+                    Segment::Key("type".into()),
+                ],
+            ),
+            (
+                "resources[0].ARN",
+                vec![
+                    Segment::Key("resources".into()),
+                    Segment::Index(0),
+                    Segment::Key("ARN".into()),
+                ],
+            ),
+            (
+                "resources[*].ARN",
+                vec![
+                    Segment::Key("resources".into()),
+                    Segment::Wildcard,
+                    Segment::Key("ARN".into()),
+                ],
+            ),
+            (
+                "a[0][1]",
+                vec![
+                    Segment::Key("a".into()),
+                    Segment::Index(0),
+                    Segment::Index(1),
+                ],
+            ),
+        ];
+        for (input, want) in cases {
+            let got = parse_path(input).unwrap_or_else(|e| panic!("{input:?} must parse: {e}"));
+            assert_eq!(&got.segments, want, "parsing {input:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_paths() {
+        for bad in [
+            "", "a.", ".a", "a[", "a[]", "a[x]", "a[-1]", "a..b", "a[0]y*]", "a[0]y5]", "a[0]x",
+            "a[0]5]",
+        ] {
+            assert!(
+                parse_path(bad).is_err(),
+                "{bad:?} must be rejected, not silently accepted"
+            );
         }
     }
 }
