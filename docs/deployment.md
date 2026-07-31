@@ -40,6 +40,12 @@ flowchart LR
 Build one binary at a time; the feature is additive but only one decoder is ever
 wired into a given binary's `main`.
 
+The S3/SNS/SQS decoders skip any notification record whose `eventName` is not
+an `ObjectCreated:*` event (e.g. `ObjectRemoved:*`, `LifecycleExpiration:*`),
+so a notification configuration is not required to be scoped to
+`s3:ObjectCreated:*` — but scoping it that way still avoids invoking the
+Lambda at all for events it will only decode and discard.
+
 ## Build: Lambda zip
 
 ```sh

@@ -43,6 +43,12 @@ jobs:
       # decoder code. Cheap — `cargo tree` resolves the graph, builds nothing.
       - name: One decoder per binary
         run: make tree-features
+      # The hexagonal boundary (root CLAUDE.md invariant 1): core reaches AWS
+      # only through the ports in crates/core/src/ports.rs. deny.toml bans
+      # crate *names*, which cannot express "not from this crate" — so the
+      # boundary itself had no enforcement. Also cheap: resolves, builds nothing.
+      - name: Core has zero AWS dependencies
+        run: make core-no-aws
 
   # Unit + MiniStack tests share one instrumented job so BOTH count toward
   # coverage. Two `--no-report` passes accumulate profile data that a final
@@ -135,10 +141,23 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --workspace --release --exclude cloudtrail-rs-testkit --target ${{ matrix.target }}
 
+  # Split by what the check depends on, because a blanket job-level
+  # `continue-on-error: true` made ALL of this advisory — including the
+  # cargo-deny `bans` check that is the third enforcement layer for the
+  # ring-not-aws-lc-rs decision (root CLAUDE.md invariant 4). A layer that
+  # cannot fail a build is not a layer.
+  #
+  #   blocking — deterministic given Cargo.lock: bans (the ring ban,
+  #     wildcards), licenses, sources. These only change when a dependency
+  #     changes, so they can never break an unrelated PR.
+  #   advisory — backed by an external DB that updates without a code change
+  #     (RUSTSEC, the yanked-crate index, Trivy's vuln feed). Blocking on
+  #     these means a new CVE disclosed overnight fails every open PR, which
+  #     is what motivated the original blanket escape hatch. They still run,
+  #     still annotate, and `make deny` runs the full set locally.
   security:
     name: Security
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -151,11 +170,18 @@ jobs:
         uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2.85.4
         with:
           tool: cargo-audit,cargo-deny
+      # Blocking. Enforces the aws-lc-rs/aws-lc-sys/openssl-sys bans, the
+      # wildcard ban, the license allow-list and the registry allow-list.
+      - name: cargo deny (bans, licenses, sources)
+        run: cargo deny check bans licenses sources
+      - name: cargo deny (advisories)
+        continue-on-error: true
+        run: cargo deny check advisories
       - name: cargo audit
+        continue-on-error: true
         run: cargo audit
-      - name: cargo deny
-        run: cargo deny check
       - name: Trivy filesystem scan
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs

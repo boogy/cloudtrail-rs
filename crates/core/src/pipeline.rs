@@ -392,11 +392,14 @@ impl Pipeline {
         };
 
         let limit = self.settings.processing.max_object_bytes;
-        // `limit + 1` so exceeding the cap is detectable without ever holding
-        // more than one byte past it.
+        // `limit.saturating_add(1)` so exceeding the cap is detectable
+        // without ever holding more than one byte past it. Saturating, not
+        // wrapping: at `limit == u64::MAX` (an operator's "no cap"), `+ 1`
+        // would wrap to 0 and `take(0)` would read nothing instead of
+        // everything.
         let mut buf = Vec::new();
         reader
-            .take(limit + 1)
+            .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .await
             .map_err(|e| {
@@ -2496,6 +2499,52 @@ rules:
         );
         assert_eq!(snapshots[0].objects_processed, 1);
         assert_eq!(snapshots[0].objects_failed, 0);
+    }
+
+    /// `max_object_bytes = u64::MAX` is an operator's "no cap". The capped
+    /// fetch computes `limit.saturating_add(1)` for the `take()` length; a
+    /// plain `limit + 1` wraps to 0 and turns "no cap" into "read nothing",
+    /// failing every object. Guards the fetch-side site in
+    /// `fetch_with_missing_policy`.
+    #[tokio::test]
+    async fn max_object_bytes_at_u64_max_does_not_wrap_the_capped_fetch() {
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin", "Decrypt"]));
+        store.seed("src-bucket", "file.json.gz", body);
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(drop_decrypt_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.processing.mode = ProcessingMode::Buffer;
+        settings.processing.max_object_bytes = u64::MAX;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink,
+        );
+
+        pipeline
+            .handle(b"{}")
+            .await
+            .expect("u64::MAX must mean no cap, not take(0)");
+        let written = store
+            .object("dest-bucket", "file.json.gz")
+            .expect("the object must be written, not rejected as too large");
+        assert_eq!(
+            gunzip(&written),
+            cloudtrail_body(&["ConsoleLogin"]),
+            "the ruleset must still apply normally under an uncapped fetch"
+        );
     }
 
     /// The fail-open passthrough is reached precisely when the rules
