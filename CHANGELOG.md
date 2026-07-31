@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-31
+
+Round five: a full-codebase review rather than a diff review, run across
+parallel reviewers and then re-verified finding by finding against the source.
+Ten candidate findings went in; four were refuted outright (an SNS sibling-loss
+claim that turns out to be a _visible_ failure and arguably correct as written,
+a retryable/permanent error split with no consumer, a missing-timeout claim
+where the SDK defaults do in fact apply, and a test-coverage gap whose fix would
+have restructured a composition root for no behavioral gain), one was
+downgraded, and the rest are below. Every fix here carries a test that was
+proven to fail without it.
+
 ### Changed
 
+- **The S3/SNS/SQS decoders now skip notification records that are not
+  `ObjectCreated:*`.** `S3RecordEnvelope` carried no `eventName`, and
+  `S3Object.size` is optional, so an `ObjectRemoved:*` notification
+  deserialized cleanly and became a `GetObject` for a key that had just been
+  deleted — a `NotFound`, which `behavior.on_missing_object` turns into a hard
+  failure by default. A bulk delete or a lifecycle expiry on the source bucket
+  therefore became a storm of invocation failures. The `EventBridge` decoder
+  already gated on `detail-type`; the other three now match it. The gate is
+  deliberately conservative: a record whose `eventName` is **absent** is still
+  kept, because treating a missing field as "drop" would reintroduce exactly
+  the silent-loss shape that `S3Notification::records` was made non-defaulting
+  to prevent. Both the bare (`ObjectCreated:Put`) and `s3:`-prefixed spellings
+  are recognised. Scoping the bucket notification to `s3:ObjectCreated:*` is no
+  longer required for correctness, but still avoids the wasted invocation.
+- **CI's `security` job is no longer advisory in its entirety.** A job-level
+  `continue-on-error: true` made every check in it non-blocking — including
+  cargo-deny's `bans` check, which is the third of the three enforcement layers
+  the `ring`-not-`aws-lc-rs` decision claims to stand on. A layer that cannot
+  fail a build is not a layer. The job is now split by what each check depends
+  on: `cargo deny check bans licenses sources` is **blocking**, because it is
+  fully determined by `Cargo.lock` and so can never break an unrelated PR;
+  `cargo deny check advisories`, `cargo audit` and the Trivy scan stay advisory
+  per-step, because they are backed by external databases that update without
+  any change to this repository — blocking on those would let an overnight CVE
+  disclosure fail every open PR, which is the pressure that produced the
+  blanket flag in the first place. `make deny` still runs the full set locally.
 - **Releases are tagged on merged `main`, via `make tag`.** The GitHub Release
   already asked for auto-generated notes (`generate_release_notes: true` plus
   the categories in `.github/release.yml`), but v0.2.0 shipped with an empty
@@ -20,6 +58,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.github/workflows/pr-label.yml` labels each PR from its conventional-commit
   title prefix (`fix:`, `feat:`, `docs:`, `ci:`, `build:`), so it files under
   the right release-notes heading instead of "Other Changes".
+
+### Added
+
+- `make core-no-aws`, wired into CI's lint job: proves `cloudtrail-rs-core` has
+  zero AWS dependencies. The hexagonal boundary is the first cross-cutting
+  invariant in `CLAUDE.md`, and it was the one with no enforcement behind it —
+  `deny.toml` can ban crate _names_, but it cannot express "not reachable from
+  this crate". Like `make tree-features` it only resolves the dependency graph
+  and builds nothing.
+
+### Fixed
+
+- **A failed `CompleteMultipartUpload` left every uploaded part orphaned in
+  S3.** `put_stream` states directly above the call that any failure past that
+  point must abort the upload so no billable orphan parts remain, and the
+  error arm honoured it — but the success arm reached `CompleteMultipartUpload`
+  through `?`, so a transient 5xx or throttle there returned early with no
+  abort. The parts stay billed indefinitely and are invisible to `ListObjects`,
+  so nothing surfaces them. Both failure sources now flow through a single
+  abort call site; the abort stays best-effort and the caller still sees the
+  original error.
+- **`max_object_bytes` set to `u64::MAX` disabled processing instead of
+  disabling the cap.** Both the buffered and streaming read paths computed
+  `max_object_bytes + 1` to make an over-cap object detectable without holding
+  more than one byte past it. `overflow-checks` is set in neither the `release`
+  nor the `dist` profile, so at `u64::MAX` that addition wrapped silently to
+  `0` and `take(0)` made every object read zero bytes — failing as a gzip or
+  JSON error rather than `ObjectTooLarge`, which in turn meant `mode: auto`
+  never fell back to streaming, because that fallback triggers on
+  `ObjectTooLarge` alone. Both sites now use `saturating_add(1)`, which leaves
+  the cap unsatisfiable at `u64::MAX` — that is, disabled, which is what
+  setting it there was meant to express.
+
+### Security
+
+- **The CLI's `filter` batch mode could write outside the destination
+  directory.** With an S3 source and a local destination, the relative key was
+  derived by a plain `strip_prefix` on the object key and then handed to
+  `Path::join`, and `LocalObjectStore::put` creates parent directories before
+  writing. Neither `..` components nor absolute paths were rejected, and the
+  default `include_key_regex` (`\.json\.gz$`) does not exclude them, so an
+  object key controlled by anyone with `s3:PutObject` on the source bucket
+  could place a file anywhere the operator running the backfill could write.
+  The absolute-path variant needs no `..` at all: a **doubled slash** in the
+  key survives the prefix strip as an absolute path, and `Path::join` discards
+  its receiver entirely when given one. The fix whitelists
+  `std::path::Component::Normal` rather than blacklisting `..`, so both
+  variants — and `.`, and Windows prefixes — are rejected by one check. An
+  unsafe key fails that object like any other failure: the batch continues, the
+  summary still prints, and the exit code is non-zero. The S3-destination path
+  is untouched, since `..` in an S3 key is a literal key character and not
+  traversal. Lambda deployments were never affected — they write through
+  `S3ObjectStore` and never touch a filesystem.
 
 ## [0.3.0] - 2026-07-28
 
@@ -348,7 +439,8 @@ processing.stream_threshold_bytes`; `processing.multipart_part_bytes` must
   GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.1.0...v0.1.1

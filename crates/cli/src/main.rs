@@ -28,7 +28,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -611,11 +611,49 @@ enum ObjectOutcome {
     DryRun,
 }
 
+/// Rejects a relative key that would escape the destination root once
+/// joined to it, and returns the safe, root-relative `PathBuf` otherwise.
+///
+/// `rel` may come from an S3 key (`enumerate`'s `Location::S3` branch: a
+/// naive `strip_prefix` of an attacker-controlled key, reachable by anyone
+/// with `s3:PutObject` on the source bucket) or a local directory walk. Two
+/// escapes matter, and only a per-component check catches both:
+/// - `..` components (`Component::ParentDir`) walk back out of the root.
+/// - A `rel` that is itself absolute (`Component::RootDir`) — e.g. an S3 key
+///   `logs//etc/cron.d/x.json.gz` strips its `logs/` prefix down to
+///   `/etc/cron.d/x.json.gz` because of the doubled slash — is worse:
+///   `Path::join` with an absolute path *discards* the base entirely, so the
+///   write lands at the absolute path with no root prefix at all. Rust's
+///   component parser collapses any run of leading slashes (one or many)
+///   into a single `RootDir`, so this same check catches the doubled-slash
+///   case without separately normalizing empty segments.
+///
+/// Requiring every component to be `Component::Normal` rejects both in one
+/// pass, plus `.` (`CurDir`) and a Windows drive prefix, rather than
+/// hand-rolling a string check for `".."` that would miss the absolute case.
+fn contain_rel(rel: &str) -> anyhow::Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in Path::new(rel).components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            _ => anyhow::bail!("unsafe relative key {rel:?}: escapes the destination root"),
+        }
+    }
+    Ok(safe)
+}
+
 /// The batch destination key for a source object's relative key.
-fn batch_dest_key(dst: &Location, rel: &str) -> String {
+///
+/// Only the local-destination case needs the [`contain_rel`] containment
+/// check: `join_key`'s `..` in an S3 key is a literal key-name character,
+/// never traversal, so the S3 branch is untouched.
+fn batch_dest_key(dst: &Location, rel: &str) -> anyhow::Result<String> {
     match dst {
-        Location::Local(root) => root.join(rel).to_string_lossy().into_owned(),
-        Location::S3 { prefix, .. } => join_key(prefix, rel),
+        Location::Local(root) => {
+            let safe_rel = contain_rel(rel)?;
+            Ok(root.join(safe_rel).to_string_lossy().into_owned())
+        }
+        Location::S3 { prefix, .. } => Ok(join_key(prefix, rel)),
     }
 }
 
@@ -1016,7 +1054,7 @@ async fn cmd_filter(
 
     for obj in &objects {
         let dst_key = match &single_dst {
-            Some(key) => key.clone(),
+            Some(key) => Ok(key.clone()),
             None => batch_dest_key(&f.dst, &obj.rel),
         };
         // The single-file path has no relative key; name the object by what
@@ -1027,7 +1065,15 @@ async fn cmd_filter(
             obj.rel.as_str()
         };
 
-        match f.process(&obj.fetch, &dst_key, obj.size).await {
+        // An unsafe `rel` fails this object exactly like any other error: it
+        // never stops the batch (see the module doc above `failures`), it is
+        // never a silent skip, and it still drives the non-zero exit code.
+        let outcome = match dst_key {
+            Ok(dst_key) => f.process(&obj.fetch, &dst_key, obj.size).await,
+            Err(e) => Err(e),
+        };
+
+        match outcome {
             Ok(ObjectOutcome::Written(at)) => {
                 written += 1;
                 println!("  {label} -> {at}");
@@ -1161,4 +1207,62 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `..`-laden `rel` (the shape a crafted local source or a naive S3
+    /// key relativization could produce) must be rejected, not silently
+    /// escape `root` via `Path::join`.
+    #[test]
+    fn batch_dest_key_rejects_parent_dir_escape() {
+        let root = Location::Local(PathBuf::from("./out"));
+        let rel = "../../../../tmp/evil.json.gz";
+        let err = batch_dest_key(&root, rel).expect_err("must reject `..` escape");
+        assert!(
+            err.to_string().contains("escapes the destination root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The more severe escape: no `..` at all, just a `rel` that is itself
+    /// absolute. Built through the exact derivation `enumerate`'s
+    /// `Location::S3` branch uses (`dir_prefix` then `strip_prefix` on the
+    /// listed key) rather than constructing an absolute `rel` by hand, so
+    /// this proves the real path — a doubled slash in an S3 key survives
+    /// the strip as a leading `/`, and `PathBuf::join` with an absolute
+    /// path discards `root` entirely.
+    #[test]
+    fn batch_dest_key_rejects_absolute_escape_via_doubled_slash() {
+        let prefix = "logs/";
+        let key = "logs//etc/passwd.json.gz";
+        let dir = dir_prefix(prefix);
+        let rel = key.strip_prefix(dir.as_str()).unwrap_or(key).to_string();
+        assert_eq!(
+            rel, "/etc/passwd.json.gz",
+            "derivation changed unexpectedly"
+        );
+
+        let root = Location::Local(PathBuf::from("./out"));
+        let err = batch_dest_key(&root, &rel).expect_err("must reject absolute escape");
+        assert!(
+            err.to_string().contains("escapes the destination root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A normal nested relative key is unaffected: it still maps under
+    /// `root` exactly as before the containment check.
+    #[test]
+    fn batch_dest_key_accepts_normal_nested_key() {
+        let root = Location::Local(PathBuf::from("./out"));
+        let dst = batch_dest_key(&root, "normal/a/b.json.gz").expect("normal key must be accepted");
+        let expected = PathBuf::from("./out")
+            .join("normal/a/b.json.gz")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(dst, expected);
+    }
 }

@@ -68,6 +68,12 @@ struct S3Notification {
 
 #[derive(Debug, Deserialize)]
 struct S3RecordEnvelope {
+    /// Optional on purpose — see [`is_object_created`]. AWS's own sample
+    /// payloads (and every fixture in this repo) carry this field, but the
+    /// conservative default when it is missing is to *keep* the record, not
+    /// drop it.
+    #[serde(rename = "eventName")]
+    event_name: Option<String>,
     s3: S3Detail,
 }
 
@@ -107,6 +113,15 @@ struct S3Object {
 /// objects in it, so it decodes to an empty `Vec` rather than an `Err`. Any
 /// *other* payload lacking a `Records` array is an `Err` — see the field
 /// docs on `S3Notification::records`.
+///
+/// A bucket notification configuration is not required to be scoped to
+/// `s3:ObjectCreated:*` — an operator can (and, for lifecycle/replication
+/// visibility, sometimes must) also subscribe to `s3:ObjectRemoved:*`,
+/// `s3:LifecycleExpiration:*`, etc. Every such record is skipped here: this
+/// pipeline only ever has something to fetch and re-pack when an object was
+/// just written, and a delete/expiry record names a key that is now gone —
+/// fetching it would 404 and, under the default `on_missing_object = error`,
+/// turn a routine delete into a hard failure. See `is_object_created`.
 pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<ObjectRef>, DecodeError> {
     let value: serde_json::Value =
         serde_json::from_slice(payload).map_err(|e| DecodeError::InvalidPayload(e.to_string()))?;
@@ -121,6 +136,21 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<ObjectRef>, De
     notification
         .records
         .into_iter()
+        .filter(|r| {
+            let keep = is_object_created(r.event_name.as_deref());
+            if !keep {
+                // Cheap and already-wired: `tracing` is a core dependency and
+                // pipeline.rs already logs this way. No new plumbing needed
+                // for what should be a rare, benign, operator-visible skip.
+                tracing::debug!(
+                    event_name = r.event_name.as_deref(),
+                    bucket = %r.s3.bucket.name,
+                    key = %r.s3.object.key,
+                    "skipping non-ObjectCreated S3 notification record"
+                );
+            }
+            keep
+        })
         .map(|r| {
             Ok(ObjectRef {
                 bucket: r.s3.bucket.name,
@@ -129,6 +159,28 @@ pub(crate) fn parse_s3_notification(payload: &[u8]) -> Result<Vec<ObjectRef>, De
             })
         })
         .collect()
+}
+
+/// True when `event_name` names an object-creation event
+/// (`ObjectCreated:Put`, `ObjectCreated:Post`, `ObjectCreated:Copy`,
+/// `ObjectCreated:CompleteMultipartUpload`, ...). Tolerates an `s3:` prefix
+/// (AWS's *Supported Event Types* documentation lists names that way, even
+/// though every fixture in this repo — sourced from AWS's own walkthrough
+/// payloads — carries the bare form, e.g. `"ObjectCreated:Put"`).
+///
+/// `None` (the field absent from the JSON entirely) returns `true` — the
+/// conservative default. This must never flip: a payload shape where AWS
+/// stops sending `eventName`, or a hand-written fixture that omits it, would
+/// otherwise silently drop every object, which is exactly the silent-loss
+/// outcome `S3Notification::records` (above) is designed to make impossible.
+fn is_object_created(event_name: Option<&str>) -> bool {
+    match event_name {
+        None => true,
+        Some(name) => name
+            .strip_prefix("s3:")
+            .unwrap_or(name)
+            .starts_with("ObjectCreated:"),
+    }
 }
 
 /// Wraps a notification's objects as the single ack-less `SourceItem` the
@@ -207,6 +259,86 @@ mod tests {
         assert_eq!(
             items[0].objects[2].bucket, "bucket-b",
             "per-entry bucket must not be taken from the first entry"
+        );
+    }
+
+    /// A bucket notification configuration scoped wider than
+    /// `ObjectCreated:*` (e.g. also `ObjectRemoved:*`) must not turn every
+    /// delete into a fetch-then-404. See `is_object_created`.
+    #[test]
+    fn object_removed_record_is_skipped() {
+        const REMOVED: &[u8] = br#"{"Records":[
+          {"eventName":"ObjectRemoved:Delete","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"gone.json.gz"}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(REMOVED).unwrap();
+        assert!(
+            items.is_empty(),
+            "an all-removed notification must decode to zero objects, not an error"
+        );
+    }
+
+    /// A prefixed `s3:ObjectRemoved:*` form (as AWS's *Supported Event
+    /// Types* docs list them) must be recognized too, not just the bare
+    /// form the fixtures happen to use.
+    #[test]
+    fn s3_prefixed_object_removed_record_is_skipped() {
+        const REMOVED: &[u8] = br#"{"Records":[
+          {"eventName":"s3:ObjectRemoved:Delete","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"gone.json.gz"}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(REMOVED).unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// A mixed batch — the realistic shape when a notification config
+    /// covers both `ObjectCreated:*` and `ObjectRemoved:*` — must keep only
+    /// the created entry.
+    #[test]
+    fn mixed_created_and_removed_keeps_only_the_created_object() {
+        const MIXED: &[u8] = br#"{"Records":[
+          {"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"kept.json.gz","size":11}}},
+          {"eventName":"ObjectRemoved:Delete","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"gone.json.gz"}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(MIXED).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].objects.len(), 1);
+        assert_eq!(items[0].objects[0].key, "kept.json.gz");
+    }
+
+    /// The conservative default this fix must never break: an `eventName`
+    /// field that is simply absent from the record is NOT treated as
+    /// "not created" — it is kept. Dropping on absence would be a silent
+    /// data-loss regression the moment AWS omits the field or a payload
+    /// shape we haven't seen lacks it.
+    #[test]
+    fn record_with_no_event_name_field_is_kept() {
+        const NO_EVENT_NAME: &[u8] = br#"{"Records":[
+          {"s3":{"bucket":{"name":"bucket-a"},"object":{"key":"no-event-name.json.gz","size":5}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(NO_EVENT_NAME).unwrap();
+        assert_eq!(items.len(), 1, "absent eventName must not be dropped");
+        assert_eq!(items[0].objects[0].key, "no-event-name.json.gz");
+    }
+
+    /// An all-removed notification must produce zero `SourceItem`s (not one
+    /// item with an empty object list) — the same shape `s3:TestEvent`
+    /// already produces, so it must not register as
+    /// `items_without_objects` downstream. See `as_source_item`.
+    #[test]
+    fn all_removed_notification_decodes_to_zero_source_items() {
+        const ALL_REMOVED: &[u8] = br#"{"Records":[
+          {"eventName":"ObjectRemoved:Delete","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"one.json.gz"}}},
+          {"eventName":"ObjectRemoved:Delete","s3":{"bucket":{"name":"bucket-a"},"object":{"key":"two.json.gz"}}}
+        ]}"#;
+
+        let items = S3EventDecoder::new().decode(ALL_REMOVED).unwrap();
+        assert_eq!(
+            items.len(),
+            0,
+            "an all-removed notification must yield no SourceItem at all"
         );
     }
 

@@ -234,3 +234,17 @@ tree-features: ## Prove each lambda binary pulls in exactly one decode-* feature
 	done; \
 	if [ "$$fail" != "0" ]; then exit 1; fi; \
 	echo "ok: each lambda pulls in exactly one decoder"
+
+.PHONY: core-no-aws
+core-no-aws: ## Prove crates/core has zero AWS dependencies (hexagonal boundary)
+	@set -eu; \
+	tree="$$($(CARGO) tree -p cloudtrail-rs-core -e normal --all-features)"; \
+	hits="$$(printf '%s\n' "$$tree" | grep -iE '(^|[^a-z])aws[-_]|smithy' || true)"; \
+	if [ -n "$$hits" ]; then \
+		echo "FAIL: cloudtrail-rs-core depends on AWS crates — the hexagonal"; \
+		echo "boundary (root CLAUDE.md invariant 1) says core reaches AWS only"; \
+		echo "through the ports in crates/core/src/ports.rs. Move this to crates/aws."; \
+		printf '%s\n' "$$hits"; \
+		exit 1; \
+	fi; \
+	echo "ok: cloudtrail-rs-core has zero AWS dependencies"

@@ -49,11 +49,14 @@ struct Envelope<'a> {
 
 /// Decompress `input` with `MultiGzDecoder` (never `GzDecoder`: concatenated
 /// gzip members are otherwise silently truncated at the first member), never
-/// buffering more than `max_object_bytes + 1` bytes so an oversized or
-/// bomb-like object fails fast with `Err` instead of exhausting memory.
+/// buffering more than `max_object_bytes.saturating_add(1)` bytes so an
+/// oversized or bomb-like object fails fast with `Err` instead of exhausting
+/// memory. Saturating (not wrapping) matters at `max_object_bytes ==
+/// u64::MAX`: that's an operator's "no cap", and it must read everything —
+/// `+ 1` would wrap to 0 and turn "no cap" into "read nothing".
 fn decompress_capped(input: &[u8], max_object_bytes: u64) -> Result<Vec<u8>, CoreError> {
     let decoder = MultiGzDecoder::new(input);
-    let mut limited = decoder.take(max_object_bytes + 1);
+    let mut limited = decoder.take(max_object_bytes.saturating_add(1));
     let mut buf = Vec::new();
     limited
         .read_to_end(&mut buf)
@@ -263,6 +266,30 @@ rules:
         assert!(
             matches!(err, CoreError::ObjectTooLarge { limit: 100 }),
             "expected ObjectTooLarge {{ limit: 100 }}, got {err:?}"
+        );
+    }
+
+    /// `max_object_bytes = u64::MAX` is an operator's "no cap". Before the
+    /// `saturating_add` fix, `decompress_capped` computed `max_object_bytes +
+    /// 1`, which wraps to 0 at `u64::MAX`, making `.take(0)` read nothing and
+    /// turning "no cap" into "every object fails to decompress".
+    #[test]
+    fn max_object_bytes_at_u64_max_reads_the_full_body_not_zero() {
+        let body = br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#;
+        let input = gzip_bytes(body);
+
+        let cfg = Processing {
+            max_object_bytes: u64::MAX,
+            ..Processing::default()
+        };
+
+        let (outcome, _tally) = buffer_run(&input, &no_op_engine(), &cfg)
+            .expect("u64::MAX must mean no cap, not a Gzip/Json error from reading 0 bytes");
+        let bytes = written_bytes(outcome);
+        assert_eq!(
+            kept_event_names(&bytes),
+            vec!["ConsoleLogin".to_string()],
+            "the full decompressed body must survive under an uncapped read"
         );
     }
 

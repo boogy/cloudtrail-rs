@@ -806,7 +806,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudtrail-rs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-aws"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-lambda-eventbridge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-lambda-s3"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-lambda-sns"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-lambda-sqs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "cloudtrail-rs-testkit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",

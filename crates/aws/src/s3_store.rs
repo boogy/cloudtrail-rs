@@ -200,38 +200,41 @@ impl ObjectStore for S3ObjectStore {
         })?;
 
         // Any failure past this point — including one surfaced by `body`
-        // itself — must abort the upload so no billable orphan parts remain.
-        match self.upload_parts(b, k, upload_id, body.as_mut()).await {
-            Ok(parts) => {
-                self.client
-                    .complete_multipart_upload()
-                    .bucket(b)
-                    .key(k)
-                    .upload_id(upload_id)
-                    .multipart_upload(
-                        CompletedMultipartUpload::builder()
-                            .set_parts(Some(parts))
-                            .build(),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| StoreError::Backend(format!("{}", DisplayErrorContext(e))))?;
-                Ok(())
-            }
-            Err(e) => {
-                // Best-effort: the original error is what the caller sees
-                // regardless of whether the abort call itself succeeds.
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(b)
-                    .key(k)
-                    .upload_id(upload_id)
-                    .send()
-                    .await;
-                Err(e)
-            }
+        // itself, or by CompleteMultipartUpload — must abort the upload so
+        // no billable orphan parts remain.
+        let result = match self.upload_parts(b, k, upload_id, body.as_mut()).await {
+            Ok(parts) => self
+                .client
+                .complete_multipart_upload()
+                .bucket(b)
+                .key(k)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| StoreError::Backend(format!("{}", DisplayErrorContext(e)))),
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = result {
+            // Best-effort: the original error is what the caller sees
+            // regardless of whether the abort call itself succeeds.
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(b)
+                .key(k)
+                .upload_id(upload_id)
+                .send()
+                .await;
+            return Err(e);
         }
+        Ok(())
     }
 }
 
@@ -631,6 +634,57 @@ mod tests {
         let err = store.put_stream("b", "k", body, meta).await.unwrap_err();
 
         assert!(matches!(err, StoreError::Backend(_)));
+        assert_eq!(abort_rule.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_stream_aborts_multipart_upload_on_complete_error() {
+        use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+        use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
+        use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+        use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+        use aws_smithy_types::error::ErrorMetadata;
+
+        let create_rule = mock!(Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("up1")
+                .build()
+        });
+        let part1 = mock!(Client::upload_part)
+            .match_requests(|r| r.upload_id() == Some("up1") && r.part_number() == Some(1))
+            .then_output(|| UploadPartOutput::builder().e_tag("etag-1").build());
+        let complete_rule = mock!(Client::complete_multipart_upload)
+            .match_requests(|r| r.upload_id() == Some("up1"))
+            .then_error(|| {
+                CompleteMultipartUploadError::generic(
+                    ErrorMetadata::builder()
+                        .code("InternalError")
+                        .message("simulated CompleteMultipartUpload failure")
+                        .build(),
+                )
+            });
+        let abort_rule = mock!(Client::abort_multipart_upload)
+            .match_requests(|r| {
+                r.bucket() == Some("b") && r.key() == Some("k") && r.upload_id() == Some("up1")
+            })
+            .then_output(|| AbortMultipartUploadOutput::builder().build());
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&create_rule, &part1, &complete_rule, &abort_rule]
+        );
+        let store = S3ObjectStore::from_client(client).with_multipart_part_bytes(4);
+        let meta = PutMeta {
+            content_type: "application/x-gzip",
+            content_encoding: "gzip",
+        };
+        let body = Box::new(BytesReader::new(*b"abcd"));
+
+        let err = store.put_stream("b", "k", body, meta).await.unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::Backend(msg) if msg.contains("simulated CompleteMultipartUpload failure"))
+        );
         assert_eq!(abort_rule.num_calls(), 1);
     }
 }
