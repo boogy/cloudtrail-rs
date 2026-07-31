@@ -27,7 +27,6 @@ pub enum Decision {
 }
 
 /// What a condition tests once its path has been resolved.
-#[allow(dead_code)] // T07 constructs Equals/AnyOf/Absent and non-false negate.
 enum Op {
     /// The v1 operator, and still the general escape hatch.
     Regex(Regex),
@@ -106,24 +105,9 @@ impl Engine {
                                 ))
                             })?,
                     ),
-                    MatchOp::Equals(_) => {
-                        return Err(ConfigError::Parse(format!(
-                            "rule {:?}: field {:?}: operator \"equals\" not supported yet",
-                            rule.name, m.field
-                        )));
-                    }
-                    MatchOp::AnyOf(_) => {
-                        return Err(ConfigError::Parse(format!(
-                            "rule {:?}: field {:?}: operator \"any_of\" not supported yet",
-                            rule.name, m.field
-                        )));
-                    }
-                    MatchOp::Absent(_) => {
-                        return Err(ConfigError::Parse(format!(
-                            "rule {:?}: field {:?}: operator \"absent\" not supported yet",
-                            rule.name, m.field
-                        )));
-                    }
+                    MatchOp::Equals(s) => Op::Equals(s),
+                    MatchOp::AnyOf(v) => Op::AnyOf(v.into_iter().collect()),
+                    MatchOp::Absent(b) => Op::Absent(b),
                 };
                 let path = parse_path(&m.field).map_err(|e| {
                     ConfigError::Parse(format!(
@@ -544,6 +528,127 @@ rules:
             }
         }
         records
+    }
+
+    /// Spec finding F1: the shipped v1 rule "Automated Tool Describe
+    /// Operations" does the exact opposite of its name, because `errorCode`
+    /// being absent is inexpressible in v1.
+    #[test]
+    fn absent_operator_separates_noise_from_signal() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Automated Tool Describe Operations
+    matches:
+      - field: eventName
+        regex: "^Describe"
+      - field: userAgent
+        regex: "^aws-cli"
+      - field: errorCode
+        absent: true
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+
+        let successful = json!({
+            "eventName": "DescribeInstances",
+            "userAgent": "aws-cli/2.15.0",
+        });
+        let denied = json!({
+            "eventName": "DescribeInstances",
+            "userAgent": "aws-cli/2.15.0",
+            "errorCode": "AccessDenied",
+        });
+
+        assert_eq!(
+            engine.evaluate(&successful),
+            Decision::Drop { rule_idx: 0 },
+            "a successful automated Describe is noise and must be dropped"
+        );
+        assert_eq!(
+            engine.evaluate(&denied),
+            Decision::Keep,
+            "an AccessDenied Describe is a security signal and must be kept"
+        );
+    }
+
+    #[test]
+    fn equals_and_any_of_operators() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Literals
+    matches:
+      - field: readOnly
+        equals: "true"
+      - field: eventSource
+        any_of: ["kms.amazonaws.com", "ec2.amazonaws.com"]
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+        assert_eq!(
+            engine.evaluate(&json!({"readOnly": true, "eventSource": "kms.amazonaws.com"})),
+            Decision::Drop { rule_idx: 0 }
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"readOnly": true, "eventSource": "s3.amazonaws.com"})),
+            Decision::Keep,
+            "eventSource outside the any_of set must not match"
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"readOnly": false, "eventSource": "kms.amazonaws.com"})),
+            Decision::Keep,
+            "equals is exact: false must not match \"true\""
+        );
+    }
+
+    #[test]
+    fn negate_inverts_a_single_clause() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Not S3
+    matches:
+      - field: eventName
+        equals: "GetObject"
+      - field: eventSource
+        equals: "s3.amazonaws.com"
+        negate: true
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+        assert_eq!(
+            engine.evaluate(&json!({"eventName": "GetObject", "eventSource": "s3.amazonaws.com"})),
+            Decision::Keep
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"eventName": "GetObject", "eventSource": "other"})),
+            Decision::Drop { rule_idx: 0 }
+        );
+    }
+
+    /// Spec finding F2, end to end through the engine.
+    #[test]
+    fn wildcard_path_matches_any_array_element() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Noisy bucket
+    matches:
+      - field: "resources[*].ARN"
+        equals: "arn:aws:s3:::noisy-bucket"
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+        assert_eq!(
+            engine.evaluate(&json!({
+                "resources": [
+                    {"ARN": "arn:aws:s3:::quiet-bucket"},
+                    {"ARN": "arn:aws:s3:::noisy-bucket"}
+                ]
+            })),
+            Decision::Drop { rule_idx: 0 }
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"resources": [{"ARN": "arn:aws:s3:::quiet-bucket"}]})),
+            Decision::Keep
+        );
     }
 
     #[test]
