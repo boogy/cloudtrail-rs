@@ -260,6 +260,35 @@ impl RuleSet {
         }
         Ok(())
     }
+
+    /// Describe the rule's `eventSource` condition for diagnostics, or `None`
+    /// if it has none. The CLI's `validate` uses this so it never has to
+    /// reach into `Match` internals, which differ between schema versions.
+    pub fn index_key_description(&self, rule_idx: usize) -> Option<String> {
+        let m = self
+            .rules
+            .get(rule_idx)?
+            .matches
+            .iter()
+            .find(|m| m.field == "eventSource")?;
+        // Quoted via Display, never Debug: the pattern must appear verbatim so
+        // a user can find it in their YAML, and Debug would double every
+        // backslash in a regex.
+        let described = match &m.op {
+            MatchOp::Regex(p) => format!("regex \"{p}\""),
+            MatchOp::Equals(s) => format!("equals \"{s}\""),
+            MatchOp::AnyOf(v) => {
+                let items: Vec<String> = v.iter().map(|s| format!("\"{s}\"")).collect();
+                format!("any_of [{}]", items.join(", "))
+            }
+            MatchOp::Absent(b) => format!("absent {b}"),
+        };
+        Some(if m.negate {
+            format!("negated {described}")
+        } else {
+            described
+        })
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +569,45 @@ rules: []
         assert!(
             RuleSet::parse(yaml).is_err(),
             "major version 3 must be rejected"
+        );
+    }
+
+    #[test]
+    fn describes_the_event_source_condition_for_diagnostics() {
+        let v1 = br#"
+version: 1.0.0
+rules:
+  - name: Has eventSource
+    matches:
+      - field_name: eventSource
+        regex: "^kms\\.amazonaws\\.com$"
+  - name: No eventSource
+    matches:
+      - field_name: eventName
+        regex: "^Describe"
+"#;
+        let rs = RuleSet::parse(v1).expect("must parse");
+        // Display, not Debug: `crates/cli/tests/cli.rs:80` asserts the raw
+        // pattern text appears in the warning, and Debug would escape the
+        // backslashes into `\\.` and break it.
+        assert_eq!(
+            rs.index_key_description(0).as_deref(),
+            Some(r#"regex "^kms\.amazonaws\.com$""#)
+        );
+        assert_eq!(rs.index_key_description(1), None);
+
+        let v2 = br#"
+version: 2.0.0
+rules:
+  - name: Literal eventSource
+    matches:
+      - field: eventSource
+        any_of: ["kms.amazonaws.com", "ec2.amazonaws.com"]
+"#;
+        let rs = RuleSet::parse(v2).expect("must parse");
+        assert_eq!(
+            rs.index_key_description(0).as_deref(),
+            Some("any_of [\"kms.amazonaws.com\", \"ec2.amazonaws.com\"]")
         );
     }
 
