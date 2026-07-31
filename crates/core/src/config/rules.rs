@@ -25,59 +25,201 @@ pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// One exclusion rule: fires (drops the record) only if *all* of its
 /// `matches` match (AND). Across rules, `Engine` ORs the result.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
     pub matches: Vec<Match>,
 }
 
-/// One condition within a rule: a dot-path into the record (`field_name`,
-/// resolved by `crate::filter::resolve`) and a regex it must match.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What a condition tests, once its `field` path has been resolved.
+#[derive(Debug, Clone)]
+pub enum MatchOp {
+    /// The v1 operator, and the general escape hatch in v2.
+    Regex(String),
+    Equals(String),
+    AnyOf(Vec<String>),
+    /// `true`: the path must resolve to no scalar; `false`: it must resolve to one.
+    Absent(bool),
+}
+
+/// One condition within a rule: a field path into the record and the operator
+/// its resolved value(s) must satisfy. Both schema versions parse into this.
+#[derive(Debug, Clone)]
 pub struct Match {
-    pub field_name: String,
-    pub regex: String,
+    pub field: String,
+    pub op: MatchOp,
+    pub negate: bool,
 }
 
 /// The parsed and structurally-validated rules document.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct RuleSet {
     pub version: String,
     /// Free-form: parsed but not schema-checked. Typing this as
     /// `HashMap<String, String>` breaks on the user's own file, because
     /// `created_at: 2024-01-01` resolves to a YAML date, not a string.
-    #[serde(default)]
     pub meta: Option<serde_yaml_ng::Mapping>,
-    #[serde(default)]
     pub rules: Vec<Rule>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRuleSet {
+    version: String,
+    #[serde(default)]
+    meta: Option<serde_yaml_ng::Mapping>,
+    #[serde(default)]
+    rules: Vec<serde_yaml_ng::Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRuleV1 {
+    name: String,
+    matches: Vec<WireMatchV1>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireMatchV1 {
+    field_name: String,
+    regex: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRuleV2 {
+    name: String,
+    matches: Vec<WireMatchV2>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireMatchV2 {
+    field: String,
+    #[serde(default)]
+    regex: Option<String>,
+    #[serde(default)]
+    equals: Option<String>,
+    #[serde(default)]
+    any_of: Option<Vec<String>>,
+    #[serde(default)]
+    absent: Option<bool>,
+    #[serde(default)]
+    negate: bool,
+}
+
+impl WireMatchV2 {
+    /// Exactly one operator per match: zero is meaningless, more than one is
+    /// ambiguous. Both are fatal at load rather than resolved by precedence.
+    fn into_match(self, rule_name: &str) -> Result<Match, ConfigError> {
+        let mut ops: Vec<MatchOp> = Vec::new();
+        if let Some(r) = self.regex {
+            ops.push(MatchOp::Regex(r));
+        }
+        if let Some(e) = self.equals {
+            ops.push(MatchOp::Equals(e));
+        }
+        if let Some(a) = self.any_of {
+            if a.is_empty() {
+                return Err(ConfigError::Parse(format!(
+                    "rule {rule_name:?}: field {:?}: any_of must not be empty",
+                    self.field
+                )));
+            }
+            ops.push(MatchOp::AnyOf(a));
+        }
+        if let Some(b) = self.absent {
+            ops.push(MatchOp::Absent(b));
+        }
+        if ops.len() != 1 {
+            return Err(ConfigError::Parse(format!(
+                "rule {rule_name:?}: field {:?}: expected exactly one of \
+                 regex/equals/any_of/absent, found {}",
+                self.field,
+                ops.len()
+            )));
+        }
+        Ok(Match {
+            field: self.field,
+            op: ops.pop().expect("length checked above"),
+            negate: self.negate,
+        })
+    }
+}
+
 impl RuleSet {
-    /// Parse a YAML rules document and validate it structurally. Fatal at
-    /// load (returns `Err`) on: invalid/non-semver `version`, major version
-    /// other than `1`, an uncompilable or oversized `regex`, a duplicate or
-    /// empty rule `name`, or an empty `matches` list (which would vacuously
-    /// match, and drop, every record).
+    /// Parse a YAML rules document and validate it structurally.
+    ///
+    /// Accepts major version `1` (`field_name` + `regex`) and major version `2`
+    /// (`field` + exactly one of `regex`/`equals`/`any_of`/`absent`, plus an
+    /// optional `negate`). Both normalize into the same `Match`.
+    ///
+    /// Fatal at load (returns `Err`) on: invalid/non-semver `version`, a major
+    /// version other than 1 or 2, an uncompilable or oversized `regex`, a
+    /// malformed field path, a duplicate or empty rule `name`, or an empty
+    /// `matches` list (which would vacuously match, and drop, every record).
     pub fn parse(bytes: &[u8]) -> Result<RuleSet, ConfigError> {
-        let parsed: RuleSet =
+        let wire: WireRuleSet =
             serde_yaml_ng::from_slice(bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
+
+        let version = semver::Version::parse(&wire.version)
+            .map_err(|e| ConfigError::Parse(format!("invalid version {:?}: {e}", wire.version)))?;
+
+        let rules = match version.major {
+            1 => wire
+                .rules
+                .into_iter()
+                .map(|raw| {
+                    let r: WireRuleV1 = serde_yaml_ng::from_value(raw)
+                        .map_err(|e| ConfigError::Parse(format!("invalid v1 rule: {e}")))?;
+                    Ok(Rule {
+                        name: r.name,
+                        matches: r
+                            .matches
+                            .into_iter()
+                            .map(|m| Match {
+                                field: m.field_name,
+                                op: MatchOp::Regex(m.regex),
+                                negate: false,
+                            })
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ConfigError>>()?,
+            2 => wire
+                .rules
+                .into_iter()
+                .map(|raw| {
+                    let r: WireRuleV2 = serde_yaml_ng::from_value(raw)
+                        .map_err(|e| ConfigError::Parse(format!("invalid v2 rule: {e}")))?;
+                    let name = r.name;
+                    let matches = r
+                        .matches
+                        .into_iter()
+                        .map(|m| m.into_match(&name))
+                        .collect::<Result<Vec<_>, ConfigError>>()?;
+                    Ok(Rule { name, matches })
+                })
+                .collect::<Result<Vec<_>, ConfigError>>()?,
+            other => {
+                return Err(ConfigError::Parse(format!(
+                    "unsupported rules version {} (major {other}): major version must be 1 or 2",
+                    wire.version
+                )));
+            }
+        };
+
+        let parsed = RuleSet {
+            version: wire.version,
+            meta: wire.meta,
+            rules,
+        };
         parsed.validate()?;
         Ok(parsed)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        let version = semver::Version::parse(&self.version)
-            .map_err(|e| ConfigError::Parse(format!("invalid version {:?}: {e}", self.version)))?;
-        if version.major != 1 {
-            return Err(ConfigError::Parse(format!(
-                "unsupported rules version {}: major version must be 1",
-                self.version
-            )));
-        }
-
         let mut names = HashSet::with_capacity(self.rules.len());
         for rule in &self.rules {
             if rule.name.is_empty() {
@@ -97,15 +239,23 @@ impl RuleSet {
                 )));
             }
             for m in &rule.matches {
-                RegexBuilder::new(&m.regex)
-                    .size_limit(REGEX_SIZE_LIMIT)
-                    .build()
-                    .map_err(|e| {
-                        ConfigError::Parse(format!(
-                            "rule {:?}: invalid regex {:?}: {e}",
-                            rule.name, m.regex
-                        ))
-                    })?;
+                crate::filter::parse_path(&m.field).map_err(|e| {
+                    ConfigError::Parse(format!(
+                        "rule {:?}: invalid field path {:?}: {e}",
+                        rule.name, m.field
+                    ))
+                })?;
+                if let MatchOp::Regex(pattern) = &m.op {
+                    RegexBuilder::new(pattern)
+                        .size_limit(REGEX_SIZE_LIMIT)
+                        .build()
+                        .map_err(|e| {
+                            ConfigError::Parse(format!(
+                                "rule {:?}: invalid regex {pattern:?}: {e}",
+                                rule.name
+                            ))
+                        })?;
+                }
             }
         }
         Ok(())
@@ -214,12 +364,12 @@ rules:
     }
 
     #[test]
-    fn rejects_non_major_1_version() {
+    fn rejects_unsupported_major_version() {
         let yaml = br#"
-version: 2.0.0
+version: 3.0.0
 rules: []
 "#;
-        let err = RuleSet::parse(yaml).expect_err("major version 2 must be rejected");
+        let err = RuleSet::parse(yaml).expect_err("major version 3 must be rejected");
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 
@@ -291,5 +441,121 @@ rules:
 "#;
         let err = RuleSet::parse(yaml).expect_err("empty rule name must be rejected");
         assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn parses_v2_operators() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Example
+    matches:
+      - field: eventName
+        regex: "^Describe"
+      - field: readOnly
+        equals: "true"
+      - field: userAgent
+        any_of: ["aws-cli", "boto3"]
+      - field: errorCode
+        absent: true
+      - field: resources[*].ARN
+        regex: "^arn:aws:s3"
+        negate: true
+"#;
+        let rs = RuleSet::parse(yaml).expect("v2 ruleset must parse");
+        let m = &rs.rules[0].matches;
+        assert_eq!(m.len(), 5);
+        assert!(matches!(&m[0].op, MatchOp::Regex(r) if r == "^Describe"));
+        assert!(matches!(&m[1].op, MatchOp::Equals(s) if s == "true"));
+        assert!(matches!(&m[2].op, MatchOp::AnyOf(v) if v.len() == 2));
+        assert!(matches!(&m[3].op, MatchOp::Absent(true)));
+        assert!(m[4].negate, "negate must round-trip");
+        assert_eq!(m[4].field, "resources[*].ARN");
+    }
+
+    #[test]
+    fn v1_still_parses_and_lowers_to_regex_ops() {
+        let yaml = br#"
+version: 1.0.0
+rules:
+  - name: Example
+    matches:
+      - field_name: eventSource
+        regex: "^kms\\.amazonaws\\.com$"
+"#;
+        let rs = RuleSet::parse(yaml).expect("v1 ruleset must still parse");
+        assert_eq!(rs.rules[0].matches[0].field, "eventSource");
+        assert!(matches!(&rs.rules[0].matches[0].op, MatchOp::Regex(_)));
+        assert!(!rs.rules[0].matches[0].negate);
+    }
+
+    #[test]
+    fn v2_rejects_zero_or_multiple_operators() {
+        let none = br#"
+version: 2.0.0
+rules:
+  - name: Example
+    matches:
+      - field: eventName
+"#;
+        let two = br#"
+version: 2.0.0
+rules:
+  - name: Example
+    matches:
+      - field: eventName
+        regex: "^A"
+        equals: "B"
+"#;
+        for (label, yaml) in [("no operator", &none[..]), ("two operators", &two[..])] {
+            assert!(
+                RuleSet::parse(yaml).is_err(),
+                "{label} must be rejected: exactly one operator is required"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_rejects_v1_field_name_key() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Example
+    matches:
+      - field_name: eventName
+        regex: "^A"
+"#;
+        assert!(
+            RuleSet::parse(yaml).is_err(),
+            "v2 must not silently accept the v1 key name"
+        );
+    }
+
+    #[test]
+    fn rejects_major_version_3() {
+        let yaml = br#"
+version: 3.0.0
+rules: []
+"#;
+        assert!(
+            RuleSet::parse(yaml).is_err(),
+            "major version 3 must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_field_path() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Example
+    matches:
+      - field: "resources[x].ARN"
+        regex: "^A"
+"#;
+        assert!(
+            RuleSet::parse(yaml).is_err(),
+            "a malformed field path must be fatal at load, not a never-matching key"
+        );
     }
 }
