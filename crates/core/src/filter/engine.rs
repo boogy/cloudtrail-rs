@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::config::rules::{REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
 use crate::filter::index::RuleIndex;
+use crate::filter::path::{Path, Segment, parse_path, visit_values};
 use crate::filter::resolve;
 
 /// Outcome of evaluating one record against the engine's rules.
@@ -25,11 +26,26 @@ pub enum Decision {
     Drop { rule_idx: usize },
 }
 
-/// One compiled condition: a dot-path (see `crate::filter::resolve`) and the
-/// regex its resolved value must match.
+/// What a condition tests once its path has been resolved.
+#[allow(dead_code)] // T07 constructs Equals/AnyOf/Absent and non-false negate.
+enum Op {
+    /// The v1 operator, and still the general escape hatch.
+    Regex(Regex),
+    /// Exact string equality -- cheaper than a regex and directly indexable.
+    Equals(String),
+    /// Membership in a fixed literal set.
+    AnyOf(std::collections::HashSet<String>),
+    /// `true`: the path resolves to no scalar. `false`: it resolves to one.
+    /// This is the condition v1 cannot express (spec F1).
+    Absent(bool),
+}
+
+/// One compiled condition: a parsed field path, the operator applied to the
+/// value(s) it resolves to, and whether the result is inverted.
 struct CompiledMatch {
-    field_name: String,
-    regex: Regex,
+    path: Path,
+    op: Op,
+    negate: bool,
 }
 
 /// One compiled rule: fires only if every `matches` condition matches (AND).
@@ -62,6 +78,12 @@ fn selectivity_rank(pattern: &str) -> u8 {
     }
 }
 
+/// Whether a compiled path is exactly the top-level `eventSource` field --
+/// the only field the rule index keys on today (widened in T16).
+fn is_event_source(path: &Path) -> bool {
+    matches!(path.segments.as_slice(), [Segment::Key(k)] if k == "eventSource")
+}
+
 impl Engine {
     /// Compile every rule's regexes. Fatal (returns `Err`) if any pattern
     /// fails to compile within `REGEX_SIZE_LIMIT` — the same limit
@@ -81,12 +103,24 @@ impl Engine {
                             rule.name, m.regex
                         ))
                     })?;
+                let path = parse_path(&m.field_name).map_err(|e| {
+                    ConfigError::Parse(format!(
+                        "rule {:?}: invalid field path {:?}: {e}",
+                        rule.name, m.field_name
+                    ))
+                })?;
                 matches.push(CompiledMatch {
-                    field_name: m.field_name,
-                    regex,
+                    path,
+                    op: Op::Regex(regex),
+                    negate: false,
                 });
             }
-            matches.sort_by_key(|m| selectivity_rank(m.regex.as_str()));
+            matches.sort_by_key(|m| match &m.op {
+                Op::Regex(re) => selectivity_rank(re.as_str()),
+                // A literal comparison is at least as selective as an anchored
+                // literal regex, and an absence check is pure lookup.
+                Op::Equals(_) | Op::AnyOf(_) | Op::Absent(_) => 0,
+            });
             compiled.push(CompiledRule {
                 name: rule.name,
                 matches,
@@ -102,8 +136,12 @@ impl Engine {
             .map(|rule| {
                 rule.matches
                     .iter()
-                    .find(|m| m.field_name == "eventSource")
-                    .map(|m| m.regex.as_str())
+                    .find(|m| !m.negate && is_event_source(&m.path))
+                    .and_then(|m| match &m.op {
+                        Op::Regex(re) => Some(re.as_str()),
+                        // T16 teaches the index to take literals directly.
+                        Op::Equals(_) | Op::AnyOf(_) | Op::Absent(_) => None,
+                    })
             })
             .collect();
         let index = RuleIndex::build(&event_source_patterns);
@@ -128,16 +166,31 @@ impl Engine {
         self.index.always()
     }
 
-    /// Whether the rule at `rule_idx` fires against `record` — every one of
-    /// its `matches` conditions matches (AND). A condition whose
-    /// `field_name` resolves to nothing (missing field, `null`, or a
-    /// non-scalar leaf) is FALSE, never TRUE — a typo'd `field_name` must
-    /// never make a rule fire on every record.
+    /// Whether one condition holds against `record`.
+    ///
+    /// A condition whose path resolves to nothing is FALSE for every operator
+    /// except `Absent(true)` -- a typo'd field must never make a rule fire on
+    /// every record. `negate` inverts the whole clause, including that rule.
+    fn match_fires(m: &CompiledMatch, record: &Value) -> bool {
+        let holds = match &m.op {
+            Op::Regex(re) => visit_values(record, &m.path, &mut |v| re.is_match(&v)),
+            Op::Equals(want) => visit_values(record, &m.path, &mut |v| v == want.as_str()),
+            Op::AnyOf(set) => visit_values(record, &m.path, &mut |v| set.contains(v.as_ref())),
+            Op::Absent(want_absent) => {
+                let present = visit_values(record, &m.path, &mut |_| true);
+                present != *want_absent
+            }
+        };
+        holds != m.negate
+    }
+
+    /// Whether the rule at `rule_idx` fires against `record` -- every one of
+    /// its conditions holds (AND).
     fn rule_fires(&self, rule_idx: usize, record: &Value) -> bool {
         self.rules[rule_idx]
             .matches
             .iter()
-            .all(|m| resolve(record, &m.field_name).is_some_and(|value| m.regex.is_match(&value)))
+            .all(|m| Self::match_fires(m, record))
     }
 
     /// Evaluate `record` against every rule in order, first match wins. The
