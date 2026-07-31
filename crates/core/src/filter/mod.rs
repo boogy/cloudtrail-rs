@@ -6,4 +6,4 @@ mod index;
 pub mod path;
 
 pub use engine::{Decision, Engine};
-pub use path::{Path, PathParseError, Segment, parse_path, resolve};
+pub use path::{Path, PathParseError, Segment, parse_path, resolve, visit_values};
