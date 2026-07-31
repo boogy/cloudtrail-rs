@@ -407,17 +407,15 @@ async fn load_engine(uri: &str) -> anyhow::Result<(Engine, RuleSet)> {
 /// one of the two conservative shapes `Engine::new`'s index extraction
 /// accepts (the rule index).
 fn explain_always_rule(rule_set: &RuleSet, rule_idx: usize) -> String {
-    let rule = &rule_set.rules[rule_idx];
-    match rule.matches.iter().find(|m| m.field_name == "eventSource") {
-        Some(m) => format!(
-            "warning: rule \"{}\" not indexed by eventSource (pattern \"{}\" could not be \
-             reduced to a fixed set of literals): checked against every record",
-            rule.name, m.regex
+    let name = &rule_set.rules[rule_idx].name;
+    match rule_set.index_key_description(rule_idx) {
+        Some(described) => format!(
+            "warning: rule {name:?} not indexed by eventSource ({described} could not be \
+             reduced to a fixed set of literals): checked against every record"
         ),
         None => format!(
-            "warning: rule \"{}\" not indexed by eventSource (no eventSource condition): \
-             checked against every record",
-            rule.name
+            "warning: rule {name:?} not indexed by eventSource (no eventSource condition): \
+             checked against every record"
         ),
     }
 }
