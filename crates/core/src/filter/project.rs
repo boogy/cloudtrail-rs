@@ -86,7 +86,11 @@ impl Projection {
     /// Whether any projected path contains `[*]`. A wildcard path captures only
     /// the first element that yields a scalar, not the existential semantics
     /// of `visit_values` — `Engine::evaluate_raw` must fall back to a full
-    /// parse whenever this is true.
+    /// parse whenever this is true. A wildcard sharing an array node with a
+    /// fixed subscript (see `records_index_and_wildcard_children`) can also
+    /// miss the very element that subscript claims, since `visit_seq` gives
+    /// the indexed child priority at that position — making the fallback
+    /// mandatory, not an optimization choice.
     #[allow(dead_code)] // Unused until T13 wires this in as a caller.
     pub(crate) fn has_wildcard(&self) -> bool {
         self.has_wildcard
@@ -179,6 +183,10 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         loop {
             let indexed = node.indices.iter().find(|(i, _)| *i == position);
             let consumed = match (indexed, node.wildcard.as_deref()) {
+                // No unfilled-check here: `Projection::build` dedupes fixed
+                // subscripts by position, so this child is dispatched at most
+                // once per array, unlike the wildcard child below, which is a
+                // candidate at every position.
                 (Some((_, child)), _) => s
                     .next_element_seed(LevelSeed {
                         node: child,
@@ -595,12 +603,58 @@ mod tests {
         assert!(!Projection::build(&p).has_wildcard());
     }
 
+    /// Documents a known limitation, not a desired property: when a fixed
+    /// index and a wildcard share the same array node (see
+    /// `records_index_and_wildcard_children`), `visit_seq` gives the indexed
+    /// child priority at that position, so the wildcard child never sees that
+    /// element. Here element 0 yields a scalar (`"a"`) and is skipped by the
+    /// wildcard for a structural reason, not because it failed the module's
+    /// own stated first-scalar rule -- and `visit_values`'s existential
+    /// short-circuit lands on that same element 0, so the two disagree. This
+    /// is exactly why `has_wildcard()` forces `Engine::evaluate_raw` to fall
+    /// back to a full parse whenever a wildcard path is present: it is not an
+    /// optional optimization, it is required for correctness.
+    #[test]
+    fn wildcard_sharing_a_node_with_a_fixed_index_skips_that_element() {
+        let specs = ["resources[0].ARN", "resources[*].ARN"];
+        let p = paths(&specs);
+        let proj = Projection::build(&p);
+        let record = r#"{"resources":[{"ARN":"a"},{"ARN":"b"}]}"#;
+        let value: Value = serde_json::from_str(record).expect("must parse");
+
+        // The fixed-index slot must still agree with `visit_values`.
+        let indexed = first_value(&value, &p[0]);
+        assert_eq!(indexed, Some("a".to_string()));
+        let projected = project(record, &proj).expect("must project");
+        assert_eq!(
+            projected[0], indexed,
+            "fixed-index slot must agree with visit_values"
+        );
+
+        // `visit_values` short-circuits on element 0 for the wildcard path too.
+        assert_eq!(
+            first_value(&value, &p[1]),
+            Some("a".to_string()),
+            "baseline: visit_values existential wildcard takes element 0"
+        );
+        // But project()'s wildcard child never gets to see element 0, because
+        // the indexed child at position 0 consumed it first -- so the
+        // wildcard slot lands on element 1 instead.
+        assert_eq!(
+            projected[1].as_deref(),
+            Some("b"),
+            "known divergence: wildcard sharing this node with a fixed index \
+             misses the element the index claims, which is why has_wildcard() \
+             forces a full-parse fallback rather than being an optimization choice"
+        );
+    }
+
     /// Differential test for fixed-subscript array paths, in the style of
     /// `projection_agrees_with_visit_values`. Wildcard semantics deliberately
     /// diverge from `visit_values` (first-scalar-wins vs. existential), so
     /// this covers only `Segment::Index`, the class of bug T11 shipped twice:
-    /// short array, scalar-not-object element, `null` element, and object
-    /// instead of array.
+    /// short array, scalar-not-object element, `null` element, object instead
+    /// of array, an empty array, and an object element missing the queried key.
     #[test]
     fn projects_array_subscripts_agrees_with_visit_values() {
         let specs = ["resources[0].ARN", "resources[1].ARN", "resources[2].ARN"];
@@ -613,6 +667,8 @@ mod tests {
             r#"{"resources":[null,{"ARN":"after-null"}]}"#,
             r#"{"resources":{"ARN":"not-an-array"}}"#,
             r#"{"resources":[{"ARN":"a"},{"ARN":"b"},{"ARN":"c"}]}"#,
+            r#"{"resources":[]}"#,
+            r#"{"resources":[{"type":"T"}]}"#,
         ];
 
         for record in records {
