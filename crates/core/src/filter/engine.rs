@@ -13,6 +13,7 @@ use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
 use crate::filter::index::RuleIndex;
 use crate::filter::path::{Path, Segment, parse_path, visit_values};
+use crate::filter::project::{Projection, project};
 use crate::filter::resolve;
 
 /// Outcome of evaluating one record against the engine's rules.
@@ -45,6 +46,8 @@ struct CompiledMatch {
     path: Path,
     op: Op,
     negate: bool,
+    /// Index into `Engine::projection`'s slot vector for this match's path.
+    path_id: usize,
 }
 
 /// One compiled rule: fires only if every `matches` condition matches (AND).
@@ -61,6 +64,10 @@ struct CompiledRule {
 pub struct Engine {
     rules: Vec<CompiledRule>,
     index: RuleIndex,
+    /// Projection over every distinct field path the rules reference, plus a
+    /// dedicated slot for `eventSource` at `event_source_slot`.
+    projection: Projection,
+    event_source_slot: usize,
 }
 
 /// Cheap selectivity ordinal used to order a rule's conditions
@@ -119,6 +126,7 @@ impl Engine {
                     path,
                     op,
                     negate: m.negate,
+                    path_id: 0,
                 });
             }
             matches.sort_by_key(|m| match &m.op {
@@ -132,6 +140,21 @@ impl Engine {
                 matches,
             });
         }
+
+        // One projection over every path the ruleset names. `path_id` on each
+        // compiled match indexes into the projected slot vector.
+        let mut paths: Vec<Path> = Vec::new();
+        for rule in &mut compiled {
+            for m in &mut rule.matches {
+                m.path_id = paths.len();
+                paths.push(m.path.clone());
+            }
+        }
+        // A dedicated slot for the index key, so `evaluate_raw` can select
+        // candidates without a second pass over the record.
+        let event_source_slot = paths.len();
+        paths.push(parse_path("eventSource").expect("literal path is valid"));
+        let projection = Projection::build(&paths);
 
         // Index by each rule's `eventSource` condition — conservatively: a
         // rule whose eventSource pattern cannot be reduced to a fixed set of
@@ -155,6 +178,8 @@ impl Engine {
         Ok(Engine {
             rules: compiled,
             index,
+            projection,
+            event_source_slot,
         })
     }
 
@@ -224,6 +249,48 @@ impl Engine {
             }
         }
         Decision::Keep
+    }
+
+    /// Whether one condition holds against an already-projected record.
+    fn match_fires_projected(m: &CompiledMatch, slots: &[Option<String>]) -> bool {
+        let value = slots[m.path_id].as_deref();
+        let holds = match &m.op {
+            Op::Regex(re) => value.is_some_and(|v| re.is_match(v)),
+            Op::Equals(want) => value == Some(want.as_str()),
+            Op::AnyOf(set) => value.is_some_and(|v| set.contains(v)),
+            Op::Absent(want_absent) => value.is_some() != *want_absent,
+        };
+        holds != m.negate
+    }
+
+    /// Evaluate a record from its raw JSON bytes, parsing only the fields the
+    /// ruleset references.
+    ///
+    /// Returns `Err` exactly when `serde_json::from_str::<Value>` would, so
+    /// the caller's "unparseable record is KEPT" handling is unchanged.
+    ///
+    /// Falls back to a full parse when any rule uses a `[*]` path: projection
+    /// captures only the first element that yields a scalar, which is not the
+    /// existential semantics `visit_values` implements.
+    pub fn evaluate_raw(&self, record: &str) -> Result<Decision, serde_json::Error> {
+        if self.projection.has_wildcard() {
+            let value: Value = serde_json::from_str(record)?;
+            return Ok(self.evaluate(&value));
+        }
+        let slots = project(record, &self.projection)?;
+        for rule_idx in self
+            .index
+            .candidates(slots[self.event_source_slot].as_deref())
+        {
+            if self.rules[rule_idx]
+                .matches
+                .iter()
+                .all(|m| Self::match_fires_projected(m, &slots))
+            {
+                return Ok(Decision::Drop { rule_idx });
+            }
+        }
+        Ok(Decision::Keep)
     }
 }
 

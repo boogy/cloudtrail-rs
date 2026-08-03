@@ -42,7 +42,6 @@ pub(crate) struct Projection {
 
 impl Projection {
     /// Build the trie. Path id `i` is `paths[i]`.
-    #[allow(dead_code)] // Unused until T13 wires this in as a caller.
     pub(crate) fn build(paths: &[Path]) -> Projection {
         let mut root = Node::default();
         let mut has_wildcard = false;
@@ -91,7 +90,6 @@ impl Projection {
     /// miss the very element that subscript claims, since `visit_seq` gives
     /// the indexed child priority at that position — making the fallback
     /// mandatory, not an optimization choice.
-    #[allow(dead_code)] // Unused until T13 wires this in as a caller.
     pub(crate) fn has_wildcard(&self) -> bool {
         self.has_wildcard
     }
@@ -103,7 +101,6 @@ impl Projection {
 /// Errors exactly when `serde_json::from_str::<Value>` would: a skipped
 /// subtree is still parsed (and discarded) via `IgnoredAny`, so malformed
 /// JSON there is still an error and the caller still keeps the record.
-#[allow(dead_code)] // Unused until T13 wires this into evaluate_raw.
 pub(crate) fn project(
     json: &str,
     projection: &Projection,
