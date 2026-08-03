@@ -17,14 +17,18 @@ use std::collections::HashMap;
 
 // Fields read by T11's visitor; only Projection::build (below) writes them
 // until then.
-#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct Node {
+    // T11/T13
+    #[allow(dead_code)]
     pub(crate) keys: HashMap<String, Node>,
     /// Fixed array subscripts kept as `(index, child)` pairs rather than a
     /// map: rulesets touch only a handful of indices per array.
+    #[allow(dead_code)]
     pub(crate) indices: Vec<(usize, Node)>,
+    #[allow(dead_code)]
     pub(crate) wildcard: Option<Box<Node>>,
+    #[allow(dead_code)]
     pub(crate) terminals: Vec<usize>,
 }
 
