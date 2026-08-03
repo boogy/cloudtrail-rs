@@ -6,6 +6,7 @@ match. Rules that survive filtering are written to the destination.
 
 - [Evaluation model](#evaluation-model)
 - [Schema](#schema)
+- [Schema v2](#schema-v2)
 - [How a record is evaluated](#how-a-record-is-evaluated)
 - [The rule index and the `always` bucket](#the-rule-index-and-the-always-bucket)
 - [Validating a ruleset](#validating-a-ruleset)
@@ -58,6 +59,45 @@ rules:
 > **`version` is semver here (`1.0.0`), integer in settings (`1`).** The two
 > files use the same key name for different schemes; do not copy one into the
 > other.
+
+## Schema v2
+
+Version `2.x` replaces `field_name`/`regex` with `field` plus exactly one of
+four operators, and an optional `negate`. v1 documents (`version: 1.x`,
+`field_name`/`regex` only) continue to load and evaluate byte-identically —
+migrating to v2 is optional, not forced.
+
+```yaml
+version: 2.0.0
+
+rules:
+  - name: Automated Tool Describe Operations
+    matches:
+      - field: eventName
+        regex: "^Describe.*$"
+      - field: readOnly
+        equals: "true"
+      - field: userAgent
+        any_of: ["aws-cli", "boto3"]
+      - field: errorCode
+        absent: true
+      - field: resources[*].ARN
+        equals: "arn:aws:s3:::noisy-bucket"
+        negate: true
+```
+
+| Field              | Meaning                                                                                                                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `matches[].field`  | Dotted path, like v1's `field_name`, plus optional array subscripts: `resources[0].ARN` indexes one element, `resources[*].ARN` matches if _any_ element does.                                |
+| `matches[].regex`  | Same as v1: a Rust-regex pattern the resolved value must match.                                                                                                                               |
+| `matches[].equals` | The resolved value must equal this string exactly — no regex, no partial match.                                                                                                               |
+| `matches[].any_of` | The resolved value must equal one of these strings. Must not be empty.                                                                                                                        |
+| `matches[].absent` | `true`: the field must resolve to nothing (missing, `null`, or a non-scalar). `false`: it must resolve to a scalar. The only way to express "this field was never set" — inexpressible in v1. |
+| `matches[].negate` | Optional, default `false`. Inverts this one condition before the rule ANDs it with the others.                                                                                                |
+
+Exactly one of `regex` / `equals` / `any_of` / `absent` must be set per match;
+zero or more than one is a validation error at load, same tier as an
+uncompilable regex or an empty `matches` list.
 
 ## How a record is evaluated
 
