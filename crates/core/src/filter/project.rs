@@ -22,9 +22,7 @@ pub(crate) struct Node {
     pub(crate) keys: HashMap<String, Node>,
     /// Fixed array subscripts kept as `(index, child)` pairs rather than a
     /// map: rulesets touch only a handful of indices per array.
-    #[allow(dead_code)] // T12/T13
     pub(crate) indices: Vec<(usize, Node)>,
-    #[allow(dead_code)] // T12/T13
     pub(crate) wildcard: Option<Box<Node>>,
     pub(crate) terminals: Vec<usize>,
     /// Every path id whose terminal lives anywhere in this node's subtree
@@ -39,6 +37,7 @@ pub(crate) struct Node {
 pub(crate) struct Projection {
     pub(crate) root: Node,
     len: usize,
+    has_wildcard: bool,
 }
 
 impl Projection {
@@ -46,6 +45,7 @@ impl Projection {
     #[allow(dead_code)] // Unused until T13 wires this in as a caller.
     pub(crate) fn build(paths: &[Path]) -> Projection {
         let mut root = Node::default();
+        let mut has_wildcard = false;
         for (id, path) in paths.iter().enumerate() {
             let mut node = &mut root;
             node.subtree_terminals.push(id);
@@ -62,9 +62,11 @@ impl Projection {
                             }
                         }
                     }
-                    Segment::Wildcard => node
-                        .wildcard
-                        .get_or_insert_with(|| Box::new(Node::default())),
+                    Segment::Wildcard => {
+                        has_wildcard = true;
+                        node.wildcard
+                            .get_or_insert_with(|| Box::new(Node::default()))
+                    }
                 };
                 node.subtree_terminals.push(id);
             }
@@ -73,11 +75,21 @@ impl Projection {
         Projection {
             root,
             len: paths.len(),
+            has_wildcard,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether any projected path contains `[*]`. A wildcard path captures only
+    /// the first element that yields a scalar, not the existential semantics
+    /// of `visit_values` — `Engine::evaluate_raw` must fall back to a full
+    /// parse whenever this is true.
+    #[allow(dead_code)] // Unused until T13 wires this in as a caller.
+    pub(crate) fn has_wildcard(&self) -> bool {
+        self.has_wildcard
     }
 }
 
@@ -158,13 +170,44 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
-        // T12 descends into arrays; for now this matches `visit_values`,
-        // which also yields nothing for a path with no array subscript. The
-        // caller already nulled this node's whole subtree before dispatching
-        // here (or, at the root, the output vec starts all-`None`), so there
-        // is nothing left to clear.
-        while s.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(())
+        let LevelSeed { node, out } = self;
+        if node.indices.is_empty() && node.wildcard.is_none() {
+            while s.next_element::<IgnoredAny>()?.is_some() {}
+            return Ok(());
+        }
+        let mut position = 0usize;
+        loop {
+            let indexed = node.indices.iter().find(|(i, _)| *i == position);
+            let consumed = match (indexed, node.wildcard.as_deref()) {
+                (Some((_, child)), _) => s
+                    .next_element_seed(LevelSeed {
+                        node: child,
+                        out: &mut *out,
+                    })?
+                    .is_some(),
+                (None, Some(child)) => {
+                    // Existential, not last-wins: `visit_values` short-circuits
+                    // on the first element that yields a scalar, so once every
+                    // terminal under this wildcard is filled, later elements
+                    // must not overwrite it.
+                    let unfilled = child.subtree_terminals.iter().any(|&id| out[id].is_none());
+                    if unfilled {
+                        s.next_element_seed(LevelSeed {
+                            node: child,
+                            out: &mut *out,
+                        })?
+                        .is_some()
+                    } else {
+                        s.next_element::<IgnoredAny>()?.is_some()
+                    }
+                }
+                (None, None) => s.next_element::<IgnoredAny>()?.is_some(),
+            };
+            if !consumed {
+                return Ok(());
+            }
+            position += 1;
+        }
     }
 
     fn visit_str<E>(mut self, v: &str) -> Result<(), E> {
@@ -499,5 +542,90 @@ mod tests {
             vec![0, 1],
             "both ids must be filled, or one rule silently sees nothing"
         );
+    }
+
+    #[test]
+    fn projects_fixed_array_subscripts() {
+        let specs = ["resources[0].ARN", "resources[1].ARN", "resources[9].ARN"];
+        let p = paths(&specs);
+        let proj = Projection::build(&p);
+        let record = r#"{"resources":[{"ARN":"a","type":"T"},{"ARN":"b"}],"eventName":"X"}"#;
+        let value: Value = serde_json::from_str(record).expect("must parse");
+        let projected = project(record, &proj).expect("must project");
+        for (id, path) in p.iter().enumerate() {
+            assert_eq!(
+                projected[id],
+                first_value(&value, path),
+                "path {:?}",
+                specs[id]
+            );
+        }
+        assert_eq!(projected[0].as_deref(), Some("a"));
+        assert_eq!(projected[1].as_deref(), Some("b"));
+        assert_eq!(projected[2], None);
+    }
+
+    #[test]
+    fn projects_wildcard_as_first_scalar() {
+        let p = paths(&["resources[*].ARN"]);
+        let proj = Projection::build(&p);
+        assert!(proj.has_wildcard(), "wildcard presence must be reported");
+        let record = r#"{"resources":[{"ARN":"first"},{"ARN":"second"}]}"#;
+        assert_eq!(
+            project(record, &proj).expect("must project")[0].as_deref(),
+            Some("first"),
+            "wildcard capture takes the first element yielding a scalar"
+        );
+    }
+
+    #[test]
+    fn wildcard_skips_elements_without_the_key() {
+        let p = paths(&["resources[*].ARN"]);
+        let proj = Projection::build(&p);
+        let record = r#"{"resources":[{"type":"T"},{"ARN":"found"}]}"#;
+        assert_eq!(
+            project(record, &proj).expect("must project")[0].as_deref(),
+            Some("found")
+        );
+    }
+
+    #[test]
+    fn non_wildcard_projection_reports_no_wildcard() {
+        let p = paths(&["eventName", "resources[0].ARN"]);
+        assert!(!Projection::build(&p).has_wildcard());
+    }
+
+    /// Differential test for fixed-subscript array paths, in the style of
+    /// `projection_agrees_with_visit_values`. Wildcard semantics deliberately
+    /// diverge from `visit_values` (first-scalar-wins vs. existential), so
+    /// this covers only `Segment::Index`, the class of bug T11 shipped twice:
+    /// short array, scalar-not-object element, `null` element, and object
+    /// instead of array.
+    #[test]
+    fn projects_array_subscripts_agrees_with_visit_values() {
+        let specs = ["resources[0].ARN", "resources[1].ARN", "resources[2].ARN"];
+        let p = paths(&specs);
+        let proj = Projection::build(&p);
+
+        let records = [
+            r#"{"resources":[{"ARN":"only-one"}]}"#,
+            r#"{"resources":["not-an-object","also-not"]}"#,
+            r#"{"resources":[null,{"ARN":"after-null"}]}"#,
+            r#"{"resources":{"ARN":"not-an-array"}}"#,
+            r#"{"resources":[{"ARN":"a"},{"ARN":"b"},{"ARN":"c"}]}"#,
+        ];
+
+        for record in records {
+            let value: Value = serde_json::from_str(record).expect("test record must parse");
+            let projected = project(record, &proj).expect("must project");
+            for (id, path) in p.iter().enumerate() {
+                assert_eq!(
+                    projected[id],
+                    first_value(&value, path),
+                    "path {:?} diverged on record {record}",
+                    specs[id]
+                );
+            }
+        }
     }
 }
