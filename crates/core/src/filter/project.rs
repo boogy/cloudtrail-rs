@@ -96,60 +96,6 @@ pub(crate) fn project(
     Ok(out)
 }
 
-/// Captures one scalar using exactly `path::visit_values`'s coercion rules:
-/// string as-is, bool and number stringified, null/object/array yield nothing.
-struct ScalarSeed;
-
-impl<'de> DeserializeSeed<'de> for ScalarSeed {
-    type Value = Option<String>;
-
-    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        struct V;
-
-        impl<'de> Visitor<'de> for V {
-            type Value = Option<String>;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("any JSON value")
-            }
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(Some(v.to_string()))
-            }
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-                Ok(Some(v))
-            }
-            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(Some(v.to_string()))
-            }
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(Some(v.to_string()))
-            }
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(Some(v.to_string()))
-            }
-            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-                Ok(Some(v.to_string()))
-            }
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
-                while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(None)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Self::Value, A::Error> {
-                while s.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(None)
-            }
-        }
-
-        d.deserialize_any(V)
-    }
-}
-
 /// Walks one JSON value against one trie node.
 struct LevelSeed<'a> {
     node: &'a Node,
@@ -179,37 +125,29 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         f.write_str("any JSON value")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
+    fn visit_map<A: MapAccess<'de>>(mut self, mut m: A) -> Result<(), A::Error> {
+        // An object reaching this node's own terminal yields nothing (path.rs:137).
+        self.capture_terminals(None);
         while let Some(key) = m.next_key::<String>()? {
             match self.node.keys.get(&key) {
                 None => {
                     m.next_value::<IgnoredAny>()?;
                 }
                 Some(child) => {
-                    if child.terminals.is_empty() {
-                        m.next_value_seed(LevelSeed {
-                            node: child,
-                            out: &mut *self.out,
-                        })?;
-                    } else {
-                        // Last-wins on duplicate keys, matching `Value`.
-                        let scalar = m.next_value_seed(ScalarSeed)?;
-                        for &id in &child.terminals {
-                            self.out[id] = scalar.clone();
-                        }
-                        // A key can be both terminal and a branch only if the
-                        // ruleset names `a` and `a.b`; `a.b` needs a descent,
-                        // which a scalar cannot provide, so nothing to do.
-                    }
+                    m.next_value_seed(LevelSeed {
+                        node: child,
+                        out: &mut *self.out,
+                    })?;
                 }
             }
         }
         Ok(())
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut s: A) -> Result<(), A::Error> {
         // T12 descends into arrays; for now this matches `visit_values`,
         // which also yields nothing for a path with no array subscript.
+        self.capture_terminals(None);
         while s.next_element::<IgnoredAny>()?.is_some() {}
         Ok(())
     }
@@ -235,13 +173,19 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         Ok(())
     }
     fn visit_f64<E>(mut self, v: f64) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        // `f64::to_string()` disagrees with `Number`'s Display on float-lexed
+        // literals (`1.0` -> "1", `1.5e-7` -> decimal); match path.rs:135 by
+        // going through `Number` itself. `from_f64` is `None` only for
+        // NaN/infinity, which JSON can't express, so `None` is correct there too.
+        self.capture_terminals(serde_json::Number::from_f64(v).map(|n| n.to_string()));
         Ok(())
     }
-    fn visit_unit<E>(self) -> Result<(), E> {
+    fn visit_unit<E>(mut self) -> Result<(), E> {
+        self.capture_terminals(None);
         Ok(())
     }
-    fn visit_none<E>(self) -> Result<(), E> {
+    fn visit_none<E>(mut self) -> Result<(), E> {
+        self.capture_terminals(None);
         Ok(())
     }
 }
@@ -372,6 +316,90 @@ mod tests {
         assert_eq!(res.indices.len(), 1);
         assert_eq!(res.indices[0].0, 0);
         assert!(res.wildcard.is_some());
+    }
+
+    /// Finding 1: `f64::to_string()` and `serde_json::Number`'s Display
+    /// disagree on float-lexed literals. Regression for the specific literals
+    /// `testing::corpus` carries deliberately (see its module doc).
+    #[test]
+    fn numeric_agreement_with_visit_values() {
+        let specs = ["value"];
+        let p = paths(&specs);
+        let proj = Projection::build(&p);
+
+        let records = [
+            r#"{"value":1.0}"#,
+            r#"{"value":1.5e-7}"#,
+            r#"{"value":-0.0}"#,
+            r#"{"value":9007199254740993}"#,
+            r#"{"value":42}"#,
+        ];
+
+        for record in records {
+            let value: Value = serde_json::from_str(record).expect("test record must parse");
+            let projected = project(record, &proj).expect("must project");
+            assert_eq!(
+                projected[0],
+                first_value(&value, &p[0]),
+                "numeric literal diverged on record {record}"
+            );
+        }
+    }
+
+    /// Finding 2: a key that is both a terminal (`userIdentity`) and a branch
+    /// (`userIdentity.type`) must still descend into its object value.
+    #[test]
+    fn terminal_and_descendant_both_resolve() {
+        let specs = ["userIdentity", "userIdentity.type", "a.b", "a.b.c"];
+        let p = paths(&specs);
+        let proj = Projection::build(&p);
+        let json = r#"{"userIdentity":{"type":"AssumedRole"},"a":{"b":{"c":"deep"}}}"#;
+        let value: Value = serde_json::from_str(json).expect("test record must parse");
+        let projected = project(json, &proj).expect("must project");
+        for (id, path) in p.iter().enumerate() {
+            assert_eq!(
+                projected[id],
+                first_value(&value, path),
+                "path {:?} diverged",
+                specs[id]
+            );
+        }
+        // Pin the concrete expectation, not just agreement with the oracle.
+        assert_eq!(projected[1].as_deref(), Some("AssumedRole"));
+        assert_eq!(projected[3].as_deref(), Some("deep"));
+    }
+
+    /// Finding 2's trap: a duplicate key whose first occurrence is a scalar
+    /// and whose second is a non-scalar must end `None` for its own terminal
+    /// (last-wins, and the second, object value yields nothing) while still
+    /// descending into the second occurrence's children. A plain single path
+    /// (no sibling branch) already passes against the unfixed code here,
+    /// because its `ScalarSeed` fallback happens to null out every duplicate
+    /// regardless of descent -- so this uses a terminal-and-branch key
+    /// (`eventName` / `eventName.x`) to force a real descent, which is what
+    /// actually exposes a fix that forgets to clear stale terminals.
+    #[test]
+    fn duplicate_key_second_occurrence_non_scalar_yields_none() {
+        let p = paths(&["eventName", "eventName.x"]);
+        let proj = Projection::build(&p);
+        let json = r#"{"eventName":"A","eventName":{"x":1}}"#;
+        let value: Value = serde_json::from_str(json).expect("serde_json accepts duplicates");
+        assert_eq!(
+            first_value(&value, &p[0]),
+            None,
+            "baseline: Value's last-wins entry is an object, which yields nothing"
+        );
+        assert_eq!(
+            first_value(&value, &p[1]),
+            Some("1".to_string()),
+            "baseline: the surviving object's child is reachable"
+        );
+        let projected = project(json, &proj).expect("must project");
+        assert_eq!(
+            projected[0], None,
+            "projection must not keep the stale first scalar"
+        );
+        assert_eq!(projected[1].as_deref(), Some("1"));
     }
 
     #[test]
