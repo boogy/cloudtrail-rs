@@ -27,6 +27,11 @@ pub(crate) struct Node {
     #[allow(dead_code)] // T12/T13
     pub(crate) wildcard: Option<Box<Node>>,
     pub(crate) terminals: Vec<usize>,
+    /// Every path id whose terminal lives anywhere in this node's subtree
+    /// (including its own `terminals`). Lets a parent null out a whole
+    /// subtree in one flat loop before re-dispatching into a duplicate key,
+    /// instead of walking the trie at parse time.
+    pub(crate) subtree_terminals: Vec<usize>,
 }
 
 /// The set of field paths a ruleset references, arranged as a trie so one
@@ -43,6 +48,7 @@ impl Projection {
         let mut root = Node::default();
         for (id, path) in paths.iter().enumerate() {
             let mut node = &mut root;
+            node.subtree_terminals.push(id);
             for segment in &path.segments {
                 node = match segment {
                     Segment::Key(k) => node.keys.entry(k.clone()).or_default(),
@@ -60,6 +66,7 @@ impl Projection {
                         .wildcard
                         .get_or_insert_with(|| Box::new(Node::default())),
                 };
+                node.subtree_terminals.push(id);
             }
             node.terminals.push(id);
         }
@@ -125,15 +132,21 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         f.write_str("any JSON value")
     }
 
-    fn visit_map<A: MapAccess<'de>>(mut self, mut m: A) -> Result<(), A::Error> {
-        // An object reaching this node's own terminal yields nothing (path.rs:137).
-        self.capture_terminals(None);
+    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
         while let Some(key) = m.next_key::<String>()? {
             match self.node.keys.get(&key) {
                 None => {
                     m.next_value::<IgnoredAny>()?;
                 }
                 Some(child) => {
+                    // Last-wins: a repeated key's earlier occurrence may have
+                    // descended and filled slots anywhere in `child`'s
+                    // subtree. Null the whole subtree before re-dispatching,
+                    // or a later occurrence that doesn't refill a slot leaves
+                    // the earlier occurrence's stale value behind.
+                    for &id in &child.subtree_terminals {
+                        self.out[id] = None;
+                    }
                     m.next_value_seed(LevelSeed {
                         node: child,
                         out: &mut *self.out,
@@ -144,10 +157,12 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         Ok(())
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(mut self, mut s: A) -> Result<(), A::Error> {
+    fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
         // T12 descends into arrays; for now this matches `visit_values`,
-        // which also yields nothing for a path with no array subscript.
-        self.capture_terminals(None);
+        // which also yields nothing for a path with no array subscript. The
+        // caller already nulled this node's whole subtree before dispatching
+        // here (or, at the root, the output vec starts all-`None`), so there
+        // is nothing left to clear.
         while s.next_element::<IgnoredAny>()?.is_some() {}
         Ok(())
     }
@@ -180,12 +195,13 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         self.capture_terminals(serde_json::Number::from_f64(v).map(|n| n.to_string()));
         Ok(())
     }
-    fn visit_unit<E>(mut self) -> Result<(), E> {
-        self.capture_terminals(None);
+    // `null` (visit_unit) and a bare `visit_none` both yield nothing
+    // (path.rs:136), same as visit_map/visit_seq above: the caller already
+    // nulled this node's whole subtree before dispatching here.
+    fn visit_unit<E>(self) -> Result<(), E> {
         Ok(())
     }
-    fn visit_none<E>(mut self) -> Result<(), E> {
-        self.capture_terminals(None);
+    fn visit_none<E>(self) -> Result<(), E> {
         Ok(())
     }
 }
@@ -400,6 +416,78 @@ mod tests {
             "projection must not keep the stale first scalar"
         );
         assert_eq!(projected[1].as_deref(), Some("1"));
+    }
+
+    /// Reverse-order variant of `duplicate_key_second_occurrence_non_scalar_yields_none`:
+    /// the branch occurrence comes *first* and the scalar occurrence *last*, so
+    /// last-wins means the final value is the scalar and the descendant slot
+    /// filled by the earlier object occurrence must be cleared, not just the
+    /// terminal at the shared node.
+    #[test]
+    fn duplicate_key_reverse_order_clears_stale_descendant() {
+        let p = paths(&["eventName", "eventName.x"]);
+        let proj = Projection::build(&p);
+        let json = r#"{"eventName":{"x":1},"eventName":"A"}"#;
+        let value: Value = serde_json::from_str(json).expect("serde_json accepts duplicates");
+        let projected = project(json, &proj).expect("must project");
+        for (id, path) in p.iter().enumerate() {
+            assert_eq!(
+                projected[id],
+                first_value(&value, path),
+                "path {:?} diverged",
+                p[id]
+            );
+        }
+        assert_eq!(
+            projected[0].as_deref(),
+            Some("A"),
+            "baseline: last-wins scalar survives"
+        );
+        assert_eq!(
+            projected[1], None,
+            "stale descendant from the shadowed first occurrence must not survive"
+        );
+    }
+
+    /// Object-then-object shadowing on a branch-only node (no terminal at the
+    /// shared key itself): the second `a` never mentions `b`, so `a.b` must
+    /// end `None` even though the first `a` filled it.
+    #[test]
+    fn duplicate_object_shadows_descendant_with_no_parent_terminal() {
+        let p = paths(&["a.b"]);
+        let proj = Projection::build(&p);
+        let json = r#"{"a":{"b":1},"a":{"c":2}}"#;
+        let value: Value = serde_json::from_str(json).expect("serde_json accepts duplicates");
+        assert_eq!(
+            first_value(&value, &p[0]),
+            None,
+            "baseline: Value's last-wins `a` has no `b`"
+        );
+        let projected = project(json, &proj).expect("must project");
+        assert_eq!(
+            projected[0], None,
+            "stale value from the shadowed first `a.b` must not survive"
+        );
+    }
+
+    /// Deeper shadowing: the stale value is two levels below the shared key,
+    /// exercising subtree clearing through more than one intermediate node.
+    #[test]
+    fn duplicate_object_shadows_deeper_descendant() {
+        let p = paths(&["a.b.c"]);
+        let proj = Projection::build(&p);
+        let json = r#"{"a":{"b":{"c":1}},"a":{"b":{}}}"#;
+        let value: Value = serde_json::from_str(json).expect("serde_json accepts duplicates");
+        assert_eq!(
+            first_value(&value, &p[0]),
+            None,
+            "baseline: last-wins `a.b` has no `c`"
+        );
+        let projected = project(json, &proj).expect("must project");
+        assert_eq!(
+            projected[0], None,
+            "stale value from the shadowed first `a.b.c` must not survive"
+        );
     }
 
     #[test]
