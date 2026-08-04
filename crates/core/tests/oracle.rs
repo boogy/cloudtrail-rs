@@ -218,6 +218,273 @@ rules:
     );
 }
 
+/// The example ruleset (80 `regex:` + 1 `absent: true`) and the two wildcard
+/// fallback tests above never exercise `Op::Equals`, `Op::AnyOf`,
+/// `Op::Absent(false)`, or `negate` through `match_fires_projected` -- the
+/// example has none of them, and the wildcard tests take the full-parse
+/// early return before `match_fires_projected` ever runs. This ruleset
+/// deliberately has no `[*]` segment anywhere, so `Projection::has_wildcard`
+/// is false by construction and `evaluate_raw` cannot take that early
+/// return; there is no record that would separate "fell back" from "went
+/// through projection" to assert against, so this doc comment is the pin.
+///
+/// Covers, each via a rule reachable only by dodging the earlier ones:
+/// `equals`, `any_of`, `negate` on both `equals` and `any_of`, `absent: true`,
+/// `absent: false`, a nested path (`userIdentity.type`), a fixed array
+/// subscript (`resources[0].ARN`), a bool leaf, an integer leaf, and two
+/// float-lexed leaves whose JSON text disagrees with `f64::to_string()`
+/// (`1.0`, `1.5e-7` -- T11's bug). Missing-entirely, `null`, object, and
+/// array leaves are exercised against `equals`/`any_of`/`absent` alike,
+/// since `path.rs` yields nothing for all four and a coercion bug would
+/// treat one of them as an empty-string match instead.
+#[test]
+fn evaluate_raw_agrees_with_linear_across_operators_and_value_shapes() {
+    let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Equals eventName is Decrypt
+    matches:
+      - field: eventName
+        equals: "Decrypt"
+  - name: AnyOf eventSource kms or s3
+    matches:
+      - field: eventSource
+        any_of: ["kms.amazonaws.com", "s3.amazonaws.com"]
+  - name: Negated equals eventName is not ConsoleLogin
+    matches:
+      - field: eventName
+        equals: "ConsoleLogin"
+        negate: true
+  - name: Negated any_of userIdentity type is not privileged
+    matches:
+      - field: userIdentity.type
+        any_of: ["Root", "IAMUser"]
+        negate: true
+  - name: Resources first ARN is the critical bucket
+    matches:
+      - field: "resources[0].ARN"
+        equals: "arn:aws:s3:::critical-bucket"
+  - name: Response count equals one
+    matches:
+      - field: responseElements.count
+        equals: "1"
+  - name: ReadOnly is true
+    matches:
+      - field: readOnly
+        equals: "true"
+  - name: Latency equals a scientific-notation literal
+    matches:
+      - field: latency
+        equals: "1.5e-7"
+  - name: Ratio equals a trailing-zero float literal
+    matches:
+      - field: ratio
+        equals: "1.0"
+  - name: ErrorCode absent
+    matches:
+      - field: errorCode
+        absent: true
+  - name: ErrorCode present
+    matches:
+      - field: errorCode
+        absent: false
+"#;
+    let rule_set = RuleSet::parse(yaml).expect("inline ruleset must parse");
+    let rule_count = rule_set.rules.len();
+    let engine = Engine::new(rule_set).expect("inline ruleset must compile");
+
+    // Every record below shares this prefix unless noted: it dodges rules
+    // 0-3 (eventName != "Decrypt", eventName == "ConsoleLogin" so the
+    // negated equals doesn't fire, eventSource not in the any_of set,
+    // userIdentity.type == "IAMUser" so the negated any_of doesn't fire) so
+    // later cases can isolate rules 4-10 without an earlier broad rule
+    // shadowing them.
+    let neutral = || {
+        json!({
+            "eventName": "ConsoleLogin",
+            "eventSource": "signin.amazonaws.com",
+            "userIdentity": {"type": "IAMUser"}
+        })
+    };
+    fn with(mut base: Value, extra: Value) -> Value {
+        base.as_object_mut()
+            .expect("neutral base is an object")
+            .extend(extra.as_object().expect("extra is an object").clone());
+        base
+    }
+
+    let records: Vec<(&str, Value)> = vec![
+        ("baseline: errorCode absent entirely", neutral()),
+        (
+            "equals fires: eventName literally Decrypt",
+            json!({"eventName": "Decrypt", "eventSource": "other.amazonaws.com"}),
+        ),
+        (
+            "any_of fires: eventSource is kms.amazonaws.com",
+            json!({"eventName": "SomethingElse", "eventSource": "kms.amazonaws.com"}),
+        ),
+        (
+            "negated equals fires: eventName missing entirely",
+            json!({
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": "IAMUser"}
+            }),
+        ),
+        (
+            "negated equals fires: eventName is an object, not a scalar",
+            json!({
+                "eventName": {"nested": "x"},
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": "IAMUser"}
+            }),
+        ),
+        (
+            "negated equals fires: eventName is an array, not a scalar",
+            json!({
+                "eventName": ["a", "b"],
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": "IAMUser"}
+            }),
+        ),
+        (
+            "negated equals fires: eventName is null",
+            json!({
+                "eventName": null,
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": "IAMUser"}
+            }),
+        ),
+        (
+            "negated any_of fires: userIdentity.type is a non-member value",
+            json!({
+                "eventName": "ConsoleLogin",
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": "AssumedRole"}
+            }),
+        ),
+        (
+            "negated any_of fires: userIdentity missing entirely",
+            json!({"eventName": "ConsoleLogin", "eventSource": "signin.amazonaws.com"}),
+        ),
+        (
+            "negated any_of fires: userIdentity.type is null",
+            json!({
+                "eventName": "ConsoleLogin",
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": {"type": null}
+            }),
+        ),
+        (
+            "negated any_of fires: userIdentity is a scalar, not an object",
+            json!({
+                "eventName": "ConsoleLogin",
+                "eventSource": "signin.amazonaws.com",
+                "userIdentity": "AROAEXAMPLE"
+            }),
+        ),
+        (
+            "negated any_of does not fire: userIdentity.type is Root",
+            with(neutral(), json!({"userIdentity": {"type": "Root"}})),
+        ),
+        (
+            "fixed subscript equals fires: resources[0].ARN matches",
+            with(
+                neutral(),
+                json!({"resources": [{"ARN": "arn:aws:s3:::critical-bucket"}]}),
+            ),
+        ),
+        (
+            "fixed subscript does not fire: resources is empty",
+            with(neutral(), json!({"resources": []})),
+        ),
+        (
+            "fixed subscript does not fire: element 0 has no ARN key",
+            with(
+                neutral(),
+                json!({"resources": [{"type": "AWS::S3::Bucket"}]}),
+            ),
+        ),
+        (
+            "fixed subscript does not fire: resources is an object, not an array",
+            with(
+                neutral(),
+                json!({"resources": {"ARN": "arn:aws:s3:::critical-bucket"}}),
+            ),
+        ),
+        (
+            "integer leaf equals fires: responseElements.count is 1",
+            with(neutral(), json!({"responseElements": {"count": 1}})),
+        ),
+        (
+            "integer leaf equals does not fire: responseElements.count is 2",
+            with(neutral(), json!({"responseElements": {"count": 2}})),
+        ),
+        (
+            "bool leaf equals fires: readOnly is true",
+            with(neutral(), json!({"readOnly": true})),
+        ),
+        (
+            "bool leaf equals does not fire: readOnly is false",
+            with(neutral(), json!({"readOnly": false})),
+        ),
+        (
+            "float leaf equals fires: latency is 1.5e-7 (T11's bug)",
+            with(neutral(), json!({"latency": 1.5e-7})),
+        ),
+        (
+            "float leaf equals fires: ratio is 1.0 (T11's bug)",
+            with(neutral(), json!({"ratio": 1.0})),
+        ),
+        (
+            "absent(false) fires: errorCode is present",
+            with(neutral(), json!({"errorCode": "AccessDenied"})),
+        ),
+        (
+            "absent(true) still fires: errorCode is null",
+            with(neutral(), json!({"errorCode": null})),
+        ),
+        (
+            "absent(true) still fires: errorCode is an empty object",
+            with(neutral(), json!({"errorCode": {}})),
+        ),
+        (
+            "absent(true) still fires: errorCode is an empty array",
+            with(neutral(), json!({"errorCode": []})),
+        ),
+        (
+            "absent(true) still fires: errorCode is a non-empty array",
+            with(neutral(), json!({"errorCode": ["x"]})),
+        ),
+    ];
+
+    let mut fired_rules = std::collections::HashSet::new();
+    for (label, record) in &records {
+        let text = record.to_string();
+        let linear = engine.evaluate_linear(record);
+        let indexed = engine.evaluate(record);
+        let raw = engine
+            .evaluate_raw(&text)
+            .unwrap_or_else(|e| panic!("{label}: record must parse: {e}; record={record}"));
+        assert_eq!(
+            linear, indexed,
+            "{label}: indexed diverged from the oracle; record={record}"
+        );
+        assert_eq!(
+            linear, raw,
+            "{label}: raw diverged from the oracle; record={record}"
+        );
+        if let Decision::Drop { rule_idx } = linear {
+            fired_rules.insert(rule_idx);
+        }
+    }
+    assert_eq!(
+        fired_rules.len(),
+        rule_count,
+        "every rule must fire on at least one record, or this test is vacuously \
+         comparing Keep to Keep for that rule; fired {fired_rules:?} of {rule_count} rules"
+    );
+}
+
 proptest::proptest! {
     /// Generated records, including missing fields and non-scalar leaves, must
     /// not separate the three evaluators.
