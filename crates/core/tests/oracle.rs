@@ -126,6 +126,36 @@ fn raw_agrees_with_linear_and_indexed_on_corpus() {
     assert!(checked > 0, "corpus was empty: the property proved nothing");
 }
 
+/// The shape `testing::corpus` never constructs: an `eventSource`-unconstrained
+/// rule ("IAM Session Renewals") firing under the `sts.amazonaws.com` bucket
+/// key that "Service Role STS Operations" also owns.
+#[test]
+fn indexed_agrees_with_linear_when_an_any_event_source_rule_shares_anothers_bucket() {
+    let engine = engine();
+    let record = json!({
+        "eventSource": "sts.amazonaws.com",
+        "eventName": "AssumeRole",
+        "requestParameters": {"roleSessionName": "botocore-session-12345"},
+        "userIdentity": {"type": "AssumedRole"}
+    });
+    let text = record.to_string();
+    let linear = engine.evaluate_linear(&record);
+    let indexed = engine.evaluate(&record);
+    let raw = engine.evaluate_raw(&text).expect("record parses");
+    assert!(
+        matches!(linear, Decision::Drop { .. }),
+        "record must exercise the unconstrained rule, or this test proves nothing"
+    );
+    assert_eq!(
+        linear, indexed,
+        "indexed diverged from the oracle on the shared-bucket record"
+    );
+    assert_eq!(
+        linear, raw,
+        "raw diverged from the oracle on the shared-bucket record"
+    );
+}
+
 /// Projection must error exactly when a full parse errors, so the pipeline's
 /// "unparseable record is KEPT" rule is unchanged.
 #[test]
