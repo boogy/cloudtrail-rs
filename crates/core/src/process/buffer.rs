@@ -122,23 +122,21 @@ pub fn buffer_run(
     for raw in &records {
         tally.record_in();
         let text = raw.get();
-        match serde_json::from_str::<Value>(text) {
-            Ok(value) => match engine.evaluate(&value) {
-                Decision::Keep => {
-                    tally.keep();
-                    survivors.push(text);
-                }
-                Decision::Drop { rule_idx } => {
-                    tally.drop_by_rule(rule_idx);
-                }
-            },
+        match engine.evaluate_raw(text) {
+            Ok(Decision::Keep) => {
+                tally.keep();
+                survivors.push(text);
+            }
+            Ok(Decision::Drop { rule_idx }) => {
+                tally.drop_by_rule(rule_idx);
+            }
             Err(_) => {
                 // Unparseable individual record: never dropped, only
                 // counted ("Unparseable individual record ⇒
                 // KEPT, never dropped"). Reachable even though the raw span
                 // was itself syntactically well-formed enough to capture —
                 // e.g. a lone UTF-16 surrogate escape parses as a span but
-                // fails full decode into a `Value`.
+                // fails full decode.
                 tally.parse_error();
                 tally.keep();
                 survivors.push(text);

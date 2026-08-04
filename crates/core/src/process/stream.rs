@@ -46,6 +46,7 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use serde::Deserializer as _;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+#[cfg(all(test, feature = "testing"))]
 use serde_json::Value;
 use serde_json::value::RawValue;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -505,14 +506,12 @@ pub async fn stream_run(
                 Some(StreamMsg::Record(raw)) => {
                     tally.record_in();
                     let text = raw.get();
-                    let keep = match serde_json::from_str::<Value>(text) {
-                        Ok(value) => match engine.evaluate(&value) {
-                            Decision::Keep => true,
-                            Decision::Drop { rule_idx } => {
-                                tally.drop_by_rule(rule_idx);
-                                false
-                            }
-                        },
+                    let keep = match engine.evaluate_raw(text) {
+                        Ok(Decision::Keep) => true,
+                        Ok(Decision::Drop { rule_idx }) => {
+                            tally.drop_by_rule(rule_idx);
+                            false
+                        }
                         Err(_) => {
                             // Unparseable individual record: kept, never
                             // dropped — parity with buffer_run.
