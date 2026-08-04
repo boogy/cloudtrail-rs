@@ -44,6 +44,14 @@ fn bench_filter(c: &mut Criterion) {
             }
         })
     });
+
+    c.bench_function("evaluate_raw", |b| {
+        b.iter(|| {
+            for r in &records {
+                black_box(engine.evaluate_raw(r).expect("corpus record parses"));
+            }
+        })
+    });
 }
 
 criterion_group!(benches, bench_filter);
