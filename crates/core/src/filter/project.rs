@@ -13,7 +13,7 @@
 //! test, because a divergence here silently changes which records are dropped.
 
 use crate::filter::path::{Path, Segment};
-use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -99,8 +99,14 @@ impl Projection {
 /// paths name. Returns one slot per path id.
 ///
 /// Errors exactly when `serde_json::from_str::<Value>` would: a skipped
-/// subtree is still parsed (and discarded) via `IgnoredAny`, so malformed
-/// JSON there is still an error and the caller still keeps the record.
+/// subtree is still walked and discarded via [`Skip`], which drives
+/// `deserialize_any` (not `IgnoredAny`'s fast structural skip) so every
+/// string in a skipped subtree is still fully decoded -- including its
+/// `\uXXXX` escapes -- and a lone surrogate or truncated escape there is
+/// still an error and the caller still keeps the record. `IgnoredAny` does
+/// not decode string contents, only skips past them structurally, so it
+/// silently accepted malformed escapes a full parse rejects; that was the
+/// bug this type exists to fix.
 pub(crate) fn project(
     json: &str,
     projection: &Projection,
@@ -149,7 +155,7 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         while let Some(key) = m.next_key::<String>()? {
             match self.node.keys.get(&key) {
                 None => {
-                    m.next_value::<IgnoredAny>()?;
+                    m.next_value_seed(Skip)?;
                 }
                 Some(child) => {
                     // Last-wins: a repeated key's earlier occurrence may have
@@ -173,7 +179,7 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
         let LevelSeed { node, out } = self;
         if node.indices.is_empty() && node.wildcard.is_none() {
-            while s.next_element::<IgnoredAny>()?.is_some() {}
+            while s.next_element_seed(Skip)?.is_some() {}
             return Ok(());
         }
         let mut position = 0usize;
@@ -203,10 +209,10 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
                         })?
                         .is_some()
                     } else {
-                        s.next_element::<IgnoredAny>()?.is_some()
+                        s.next_element_seed(Skip)?.is_some()
                     }
                 }
-                (None, None) => s.next_element::<IgnoredAny>()?.is_some(),
+                (None, None) => s.next_element_seed(Skip)?.is_some(),
             };
             if !consumed {
                 return Ok(());
@@ -246,6 +252,75 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     // `null` (visit_unit) and a bare `visit_none` both yield nothing
     // (path.rs:136), same as visit_map/visit_seq above: the caller already
     // nulled this node's whole subtree before dispatching here.
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_none<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// Consumes and discards one JSON value in a subtree the projection does not
+/// name -- but, unlike `serde::de::IgnoredAny`, still *validates* it.
+///
+/// `IgnoredAny` skips a value structurally without decoding string content
+/// (serde_json's `deserialize_ignored_any` fast path just scans past bytes),
+/// so a string escape serde_json's real string parser would reject -- most
+/// notably a lone UTF-16 surrogate half in a `\uXXXX` escape, which has no
+/// valid UTF-8/char encoding -- silently passes. `Skip` instead drives
+/// `deserialize_any`, the same entry point `serde_json::Value` uses: every
+/// string is routed through `visit_str`/`visit_borrowed_str`, which only run
+/// after serde_json has fully decoded the escape sequence, so a malformed one
+/// still surfaces as a deserialize error there. Maps and sequences recurse
+/// into `Skip` again so nested skipped subtrees get the same treatment; every
+/// visited value is otherwise dropped.
+struct Skip;
+
+impl<'de> DeserializeSeed<'de> for Skip {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Skip {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
+        while m.next_key::<String>()?.is_some() {
+            m.next_value_seed(Skip)?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<(), A::Error> {
+        while s.next_element_seed(Skip)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _v: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_string<E>(self, _v: String) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_bool<E>(self, _v: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _v: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _v: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _v: f64) -> Result<(), E> {
+        Ok(())
+    }
     fn visit_unit<E>(self) -> Result<(), E> {
         Ok(())
     }
@@ -679,6 +754,141 @@ mod tests {
                     specs[id]
                 );
             }
+        }
+    }
+
+    /// Spec F6 / T13: the contract `project()` documents is "errors exactly
+    /// when a full parse would," which is exactly what `IgnoredAny` breaks --
+    /// it skips a value's bytes structurally without decoding string escapes,
+    /// so a lone UTF-16 surrogate half deep in a subtree the projection never
+    /// names silently parses as OK where a full `Value` parse rejects it. Each
+    /// case here plants its malformation inside `"other"`, a key no path in
+    /// `p` names, so it only exercises the skip path (`Skip`, formerly
+    /// `IgnoredAny`) -- never the captured (`"eventName"`) path.
+    #[test]
+    fn skip_path_agrees_with_full_parse_on_malformed_escapes() {
+        let p = paths(&["eventName"]);
+        let proj = Projection::build(&p);
+
+        let cases: &[(&str, &str)] = &[
+            (
+                "lone high surrogate",
+                r#"{"eventName":"A","other":"\uD800"}"#,
+            ),
+            (
+                "lone low surrogate",
+                r#"{"eventName":"A","other":"\uDC00"}"#,
+            ),
+            (
+                "truncated surrogate pair",
+                r#"{"eventName":"A","other":"\uD800\u"}"#,
+            ),
+            (
+                "valid surrogate pair (emoji) must NOT be rejected",
+                r#"{"eventName":"A","other":"😀"}"#,
+            ),
+            (
+                "invalid hex escape \\uZZZZ",
+                r#"{"eventName":"A","other":"\uZZZZ"}"#,
+            ),
+            ("invalid escape \\q", r#"{"eventName":"A","other":"\q"}"#),
+            (
+                "unterminated string",
+                r#"{"eventName":"A","other":"unterminated}"#,
+            ),
+            (
+                "raw control byte (literal newline) inside a string",
+                "{\"eventName\":\"A\",\"other\":\"line\nbreak\"}",
+            ),
+            (
+                "trailing garbage after the top-level value",
+                r#"{"eventName":"A","other":"fine"} garbage"#,
+            ),
+            ("truncated document", r#"{"eventName":"A","other":{"a":1"#),
+        ];
+
+        for (label, json) in cases {
+            let full_ok = serde_json::from_str::<Value>(json).is_ok();
+            let skip_ok = project(json, &proj).is_ok();
+            assert_eq!(
+                skip_ok, full_ok,
+                "{label}: project() disagreed with a full parse on {json:?} \
+                 (full_ok={full_ok}, project_ok={skip_ok})"
+            );
+        }
+    }
+
+    /// Same malformation table as
+    /// `skip_path_agrees_with_full_parse_on_malformed_escapes`, but the
+    /// malformed string now lives inside a *projected* subtree
+    /// (`"eventName"` itself), exercising `LevelSeed::visit_str` /
+    /// `visit_map`'s captured-key path rather than `Skip`. This path goes
+    /// through serde_json's real string decoding regardless -- it was never
+    /// broken -- so this pins that it still isn't, now that `Skip` exists
+    /// alongside it.
+    #[test]
+    fn captured_path_agrees_with_full_parse_on_malformed_escapes() {
+        let p = paths(&["eventName"]);
+        let proj = Projection::build(&p);
+
+        let cases: &[(&str, &str)] = &[
+            ("lone high surrogate", r#"{"eventName":"\uD800"}"#),
+            ("lone low surrogate", r#"{"eventName":"\uDC00"}"#),
+            ("truncated surrogate pair", r#"{"eventName":"\uD800\u"}"#),
+            (
+                "valid surrogate pair (emoji) must NOT be rejected",
+                r#"{"eventName":"😀"}"#,
+            ),
+            ("invalid hex escape \\uZZZZ", r#"{"eventName":"\uZZZZ"}"#),
+            ("invalid escape \\q", r#"{"eventName":"\q"}"#),
+            ("unterminated string", r#"{"eventName":"unterminated}"#),
+            (
+                "raw control byte (literal newline) inside a string",
+                "{\"eventName\":\"line\nbreak\"}",
+            ),
+        ];
+
+        for (label, json) in cases {
+            let full_ok = serde_json::from_str::<Value>(json).is_ok();
+            let projected_ok = project(json, &proj).is_ok();
+            assert_eq!(
+                projected_ok, full_ok,
+                "{label}: project() disagreed with a full parse on {json:?} \
+                 (full_ok={full_ok}, project_ok={projected_ok})"
+            );
+        }
+    }
+
+    /// serde_json enforces a 128-level nesting limit when building a `Value`
+    /// (`recursion_limit` feature default). `Skip`'s recursion goes through
+    /// `deserialize_any`/`visit_seq`/`visit_map` on the *same*
+    /// `serde_json::Deserializer`, whose depth counter is incremented by the
+    /// deserializer itself (in `parse_array`/`parse_object`), not by which
+    /// `Visitor` is driving it -- so this checks the skip path enforces the
+    /// identical limit rather than assuming it, per T13's instructions.
+    /// Measured directly: depth 128 already errors on both sides (127 nested
+    /// arrays parse fine, 128 do not), and they agree at every depth tried.
+    #[test]
+    fn skip_path_enforces_the_same_recursion_limit_as_a_full_parse() {
+        let p = paths(&["eventName"]);
+        let proj = Projection::build(&p);
+
+        for depth in [100usize, 127, 128, 129, 150, 500] {
+            let mut nested = String::new();
+            for _ in 0..depth {
+                nested.push('[');
+            }
+            for _ in 0..depth {
+                nested.push(']');
+            }
+            let json = format!(r#"{{"eventName":"A","other":{nested}}}"#);
+            let full_ok = serde_json::from_str::<Value>(&json).is_ok();
+            let skip_ok = project(&json, &proj).is_ok();
+            assert_eq!(
+                skip_ok, full_ok,
+                "recursion-limit disagreement at depth {depth}: \
+                 full parse ok={full_ok}, project() ok={skip_ok}"
+            );
         }
     }
 }
