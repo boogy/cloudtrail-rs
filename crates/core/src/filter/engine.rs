@@ -256,12 +256,11 @@ impl Engine {
     pub fn evaluate(&self, record: &Value) -> Decision {
         let event_source = resolve(record, "eventSource");
         let event_name = resolve(record, "eventName");
+        let candidates = self
+            .index
+            .candidates_for(event_source.as_deref(), event_name.as_deref());
         for rule_idx in 0..self.index.rule_count() {
-            if self
-                .index
-                .permits(rule_idx, event_source.as_deref(), event_name.as_deref())
-                && self.rule_fires(rule_idx, record)
-            {
+            if candidates.permits(rule_idx) && self.rule_fires(rule_idx, record) {
                 return Decision::Drop { rule_idx };
             }
         }
@@ -297,8 +296,9 @@ impl Engine {
         let slots = project(record, &self.projection)?;
         let event_source = slots[self.event_source_slot].as_deref();
         let event_name = slots[self.event_name_slot].as_deref();
+        let candidates = self.index.candidates_for(event_source, event_name);
         for rule_idx in 0..self.index.rule_count() {
-            if self.index.permits(rule_idx, event_source, event_name)
+            if candidates.permits(rule_idx)
                 && self.rules[rule_idx]
                     .matches
                     .iter()

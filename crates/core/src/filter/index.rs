@@ -17,12 +17,69 @@ pub(super) struct RuleKeys {
     pub(super) event_name: Option<Vec<String>>,
 }
 
+/// A fixed-size, allocation-free-to-query membership set over `0..rule_count`.
+#[derive(Clone)]
+pub(super) struct Bits {
+    words: Vec<u64>,
+}
+
+impl Bits {
+    fn new(len: usize) -> Bits {
+        Bits {
+            words: vec![0u64; len.div_ceil(64)],
+        }
+    }
+
+    fn all_set(len: usize) -> Bits {
+        let mut bits = Bits::new(len);
+        for idx in 0..len {
+            bits.set(idx);
+        }
+        bits
+    }
+
+    fn set(&mut self, idx: usize) {
+        self.words[idx / 64] |= 1u64 << (idx % 64);
+    }
+
+    fn contains(&self, idx: usize) -> bool {
+        self.words
+            .get(idx / 64)
+            .is_some_and(|w| w & (1u64 << (idx % 64)) != 0)
+    }
+
+    fn union_from(&mut self, other: &Bits) {
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= b;
+        }
+    }
+}
+
+/// The two dimensions' candidate sets for one record, borrowed from the
+/// index that produced them -- computing this is the only per-record hash
+/// lookup; testing a rule against it is two bit tests.
+pub(super) struct Candidates<'a> {
+    source: &'a Bits,
+    name: &'a Bits,
+}
+
+impl Candidates<'_> {
+    pub(super) fn permits(&self, idx: usize) -> bool {
+        self.source.contains(idx) && self.name.contains(idx)
+    }
+}
+
 pub(super) struct RuleIndex {
-    by_event_source: HashMap<String, Vec<usize>>,
+    /// Each bucket already has `any_event_source` unioned in, so a hit here
+    /// is a complete answer -- no separate "or is it unconstrained" check.
+    by_event_source: HashMap<String, Bits>,
     /// Rules with no reducible `eventSource` constraint.
-    any_event_source: Vec<usize>,
-    by_event_name: HashMap<String, Vec<usize>>,
-    any_event_name: Vec<usize>,
+    any_event_source: Bits,
+    by_event_name: HashMap<String, Bits>,
+    any_event_name: Bits,
+    /// Every rule; the fallback when the record has no value for a
+    /// dimension, since an absent value constrains nothing.
+    all: Bits,
     /// Rules constrained on neither field.
     always: Vec<usize>,
     rule_count: usize,
@@ -33,10 +90,11 @@ impl RuleIndex {
     /// `rule_idx` here is the same index `Decision::Drop` and
     /// `Engine::rule_name` use.
     pub(super) fn build(keys: &[RuleKeys]) -> RuleIndex {
-        let mut by_event_source: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut any_event_source = Vec::new();
-        let mut by_event_name: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut any_event_name = Vec::new();
+        let rule_count = keys.len();
+        let mut by_event_source: HashMap<String, Bits> = HashMap::new();
+        let mut any_event_source = Bits::new(rule_count);
+        let mut by_event_name: HashMap<String, Bits> = HashMap::new();
+        let mut any_event_name = Bits::new(rule_count);
         let mut always = Vec::new();
 
         for (rule_idx, k) in keys.iter().enumerate() {
@@ -45,23 +103,35 @@ impl RuleIndex {
                     for lit in literals {
                         by_event_source
                             .entry(lit.clone())
-                            .or_default()
-                            .push(rule_idx);
+                            .or_insert_with(|| Bits::new(rule_count))
+                            .set(rule_idx);
                     }
                 }
-                None => any_event_source.push(rule_idx),
+                None => any_event_source.set(rule_idx),
             }
             match &k.event_name {
                 Some(literals) => {
                     for lit in literals {
-                        by_event_name.entry(lit.clone()).or_default().push(rule_idx);
+                        by_event_name
+                            .entry(lit.clone())
+                            .or_insert_with(|| Bits::new(rule_count))
+                            .set(rule_idx);
                     }
                 }
-                None => any_event_name.push(rule_idx),
+                None => any_event_name.set(rule_idx),
             }
             if k.event_source.is_none() && k.event_name.is_none() {
                 always.push(rule_idx);
             }
+        }
+
+        // `any_*` is only complete once every rule has been walked, so the
+        // union into each literal bucket has to be a second pass.
+        for bits in by_event_source.values_mut() {
+            bits.union_from(&any_event_source);
+        }
+        for bits in by_event_name.values_mut() {
+            bits.union_from(&any_event_name);
         }
 
         RuleIndex {
@@ -69,14 +139,16 @@ impl RuleIndex {
             any_event_source,
             by_event_name,
             any_event_name,
+            all: Bits::all_set(rule_count),
             always,
-            rule_count: keys.len(),
+            rule_count,
         }
     }
 
     /// Candidate rules for a record, in ascending `rule_idx` order so
     /// first-match-wins agrees with `evaluate_linear`. Kept for this module's
-    /// own tests; the engine walks `permits` directly to avoid the `Vec`.
+    /// own tests; the engine walks `Candidates::permits` directly to avoid
+    /// the `Vec`.
     #[cfg(test)]
     pub(super) fn candidates(
         &self,
@@ -97,39 +169,52 @@ impl RuleIndex {
         self.rule_count
     }
 
+    /// A missing bucket key falls back to `any_event_source`, not `all`: the
+    /// record positively has a value, and that value matched no rule's
+    /// literal set, so only the unconstrained rules remain candidates.
+    fn source_bits(&self, event_source: Option<&str>) -> &Bits {
+        match event_source {
+            None => &self.all,
+            Some(es) => self
+                .by_event_source
+                .get(es)
+                .unwrap_or(&self.any_event_source),
+        }
+    }
+
+    fn name_bits(&self, event_name: Option<&str>) -> &Bits {
+        match event_name {
+            None => &self.all,
+            Some(en) => self.by_event_name.get(en).unwrap_or(&self.any_event_name),
+        }
+    }
+
+    /// One hash lookup per dimension; the returned `Candidates` answers
+    /// `permits` for every rule with two bit tests and no further lookups.
+    pub(super) fn candidates_for(
+        &self,
+        event_source: Option<&str>,
+        event_name: Option<&str>,
+    ) -> Candidates<'_> {
+        Candidates {
+            source: self.source_bits(event_source),
+            name: self.name_bits(event_name),
+        }
+    }
+
     /// Whether the rule at `idx` must be considered for a record with the
     /// given `eventSource`/`eventName`. The sole implementation of the
-    /// conservative selection rule -- both `candidates_into` and the engine's
-    /// hot path go through this.
+    /// conservative selection rule, restated here for tests that check one
+    /// index at a time; the engine's hot path calls `candidates_for` once per
+    /// record instead.
+    #[cfg(test)]
     pub(super) fn permits(
         &self,
         idx: usize,
         event_source: Option<&str>,
         event_name: Option<&str>,
     ) -> bool {
-        // Buckets are built in ascending rule_idx order, so binary_search is
-        // valid here without an explicit sort.
-        let permitted_by_source = match event_source {
-            None => true,
-            Some(es) => {
-                self.any_event_source.binary_search(&idx).is_ok()
-                    || self
-                        .by_event_source
-                        .get(es)
-                        .is_some_and(|v| v.binary_search(&idx).is_ok())
-            }
-        };
-        let permitted_by_name = match event_name {
-            None => true,
-            Some(en) => {
-                self.any_event_name.binary_search(&idx).is_ok()
-                    || self
-                        .by_event_name
-                        .get(en)
-                        .is_some_and(|v| v.binary_search(&idx).is_ok())
-            }
-        };
-        permitted_by_source && permitted_by_name
+        self.candidates_for(event_source, event_name).permits(idx)
     }
 
     /// Fill `out` with the candidate rule indices. `out` is cleared first.
@@ -141,8 +226,9 @@ impl RuleIndex {
         out: &mut Vec<usize>,
     ) {
         out.clear();
+        let candidates = self.candidates_for(event_source, event_name);
         for idx in 0..self.rule_count {
-            if self.permits(idx, event_source, event_name) {
+            if candidates.permits(idx) {
                 out.push(idx);
             }
         }
@@ -390,5 +476,33 @@ mod tests {
         }];
         let index = RuleIndex::build(&keys);
         assert_eq!(index.always(), &[0]);
+    }
+
+    #[test]
+    fn permits_agrees_with_the_bucket_a_record_falls_into() {
+        let keys = vec![
+            RuleKeys {
+                event_source: extract_literals(r"^kms\.amazonaws\.com$"),
+                event_name: None,
+            },
+            RuleKeys {
+                event_source: None,
+                event_name: None,
+            },
+        ];
+        let index = RuleIndex::build(&keys);
+        assert!(index.permits(0, Some("kms.amazonaws.com"), None));
+        assert!(
+            !index.permits(0, Some("other.amazonaws.com"), None),
+            "a literal-indexed rule must not be a candidate for an unrelated eventSource"
+        );
+        assert!(
+            index.permits(1, Some("other.amazonaws.com"), None),
+            "the unconstrained rule is a candidate no matter which eventSource is present"
+        );
+        assert!(
+            index.permits(0, None, None),
+            "a record missing eventSource must still consider a source-indexed rule"
+        );
     }
 }
