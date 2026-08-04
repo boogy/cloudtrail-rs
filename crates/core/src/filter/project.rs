@@ -122,6 +122,36 @@ pub(crate) fn project(
     Ok(out)
 }
 
+/// `deserialize_str` decodes escapes the same way `next_key::<String>()`
+/// does, so malformed keys still error identically -- only the `.to_owned()`
+/// is skipped.
+struct KeyLookup<'a> {
+    keys: &'a HashMap<String, Node>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for KeyLookup<'a> {
+    type Value = Option<&'a Node>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl<'de, 'a> Visitor<'de> for KeyLookup<'a> {
+    type Value = Option<&'a Node>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(self.keys.get(v))
+    }
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(self.keys.get(v))
+    }
+}
+
 /// Walks one JSON value against one trie node.
 struct LevelSeed<'a> {
     node: &'a Node,
@@ -152,8 +182,10 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
-        while let Some(key) = m.next_key::<String>()? {
-            match self.node.keys.get(&key) {
+        while let Some(found) = m.next_key_seed(KeyLookup {
+            keys: &self.node.keys,
+        })? {
+            match found {
                 None => {
                     m.next_value_seed(Skip)?;
                 }
@@ -284,6 +316,32 @@ impl<'de> DeserializeSeed<'de> for Skip {
     }
 }
 
+/// See `KeyLookup`.
+struct DiscardKey;
+
+impl<'de> DeserializeSeed<'de> for DiscardKey {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DiscardKey {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E>(self, _v: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_borrowed_str<E>(self, _v: &'de str) -> Result<(), E> {
+        Ok(())
+    }
+}
+
 impl<'de> Visitor<'de> for Skip {
     type Value = ();
 
@@ -292,7 +350,7 @@ impl<'de> Visitor<'de> for Skip {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<(), A::Error> {
-        while m.next_key::<String>()?.is_some() {
+        while m.next_key_seed(DiscardKey)?.is_some() {
             m.next_value_seed(Skip)?;
         }
         Ok(())
