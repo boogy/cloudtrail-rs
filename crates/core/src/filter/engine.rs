@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
-use crate::filter::index::RuleIndex;
+use crate::filter::index::{RuleIndex, RuleKeys, extract_literals};
 use crate::filter::path::{Path, Segment, parse_path, visit_values};
 use crate::filter::project::{Projection, project};
 use crate::filter::resolve;
@@ -64,10 +64,12 @@ struct CompiledRule {
 pub struct Engine {
     rules: Vec<CompiledRule>,
     index: RuleIndex,
-    /// Projection over every distinct field path the rules reference, plus a
-    /// dedicated slot for `eventSource` at `event_source_slot`.
+    /// Projection over every distinct field path the rules reference, plus
+    /// dedicated slots for `eventSource` and `eventName` at
+    /// `event_source_slot` / `event_name_slot`.
     projection: Projection,
     event_source_slot: usize,
+    event_name_slot: usize,
 }
 
 /// Cheap selectivity ordinal used to order a rule's conditions
@@ -84,10 +86,28 @@ fn selectivity_rank(pattern: &str) -> u8 {
     }
 }
 
-/// Whether a compiled path is exactly the top-level `eventSource` field --
-/// the only field the rule index keys on today (widened in T16).
-fn is_event_source(path: &Path) -> bool {
-    matches!(path.segments.as_slice(), [Segment::Key(k)] if k == "eventSource")
+/// Whether a compiled path is exactly the single top-level key `field`.
+fn is_single_key(path: &Path, field: &str) -> bool {
+    matches!(path.segments.as_slice(), [Segment::Key(k)] if k == field)
+}
+
+/// Literals a condition restricts `field` to, or `None` if it cannot be
+/// reduced. A negated condition never yields index keys: it says which values
+/// must NOT appear, which excludes nothing.
+fn index_literals(matches: &[CompiledMatch], field: &str) -> Option<Vec<String>> {
+    let m = matches
+        .iter()
+        .find(|m| !m.negate && is_single_key(&m.path, field))?;
+    match &m.op {
+        Op::Regex(re) => extract_literals(re.as_str()),
+        Op::Equals(s) => Some(vec![s.clone()]),
+        Op::AnyOf(set) => {
+            let mut v: Vec<String> = set.iter().cloned().collect();
+            v.sort();
+            Some(v)
+        }
+        Op::Absent(_) => None,
+    }
 }
 
 impl Engine {
@@ -150,36 +170,29 @@ impl Engine {
                 paths.push(m.path.clone());
             }
         }
-        // A dedicated slot for the index key, so `evaluate_raw` can select
+        // Dedicated slots for the index keys, so `evaluate_raw` can select
         // candidates without a second pass over the record.
         let event_source_slot = paths.len();
         paths.push(parse_path("eventSource").expect("literal path is valid"));
+        let event_name_slot = paths.len();
+        paths.push(parse_path("eventName").expect("literal path is valid"));
         let projection = Projection::build(&paths);
 
-        // Index by each rule's `eventSource` condition — conservatively: a
-        // rule whose eventSource pattern cannot be reduced to a fixed set of
-        // literals (or that has no eventSource condition at all) falls into
-        // `always` and is checked against every record. See `filter::index`.
-        let event_source_patterns: Vec<Option<&str>> = compiled
+        let keys: Vec<RuleKeys> = compiled
             .iter()
-            .map(|rule| {
-                rule.matches
-                    .iter()
-                    .find(|m| !m.negate && is_event_source(&m.path))
-                    .and_then(|m| match &m.op {
-                        Op::Regex(re) => Some(re.as_str()),
-                        // T16 teaches the index to take literals directly.
-                        Op::Equals(_) | Op::AnyOf(_) | Op::Absent(_) => None,
-                    })
+            .map(|rule| RuleKeys {
+                event_source: index_literals(&rule.matches, "eventSource"),
+                event_name: index_literals(&rule.matches, "eventName"),
             })
             .collect();
-        let index = RuleIndex::build(&event_source_patterns);
+        let index = RuleIndex::build(&keys);
 
         Ok(Engine {
             rules: compiled,
             index,
             projection,
             event_source_slot,
+            event_name_slot,
         })
     }
 
@@ -188,11 +201,10 @@ impl Engine {
         &self.rules[rule_idx].name
     }
 
-    /// Indices of rules the rule index could not conservatively narrow to a
-    /// fixed set of `eventSource` literals — these are checked against every
-    /// record regardless of `eventSource`. Exposed so the CLI (`validate`,
-    /// Task 17) can warn, by name, about each one: this is the user's lever
-    /// to get the indexed evaluator's speedup.
+    /// Indices of rules the rule index could not conservatively narrow on
+    /// either `eventSource` or `eventName` — these are checked against every
+    /// record. Exposed so the CLI can warn, by name, about each one: this is
+    /// the user's lever to get the indexed evaluator's speedup.
     pub fn always_rules(&self) -> &[usize] {
         self.index.always()
     }
@@ -237,13 +249,17 @@ impl Engine {
     }
 
     /// Evaluate `record` against only the candidate rules the rule index
-    /// selects for its `eventSource` (`index[eventSource] ∪ always`),
-    /// still in ascending `rule_idx` order so first-match-wins agrees with
-    /// `evaluate_linear`. Semantics are identical to `evaluate_linear`; see
-    /// the equivalence test below.
+    /// selects for its `eventSource` and `eventName`, still in ascending
+    /// `rule_idx` order so first-match-wins agrees with `evaluate_linear`.
+    /// Semantics are identical to `evaluate_linear`; see the equivalence test
+    /// below.
     pub fn evaluate(&self, record: &Value) -> Decision {
         let event_source = resolve(record, "eventSource");
-        for rule_idx in self.index.candidates(event_source.as_deref()) {
+        let event_name = resolve(record, "eventName");
+        for rule_idx in self
+            .index
+            .candidates(event_source.as_deref(), event_name.as_deref())
+        {
             if self.rule_fires(rule_idx, record) {
                 return Decision::Drop { rule_idx };
             }
@@ -278,10 +294,10 @@ impl Engine {
             return Ok(self.evaluate(&value));
         }
         let slots = project(record, &self.projection)?;
-        for rule_idx in self
-            .index
-            .candidates(slots[self.event_source_slot].as_deref())
-        {
+        for rule_idx in self.index.candidates(
+            slots[self.event_source_slot].as_deref(),
+            slots[self.event_name_slot].as_deref(),
+        ) {
             if self.rules[rule_idx]
                 .matches
                 .iter()
@@ -365,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_three_of_25_example_rules_land_in_always() {
+    fn exactly_two_of_25_example_rules_land_in_always() {
         let engine = engine();
         let mut always_names: Vec<&str> = engine
             .always_rules()
@@ -374,17 +390,17 @@ mod tests {
             .collect();
         always_names.sort_unstable();
         // "AWS Config Recorder": eventSource `.*\.amazonaws\.com$` is not
-        // anchored at the start. "IAM Session Renewals" and "Automated Tool
-        // Describe Operations" have no eventSource condition at all. Every
-        // other rule's eventSource is an anchored literal or literal
-        // alternation and lands in the literal index instead.
+        // anchored at the start, and its eventName `^(Describe|List|Get).*$`
+        // has an unreducible trailing `.*`. "Automated Tool Describe
+        // Operations" has no eventSource condition and its eventName
+        // `^Describe.*$` is likewise unreducible. Every other rule reduces to
+        // literals on eventSource, eventName, or both, and lands in one of
+        // the literal indexes instead -- including "IAM Session Renewals",
+        // whose eventName is the exact literal "AssumeRole" even though it
+        // has no eventSource condition.
         assert_eq!(
             always_names,
-            vec![
-                "AWS Config Recorder",
-                "Automated Tool Describe Operations",
-                "IAM Session Renewals",
-            ]
+            vec!["AWS Config Recorder", "Automated Tool Describe Operations"]
         );
     }
 
@@ -406,16 +422,17 @@ mod tests {
     }
 
     #[test]
-    fn iam_session_renewals_lands_in_always_and_still_drops_with_no_event_source() {
+    fn iam_session_renewals_is_indexed_by_event_name_and_still_drops_with_no_event_source() {
         let engine = engine();
         let idx = rule_idx_named(&engine, "IAM Session Renewals");
         assert!(
-            engine.always_rules().contains(&idx),
-            "IAM Session Renewals has no eventSource condition and must fall back to always"
+            !engine.always_rules().contains(&idx),
+            "IAM Session Renewals' eventName is the exact literal \"AssumeRole\", so it must \
+             be indexed by eventName despite having no eventSource condition"
         );
 
-        // No eventSource field at all: evaluate() must fall back to `always`
-        // only, and this rule's other conditions still fire.
+        // No eventSource field at all: evaluate() must still consider this
+        // rule via its eventName index entry, and its other conditions fire.
         let record = json!({
             "eventName": "AssumeRole",
             "requestParameters": { "roleSessionName": "botocore-session-1690000000" },
