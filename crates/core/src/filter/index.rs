@@ -1,69 +1,137 @@
-//! Rule index: maps an `eventSource` value to the rules whose `eventSource`
-//! condition it can satisfy, so `Engine::evaluate` only checks a candidate
-//! subset of rules instead of scanning all of them (`evaluate_linear`, the
-//! oracle, still does the latter).
+//! Rule index: narrows candidate rules by `eventSource` and `eventName`
+//! literals, so `Engine::evaluate` only checks a candidate subset of rules
+//! instead of scanning all of them (`evaluate_linear`, the oracle, still does
+//! the latter).
 //!
-//! Built once, in `Engine::new`, from each rule's `eventSource` pattern (or
-//! `None` if the rule has no `eventSource` condition).
-//! Over-inclusion (a rule landing in `always` when it didn't
-//! need to) is safe; over-exclusion is a silent correctness bug, so
-//! extraction is deliberately conservative.
+//! Over-inclusion (a rule landing in `always` when it didn't need to) is
+//! safe; over-exclusion is a silent correctness bug, so extraction is
+//! deliberately conservative.
 
 use std::collections::HashMap;
 
-/// `HashMap<eventSource literal, rule indices>` plus the `always` bucket —
-/// rules whose `eventSource` condition (or its absence) could not be
-/// conservatively reduced to a fixed set of literals, and so must be checked
-/// against every record regardless of its `eventSource`.
+/// The literal values each indexable field restricts a rule to. `None` means
+/// the rule places no reducible constraint on that field, so it must be
+/// considered for every value of it.
+pub(super) struct RuleKeys {
+    pub(super) event_source: Option<Vec<String>>,
+    pub(super) event_name: Option<Vec<String>>,
+}
+
 pub(super) struct RuleIndex {
-    literal: HashMap<String, Vec<usize>>,
+    by_event_source: HashMap<String, Vec<usize>>,
+    /// Rules with no reducible `eventSource` constraint.
+    any_event_source: Vec<usize>,
+    by_event_name: HashMap<String, Vec<usize>>,
+    any_event_name: Vec<usize>,
+    /// Rules constrained on neither field.
     always: Vec<usize>,
+    rule_count: usize,
 }
 
 impl RuleIndex {
-    /// `event_source_patterns[rule_idx]` is `Some(pattern)` if that rule has
-    /// an `eventSource` condition, `None` otherwise. Order must match the
-    /// engine's compiled rule order — `rule_idx` here is the same index
-    /// `Decision::Drop` and `Engine::rule_name` use.
-    pub(super) fn build(event_source_patterns: &[Option<&str>]) -> RuleIndex {
-        let mut literal: HashMap<String, Vec<usize>> = HashMap::new();
+    /// `keys[rule_idx]` corresponds to the engine's compiled rule order --
+    /// `rule_idx` here is the same index `Decision::Drop` and
+    /// `Engine::rule_name` use.
+    pub(super) fn build(keys: &[RuleKeys]) -> RuleIndex {
+        let mut by_event_source: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut any_event_source = Vec::new();
+        let mut by_event_name: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut any_event_name = Vec::new();
         let mut always = Vec::new();
-        for (rule_idx, pattern) in event_source_patterns.iter().enumerate() {
-            match pattern.and_then(extract_literals) {
+
+        for (rule_idx, k) in keys.iter().enumerate() {
+            match &k.event_source {
                 Some(literals) => {
                     for lit in literals {
-                        literal.entry(lit).or_default().push(rule_idx);
+                        by_event_source
+                            .entry(lit.clone())
+                            .or_default()
+                            .push(rule_idx);
                     }
                 }
-                None => always.push(rule_idx),
+                None => any_event_source.push(rule_idx),
+            }
+            match &k.event_name {
+                Some(literals) => {
+                    for lit in literals {
+                        by_event_name.entry(lit.clone()).or_default().push(rule_idx);
+                    }
+                }
+                None => any_event_name.push(rule_idx),
+            }
+            if k.event_source.is_none() && k.event_name.is_none() {
+                always.push(rule_idx);
             }
         }
-        RuleIndex { literal, always }
+
+        RuleIndex {
+            by_event_source,
+            any_event_source,
+            by_event_name,
+            any_event_name,
+            always,
+            rule_count: keys.len(),
+        }
     }
 
-    /// Candidate rule indices for a record whose `eventSource` resolved to
-    /// `event_source` (`None` if the record has no `eventSource` field, or
-    /// its value did not coerce to a string): `index[event_source] ∪ always`,
-    /// in ascending `rule_idx` order so first-match-wins agrees with
-    /// `evaluate_linear`.
-    pub(super) fn candidates(&self, event_source: Option<&str>) -> Vec<usize> {
-        let mut out = event_source
-            .and_then(|es| self.literal.get(es))
-            .cloned()
-            .unwrap_or_default();
-        out.extend_from_slice(&self.always);
-        out.sort_unstable();
+    /// Candidate rules for a record, in ascending `rule_idx` order so
+    /// first-match-wins agrees with `evaluate_linear`.
+    pub(super) fn candidates(
+        &self,
+        event_source: Option<&str>,
+        event_name: Option<&str>,
+    ) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.candidates_into(event_source, event_name, &mut out);
         out
     }
 
     pub(super) fn always(&self) -> &[usize] {
         &self.always
     }
+
+    /// Fill `out` with the candidate rule indices. `out` is cleared first.
+    pub(super) fn candidates_into(
+        &self,
+        event_source: Option<&str>,
+        event_name: Option<&str>,
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
+        // A rule survives if it is permitted by BOTH dimensions. Buckets are
+        // built in ascending rule_idx order, so binary_search is valid here
+        // without an explicit sort.
+        let permitted_by_source = |idx: usize| match event_source {
+            None => true,
+            Some(es) => {
+                self.any_event_source.binary_search(&idx).is_ok()
+                    || self
+                        .by_event_source
+                        .get(es)
+                        .is_some_and(|v| v.binary_search(&idx).is_ok())
+            }
+        };
+        let permitted_by_name = |idx: usize| match event_name {
+            None => true,
+            Some(en) => {
+                self.any_event_name.binary_search(&idx).is_ok()
+                    || self
+                        .by_event_name
+                        .get(en)
+                        .is_some_and(|v| v.binary_search(&idx).is_ok())
+            }
+        };
+        for idx in 0..self.rule_count {
+            if permitted_by_source(idx) && permitted_by_name(idx) {
+                out.push(idx);
+            }
+        }
+    }
 }
 
 /// Conservatively extract the finite set of literal strings a `^...$`-anchored
-/// `eventSource` regex can match, or `None` if it cannot be reduced to exact
-/// literals without risking a silent under-match.
+/// regex can match, or `None` if it cannot be reduced to exact literals
+/// without risking a silent under-match.
 ///
 /// Accepts exactly two shapes, both fully anchored:
 /// - a plain escaped literal: `^kms\.amazonaws\.com$` -> `["kms.amazonaws.com"]`
@@ -74,7 +142,7 @@ impl RuleIndex {
 /// Everything else — inline flags (`(?i)`), character classes, quantifiers,
 /// nested or multiple groups, a non-anchored pattern, an escaped `|` inside
 /// the group — returns `None`, and the caller must fall back to `always`.
-fn extract_literals(pattern: &str) -> Option<Vec<String>> {
+pub(super) fn extract_literals(pattern: &str) -> Option<Vec<String>> {
     if pattern.contains("(?") {
         return None;
     }
@@ -228,25 +296,79 @@ mod tests {
 
     #[test]
     fn build_buckets_by_extracted_literal_and_always() {
-        let patterns: Vec<Option<&str>> = vec![
-            Some(r"^kms\.amazonaws\.com$"), // 0: index under one literal
-            Some(r"^(cloudwatch|logs|ec2)\.amazonaws\.com$"), // 1: three literals
-            None,                           // 2: no eventSource condition -> always
-            Some(r".*\.amazonaws\.com$"),   // 3: unreducible -> always
-            Some(r"^logs\.amazonaws\.com$"), // 4: shares a literal with rule 1
+        let event_sources: Vec<Option<Vec<String>>> = vec![
+            extract_literals(r"^kms\.amazonaws\.com$"), // 0: index under one literal
+            extract_literals(r"^(cloudwatch|logs|ec2)\.amazonaws\.com$"), // 1: three literals
+            None,                                       // 2: no eventSource condition -> always
+            extract_literals(r".*\.amazonaws\.com$"),   // 3: unreducible -> always
+            extract_literals(r"^logs\.amazonaws\.com$"), // 4: shares a literal with rule 1
         ];
-        let index = RuleIndex::build(&patterns);
+        let keys: Vec<RuleKeys> = event_sources
+            .into_iter()
+            .map(|event_source| RuleKeys {
+                event_source,
+                event_name: None,
+            })
+            .collect();
+        let index = RuleIndex::build(&keys);
 
         assert_eq!(index.always(), &[2, 3]);
-        assert_eq!(index.candidates(Some("kms.amazonaws.com")), vec![0, 2, 3]);
         assert_eq!(
-            index.candidates(Some("logs.amazonaws.com")),
+            index.candidates(Some("kms.amazonaws.com"), None),
+            vec![0, 2, 3]
+        );
+        assert_eq!(
+            index.candidates(Some("logs.amazonaws.com"), None),
             vec![1, 2, 3, 4]
         );
         assert_eq!(
-            index.candidates(Some("unrelated.amazonaws.com")),
+            index.candidates(Some("unrelated.amazonaws.com"), None),
             vec![2, 3]
         );
-        assert_eq!(index.candidates(None), vec![2, 3]);
+        assert_eq!(
+            index.candidates(None, None),
+            vec![0, 1, 2, 3, 4],
+            "a record with no eventSource must still consider every rule"
+        );
+    }
+
+    #[test]
+    fn indexes_rules_that_only_constrain_event_name() {
+        let keys = vec![
+            RuleKeys {
+                event_source: None,
+                event_name: Some(vec!["Decrypt".into()]),
+            },
+            RuleKeys {
+                event_source: None,
+                event_name: None,
+            },
+        ];
+        let index = RuleIndex::build(&keys);
+        assert_eq!(
+            index.always(),
+            &[1],
+            "only the wholly-unconstrained rule belongs in `always`"
+        );
+        assert_eq!(index.candidates(None, Some("Decrypt")), vec![0, 1]);
+        assert_eq!(index.candidates(None, Some("Encrypt")), vec![1]);
+        assert_eq!(
+            index.candidates(None, None),
+            vec![0, 1],
+            "a record with no eventName must still consider every rule"
+        );
+    }
+
+    #[test]
+    fn a_negated_condition_never_supplies_an_index_key() {
+        // Enforced in engine.rs, asserted here as documentation of the rule:
+        // a rule that fires when eventSource is NOT kms must not be filed
+        // under "kms", or it would be skipped for every other source.
+        let keys = vec![RuleKeys {
+            event_source: None,
+            event_name: None,
+        }];
+        let index = RuleIndex::build(&keys);
+        assert_eq!(index.always(), &[0]);
     }
 }
