@@ -18,7 +18,6 @@ pub(super) struct RuleKeys {
 }
 
 /// A fixed-size, allocation-free-to-query membership set over `0..rule_count`.
-#[derive(Clone)]
 pub(super) struct Bits {
     words: Vec<u64>,
 }
