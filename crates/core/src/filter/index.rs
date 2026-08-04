@@ -75,7 +75,9 @@ impl RuleIndex {
     }
 
     /// Candidate rules for a record, in ascending `rule_idx` order so
-    /// first-match-wins agrees with `evaluate_linear`.
+    /// first-match-wins agrees with `evaluate_linear`. Kept for this module's
+    /// own tests; the engine walks `permits` directly to avoid the `Vec`.
+    #[cfg(test)]
     pub(super) fn candidates(
         &self,
         event_source: Option<&str>,
@@ -90,18 +92,24 @@ impl RuleIndex {
         &self.always
     }
 
-    /// Fill `out` with the candidate rule indices. `out` is cleared first.
-    pub(super) fn candidates_into(
+    /// Number of compiled rules, i.e. the exclusive upper bound on `rule_idx`.
+    pub(super) fn rule_count(&self) -> usize {
+        self.rule_count
+    }
+
+    /// Whether the rule at `idx` must be considered for a record with the
+    /// given `eventSource`/`eventName`. The sole implementation of the
+    /// conservative selection rule -- both `candidates_into` and the engine's
+    /// hot path go through this.
+    pub(super) fn permits(
         &self,
+        idx: usize,
         event_source: Option<&str>,
         event_name: Option<&str>,
-        out: &mut Vec<usize>,
-    ) {
-        out.clear();
-        // A rule survives if it is permitted by BOTH dimensions. Buckets are
-        // built in ascending rule_idx order, so binary_search is valid here
-        // without an explicit sort.
-        let permitted_by_source = |idx: usize| match event_source {
+    ) -> bool {
+        // Buckets are built in ascending rule_idx order, so binary_search is
+        // valid here without an explicit sort.
+        let permitted_by_source = match event_source {
             None => true,
             Some(es) => {
                 self.any_event_source.binary_search(&idx).is_ok()
@@ -111,7 +119,7 @@ impl RuleIndex {
                         .is_some_and(|v| v.binary_search(&idx).is_ok())
             }
         };
-        let permitted_by_name = |idx: usize| match event_name {
+        let permitted_by_name = match event_name {
             None => true,
             Some(en) => {
                 self.any_event_name.binary_search(&idx).is_ok()
@@ -121,8 +129,20 @@ impl RuleIndex {
                         .is_some_and(|v| v.binary_search(&idx).is_ok())
             }
         };
+        permitted_by_source && permitted_by_name
+    }
+
+    /// Fill `out` with the candidate rule indices. `out` is cleared first.
+    #[cfg(test)]
+    pub(super) fn candidates_into(
+        &self,
+        event_source: Option<&str>,
+        event_name: Option<&str>,
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
         for idx in 0..self.rule_count {
-            if permitted_by_source(idx) && permitted_by_name(idx) {
+            if self.permits(idx, event_source, event_name) {
                 out.push(idx);
             }
         }
