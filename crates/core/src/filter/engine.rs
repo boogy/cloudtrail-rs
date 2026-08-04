@@ -256,11 +256,12 @@ impl Engine {
     pub fn evaluate(&self, record: &Value) -> Decision {
         let event_source = resolve(record, "eventSource");
         let event_name = resolve(record, "eventName");
-        for rule_idx in self
-            .index
-            .candidates(event_source.as_deref(), event_name.as_deref())
-        {
-            if self.rule_fires(rule_idx, record) {
+        for rule_idx in 0..self.index.rule_count() {
+            if self
+                .index
+                .permits(rule_idx, event_source.as_deref(), event_name.as_deref())
+                && self.rule_fires(rule_idx, record)
+            {
                 return Decision::Drop { rule_idx };
             }
         }
@@ -294,14 +295,14 @@ impl Engine {
             return Ok(self.evaluate(&value));
         }
         let slots = project(record, &self.projection)?;
-        for rule_idx in self.index.candidates(
-            slots[self.event_source_slot].as_deref(),
-            slots[self.event_name_slot].as_deref(),
-        ) {
-            if self.rules[rule_idx]
-                .matches
-                .iter()
-                .all(|m| Self::match_fires_projected(m, &slots))
+        let event_source = slots[self.event_source_slot].as_deref();
+        let event_name = slots[self.event_name_slot].as_deref();
+        for rule_idx in 0..self.index.rule_count() {
+            if self.index.permits(rule_idx, event_source, event_name)
+                && self.rules[rule_idx]
+                    .matches
+                    .iter()
+                    .all(|m| Self::match_fires_projected(m, &slots))
             {
                 return Ok(Decision::Drop { rule_idx });
             }
