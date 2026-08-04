@@ -137,6 +137,13 @@ fn raw_errors_exactly_when_full_parse_errors() {
         r#"{"eventName":"A""#,
         r#"not json at all"#,
         r#""#,
+        // T13: a lone (unpaired) UTF-16 surrogate escape in a subtree no
+        // rule references. `serde::de::IgnoredAny` skips a value's bytes
+        // structurally without decoding string escapes, so it used to
+        // accept this where a full `Value` parse rejects it -- silently
+        // turning an unparseable record into one the engine evaluated (and
+        // could drop) instead of keeping.
+        r#"{"eventName":"A","x":"\uD800"}"#,
     ] {
         let full_ok = serde_json::from_str::<Value>(bad).is_ok();
         let raw_ok = engine.evaluate_raw(bad).is_ok();
