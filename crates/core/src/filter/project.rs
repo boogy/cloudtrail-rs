@@ -3,10 +3,12 @@
 //!
 //! The engine reads a handful of scalars per record, but the record carries
 //! bulky `requestParameters`/`responseElements` subtrees no rule touches.
-//! Per spec findings F4/F5, fully materialising a `serde_json::Value` is
-//! measured at ~88% of per-record time, and walking the JSON once against a
-//! trie of the ruleset's own field paths (discarding the rest) is measured at
-//! ~3x cheaper on the parse.
+//! Fully materialising a `serde_json::Value` dominates per-record time (spec
+//! F4/F5). Measured on the 14-record corpus (~1.16 KB mean, ~70% of bytes
+//! skipped), this walk is ~1.4x cheaper end-to-end than parse-then-evaluate —
+//! not the ~3x the spec predicted for its 4.2 KB synthetic records, because
+//! the JSON is still scanned byte-for-byte whether a subtree is captured or
+//! skipped. `crates/core/benches/filter.rs` is the measurement.
 //!
 //! Correctness rule: this must agree with `path::visit_values` on a fully
 //! parsed `Value` for every (record, path) pair. Enforced by differential
