@@ -157,8 +157,9 @@ impl RuleSet {
     ///
     /// Fatal at load (returns `Err`) on: invalid/non-semver `version`, a major
     /// version other than 1 or 2, an uncompilable or oversized `regex`, a
-    /// malformed field path, a duplicate or empty rule `name`, or an empty
-    /// `matches` list (which would vacuously match, and drop, every record).
+    /// malformed v2 field path (v1's has no syntax to reject — see
+    /// `validate`), a duplicate or empty rule `name`, or an empty `matches`
+    /// list (which would vacuously match, and drop, every record).
     pub fn parse(bytes: &[u8]) -> Result<RuleSet, ConfigError> {
         let wire: WireRuleSet =
             serde_yaml_ng::from_slice(bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -215,11 +216,16 @@ impl RuleSet {
             meta: wire.meta,
             rules,
         };
-        parsed.validate()?;
+        parsed.validate(version.major)?;
         Ok(parsed)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// `major` is the already-validated `version`'s major component: v1
+    /// `field_name` lowers to a literal dotted key path at `Engine::new`
+    /// (`filter::path::literal_path`), which has no syntax to reject, so a
+    /// malformed v1 path must not be fatal here — only v2's `field`, which
+    /// adds subscript syntax `parse_path` can fail on, is checked.
+    fn validate(&self, major: u64) -> Result<(), ConfigError> {
         let mut names = HashSet::with_capacity(self.rules.len());
         for rule in &self.rules {
             if rule.name.is_empty() {
@@ -239,12 +245,14 @@ impl RuleSet {
                 )));
             }
             for m in &rule.matches {
-                crate::filter::parse_path(&m.field).map_err(|e| {
-                    ConfigError::Parse(format!(
-                        "rule {:?}: invalid field path {:?}: {e}",
-                        rule.name, m.field
-                    ))
-                })?;
+                if major != 1 {
+                    crate::filter::parse_path(&m.field).map_err(|e| {
+                        ConfigError::Parse(format!(
+                            "rule {:?}: invalid field path {:?}: {e}",
+                            rule.name, m.field
+                        ))
+                    })?;
+                }
                 if let MatchOp::Regex(pattern) = &m.op {
                     RegexBuilder::new(pattern)
                         .size_limit(REGEX_SIZE_LIMIT)
