@@ -35,3 +35,4 @@ proptest = "1"
 [[bench]]
 name = "filter"
 harness = false
+required-features = ["testing"]

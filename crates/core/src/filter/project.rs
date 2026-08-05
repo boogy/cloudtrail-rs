@@ -277,15 +277,17 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     }
     fn visit_f64<E>(mut self, v: f64) -> Result<(), E> {
         // `f64::to_string()` disagrees with `Number`'s Display on float-lexed
-        // literals (`1.0` -> "1", `1.5e-7` -> decimal); match path.rs:135 by
-        // going through `Number` itself. `from_f64` is `None` only for
-        // NaN/infinity, which JSON can't express, so `None` is correct there too.
+        // literals (`1.0` -> "1", `1.5e-7` -> decimal); match the `Value::Number`
+        // arm of `path::walk` (`resolve`'s scalar coercion) by going through
+        // `Number` itself. `from_f64` is `None` only for NaN/infinity, which
+        // JSON can't express, so `None` is correct there too.
         self.capture_terminals(serde_json::Number::from_f64(v).map(|n| n.to_string()));
         Ok(())
     }
-    // `null` (visit_unit) and a bare `visit_none` both yield nothing
-    // (path.rs:136), same as visit_map/visit_seq above: the caller already
-    // nulled this node's whole subtree before dispatching here.
+    // `null` (visit_unit) and a bare `visit_none` both yield nothing, same as
+    // the `Value::Null | Value::Object(_) | Value::Array(_)` arm of
+    // `path::walk` and visit_map/visit_seq above: the caller already nulled
+    // this node's whole subtree before dispatching here.
     fn visit_unit<E>(self) -> Result<(), E> {
         Ok(())
     }
@@ -784,9 +786,10 @@ mod tests {
     /// Differential test for fixed-subscript array paths, in the style of
     /// `projection_agrees_with_visit_values`. Wildcard semantics deliberately
     /// diverge from `visit_values` (first-scalar-wins vs. existential), so
-    /// this covers only `Segment::Index`, the class of bug T11 shipped twice:
-    /// short array, scalar-not-object element, `null` element, object instead
-    /// of array, an empty array, and an object element missing the queried key.
+    /// this covers only `Segment::Index`: a class of array-projection bug
+    /// that has shipped twice, covering short array, scalar-not-object
+    /// element, `null` element, object instead of array, an empty array, and
+    /// an object element missing the queried key.
     #[test]
     fn projects_array_subscripts_agrees_with_visit_values() {
         let specs = ["resources[0].ARN", "resources[1].ARN", "resources[2].ARN"];

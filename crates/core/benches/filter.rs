@@ -1,7 +1,7 @@
 //! Where per-record time goes. The spec's F4 measurement, as a repeatable
 //! benchmark: JSON parse dominates evaluation by roughly 10x, so this is the
-//! guard that the projection work (T10-T15) actually moved the number it
-//! claimed to move.
+//! guard that the projected-parse work actually moved the number it claimed
+//! to move.
 
 use cloudtrail_rs_core::config::rules::RuleSet;
 use cloudtrail_rs_core::filter::Engine;
