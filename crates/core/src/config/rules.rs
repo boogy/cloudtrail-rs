@@ -261,33 +261,41 @@ impl RuleSet {
         Ok(())
     }
 
-    /// Describe the rule's `eventSource` condition for diagnostics, or `None`
-    /// if it has none. The CLI's `validate` uses this so it never has to
-    /// reach into `Match` internals, which differ between schema versions.
+    /// Describe the rule's `eventSource` and/or `eventName` conditions for
+    /// diagnostics, or `None` if it has neither. The CLI's `validate` uses
+    /// this so it never has to reach into `Match` internals, which differ
+    /// between schema versions.
     pub fn index_key_description(&self, rule_idx: usize) -> Option<String> {
-        let m = self
-            .rules
-            .get(rule_idx)?
-            .matches
-            .iter()
-            .find(|m| m.field == "eventSource")?;
-        // Quoted via Display, never Debug: the pattern must appear verbatim so
-        // a user can find it in their YAML, and Debug would double every
-        // backslash in a regex.
-        let described = match &m.op {
-            MatchOp::Regex(p) => format!("regex \"{p}\""),
-            MatchOp::Equals(s) => format!("equals \"{s}\""),
-            MatchOp::AnyOf(v) => {
-                let items: Vec<String> = v.iter().map(|s| format!("\"{s}\"")).collect();
-                format!("any_of [{}]", items.join(", "))
-            }
-            MatchOp::Absent(b) => format!("absent {b}"),
-        };
-        Some(if m.negate {
-            format!("negated {described}")
+        let matches = &self.rules.get(rule_idx)?.matches;
+        let parts: Vec<String> = ["eventSource", "eventName"]
+            .into_iter()
+            .filter_map(|field| {
+                let m = matches.iter().find(|m| m.field == field)?;
+                // Quoted via Display, never Debug: the pattern must appear
+                // verbatim so a user can find it in their YAML, and Debug
+                // would double every backslash in a regex.
+                let described = match &m.op {
+                    MatchOp::Regex(p) => format!("regex \"{p}\""),
+                    MatchOp::Equals(s) => format!("equals \"{s}\""),
+                    MatchOp::AnyOf(v) => {
+                        let items: Vec<String> = v.iter().map(|s| format!("\"{s}\"")).collect();
+                        format!("any_of [{}]", items.join(", "))
+                    }
+                    MatchOp::Absent(b) => format!("absent {b}"),
+                };
+                let described = if m.negate {
+                    format!("negated {described}")
+                } else {
+                    described
+                };
+                Some(format!("{field} {described}"))
+            })
+            .collect();
+        if parts.is_empty() {
+            None
         } else {
-            described
-        })
+            Some(parts.join(", "))
+        }
     }
 }
 
@@ -573,7 +581,7 @@ rules: []
     }
 
     #[test]
-    fn describes_the_event_source_condition_for_diagnostics() {
+    fn describes_the_event_source_and_event_name_conditions_for_diagnostics() {
         let v1 = br#"
 version: 1.0.0
 rules:
@@ -581,8 +589,18 @@ rules:
     matches:
       - field_name: eventSource
         regex: "^kms\\.amazonaws\\.com$"
-  - name: No eventSource
+  - name: Has eventName only
     matches:
+      - field_name: eventName
+        regex: "^Describe"
+  - name: Has neither
+    matches:
+      - field_name: userAgent
+        regex: "^aws-cli"
+  - name: Has both
+    matches:
+      - field_name: eventSource
+        regex: "^kms\\.amazonaws\\.com$"
       - field_name: eventName
         regex: "^Describe"
 "#;
@@ -592,9 +610,19 @@ rules:
         // backslashes into `\\.` and break it.
         assert_eq!(
             rs.index_key_description(0).as_deref(),
-            Some(r#"regex "^kms\.amazonaws\.com$""#)
+            Some(r#"eventSource regex "^kms\.amazonaws\.com$""#)
         );
-        assert_eq!(rs.index_key_description(1), None);
+        assert_eq!(
+            rs.index_key_description(1).as_deref(),
+            Some(r#"eventName regex "^Describe""#),
+            "a rule narrowed only by eventName must be described, not treated as \
+             having no indexable condition"
+        );
+        assert_eq!(rs.index_key_description(2), None);
+        assert_eq!(
+            rs.index_key_description(3).as_deref(),
+            Some(r#"eventSource regex "^kms\.amazonaws\.com$", eventName regex "^Describe""#)
+        );
 
         let v2 = br#"
 version: 2.0.0
@@ -607,7 +635,7 @@ rules:
         let rs = RuleSet::parse(v2).expect("must parse");
         assert_eq!(
             rs.index_key_description(0).as_deref(),
-            Some("any_of [\"kms.amazonaws.com\", \"ec2.amazonaws.com\"]")
+            Some("eventSource any_of [\"kms.amazonaws.com\", \"ec2.amazonaws.com\"]")
         );
     }
 

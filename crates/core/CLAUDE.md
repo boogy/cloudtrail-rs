@@ -18,24 +18,25 @@ Adapters live in `crates/aws`. If you reach for an AWS type here, it belongs in
 
 ## Layout
 
-| Module        | Role                                                                                |
-| ------------- | ----------------------------------------------------------------------------------- |
-| `filter/`     | `Engine`: compiles rules, indexes by `eventSource`, evaluates AND-within/OR-across. |
-| `decode/`     | Per-trigger `EventDecoder`s, each gated behind a `decode-*` feature.                |
-| `process/`    | `buffer_run` / streaming record processing (buffer vs stream by size).              |
-| `pipeline.rs` | `Pipeline`: wires the four ports + `Settings`; the composition target.              |
-| `config/`     | `Settings`, `CT_*` env overlay, `ConfigUri`, `RuleSet`, `FileConfigSource`.         |
-| `model.rs`    | CloudTrail record/envelope types.                                                   |
-| `metrics.rs`  | `Metrics`, `EmfMetricsSink`, `NoopMetricsSink`.                                     |
-| `testing/`    | Port doubles + `corpus` (realistic CloudTrail records), `testing` feature.          |
+| Module        | Role                                                                                            |
+| ------------- | ----------------------------------------------------------------------------------------------- |
+| `filter/`     | `Engine`: compiles rules, indexes by `eventSource`/`eventName`, evaluates AND-within/OR-across. |
+| `decode/`     | Per-trigger `EventDecoder`s, each gated behind a `decode-*` feature.                            |
+| `process/`    | `buffer_run` / streaming record processing (buffer vs stream by size).                          |
+| `pipeline.rs` | `Pipeline`: wires the four ports + `Settings`; the composition target.                          |
+| `config/`     | `Settings`, `CT_*` env overlay, `ConfigUri`, `RuleSet`, `FileConfigSource`.                     |
+| `model.rs`    | CloudTrail record/envelope types.                                                               |
+| `metrics.rs`  | `Metrics`, `EmfMetricsSink`, `NoopMetricsSink`.                                                 |
+| `testing/`    | Port doubles + `corpus` (realistic CloudTrail records), `testing` feature.                      |
 
 ## Invariants
 
 - **Warm path is pure computation.** Per-record work does no trait dispatch —
   dispatch happens once per object/invocation. Keep it that way.
 - **Rule indexing.** A record only checks rules that could apply (indexed by
-  `eventSource` literal), plus the `always` bucket for un-indexable rules.
-  `cli validate` warns about rules that fall into `always`.
+  `eventSource` and `eventName` literals), plus the `always` bucket for
+  un-indexable rules. `cli validate` warns about rules that fall into
+  `always`, and `--max-unindexed <PERCENT>` can gate on the fraction that do.
 - **Feature-gated decoders.** Adding a source = one decoder behind one
   `decode-*` feature; zero changes to the rest of core.
 - **Buffer/stream parity.** The mode is chosen by object **size**, so the two
