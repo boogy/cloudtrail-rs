@@ -8,7 +8,8 @@
 //! logic — nothing here reimplements filtering or validation:
 //! - `validate <uri>`: builds the `Engine`, prints rule/pattern counts, and
 //!   warns (non-fatally) about every rule `Engine::always_rules()` could not
-//!   index. Non-zero exit only on a config/build error — the CI gate.
+//!   index. Non-zero exit on a config/build error; `--max-unindexed` adds an
+//!   opt-in CI gate on top of that.
 //! - `test <rules> <sample.json.gz>`: per-record KEEP/DROP against the
 //!   compiled ruleset, plus a summary, so dead rules are visible.
 //! - `filter <source> <dest> --rules <uri> [--settings <path>]`:
@@ -69,10 +70,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Build the Engine from a rules document; report rule/pattern counts
-    /// and warn about every rule that could not be indexed by eventSource.
+    /// and warn about every rule that could not be indexed by eventSource or
+    /// eventName.
     Validate {
         /// `ssm://`, `s3://`, `file://`, or a bare local path.
         uri: String,
+        /// Fail (exit 1) if more than this percentage of rules could not be
+        /// indexed. Omit for no gate. Intended for CI: an un-indexed ruleset
+        /// still works, but checks every rule against every record.
+        #[arg(long, value_name = "PERCENT")]
+        max_unindexed: Option<u8>,
     },
     /// Evaluate every record in a decompressed CloudTrail sample against a
     /// ruleset, reporting KEEP/DROP (with rule name) per record plus a
@@ -402,25 +409,24 @@ async fn load_engine(uri: &str) -> anyhow::Result<(Engine, RuleSet)> {
 }
 
 /// Names the rule at `rule_idx` and explains, in prose, why the rule index
-/// could not narrow it to a fixed set of `eventSource` literals — either it
-/// has no `eventSource` condition at all, or that condition's pattern is not
-/// one of the two conservative shapes `Engine::new`'s index extraction
-/// accepts (the rule index).
+/// could not narrow it on `eventSource` or `eventName` — either it has no
+/// condition on either field, or the condition(s) it has are not one of the
+/// two conservative shapes `Engine::new`'s index extraction accepts.
 fn explain_always_rule(rule_set: &RuleSet, rule_idx: usize) -> String {
     let name = &rule_set.rules[rule_idx].name;
     match rule_set.index_key_description(rule_idx) {
         Some(described) => format!(
-            "warning: rule {name:?} not indexed by eventSource ({described} could not be \
-             reduced to a fixed set of literals): checked against every record"
+            "warning: rule {name:?} not indexed ({described} could not be reduced to a fixed \
+             set of literals): checked against every record"
         ),
         None => format!(
-            "warning: rule {name:?} not indexed by eventSource (no eventSource condition): \
+            "warning: rule {name:?} not indexed (no eventSource or eventName condition): \
              checked against every record"
         ),
     }
 }
 
-async fn cmd_validate(uri: &str) -> anyhow::Result<()> {
+async fn cmd_validate(uri: &str, max_unindexed: Option<u8>) -> anyhow::Result<()> {
     let (engine, rule_set) = load_engine(uri).await?;
 
     let rule_count = rule_set.rules.len();
@@ -429,6 +435,23 @@ async fn cmd_validate(uri: &str) -> anyhow::Result<()> {
 
     for &rule_idx in engine.always_rules() {
         eprintln!("{}", explain_always_rule(&rule_set, rule_idx));
+    }
+
+    let unindexed = engine.always_rules().len();
+    if let Some(ceiling) = max_unindexed {
+        // Integer percentage, rounded up, so "1 of 3 unindexed" is 34% and
+        // trips a 33% ceiling rather than silently passing it.
+        let percent = if rule_count == 0 {
+            0
+        } else {
+            unindexed.saturating_mul(100).div_ceil(rule_count)
+        };
+        if percent > usize::from(ceiling) {
+            anyhow::bail!(
+                "{unindexed} of {rule_count} rules ({percent}%) could not be indexed, \
+                 exceeding --max-unindexed {ceiling}"
+            );
+        }
     }
 
     Ok(())
@@ -1189,7 +1212,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Validate { uri } => cmd_validate(&uri).await,
+        Command::Validate { uri, max_unindexed } => cmd_validate(&uri, max_unindexed).await,
         Command::Test { rules, sample } => cmd_test(&rules, &sample).await,
         Command::Filter {
             source,

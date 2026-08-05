@@ -1227,3 +1227,41 @@ fn filter_stream_mode_copies_an_unrecognized_object_verbatim() {
     std::fs::remove_file(&input_path).unwrap();
     std::fs::remove_file(&output_path).unwrap();
 }
+
+#[test]
+fn validate_max_unindexed_gates_an_unindexable_ruleset() {
+    // The only condition is on a field the index does not key on, so 100% of
+    // rules land in `always` and a 50% ceiling must fail the command.
+    let path = temp_path("validate-max-unindexed.yaml");
+    std::fs::write(
+        &path,
+        b"version: 2.0.0\nrules:\n  - name: Unindexable\n    matches:\n      - field: userAgent\n        regex: \"^aws-cli\"\n",
+    )
+    .unwrap();
+
+    let ungated = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate")
+        .arg(&path)
+        .assert();
+    assert!(
+        ungated.get_output().status.success(),
+        "without the flag, validate must still exit 0 (unchanged behaviour)"
+    );
+
+    let gated = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("validate")
+        .arg(&path)
+        .arg("--max-unindexed")
+        .arg("50")
+        .assert();
+    let output = gated.get_output();
+    assert!(
+        !output.status.success(),
+        "100% unindexed must fail a 50% ceiling; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::remove_file(&path).unwrap();
+}

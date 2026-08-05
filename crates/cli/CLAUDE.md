@@ -6,9 +6,12 @@ so a rules `uri` may be `ssm://`, `s3://`, `file://`, or a bare local path.
 
 ## Subcommands (all reuse `core`'s engine — never reimplement filtering)
 
-- `validate <uri>` — build the `Engine`, print rule/pattern counts, warn
-  (non-fatally) about rules that couldn't be indexed (`always` bucket). Non-zero
-  exit only on a config/build error — this is the CI gate.
+- `validate <uri> [--max-unindexed <PERCENT>]` — build the `Engine`, print
+  rule/pattern counts, warn (non-fatally) about rules that couldn't be indexed
+  by `eventSource`/`eventName` (`always` bucket). Non-zero exit on a
+  config/build error always; `--max-unindexed` adds an opt-in CI gate that
+  also fails when more than `PERCENT` of rules land in `always` (default: no
+  gate, exit 0).
 - `validate-settings [path]` — run a settings document through the same
   `Settings::from_parts` the Lambdas run at cold start (`CT_*` overrides
   honoured), so a config value that would panic mid-invocation under

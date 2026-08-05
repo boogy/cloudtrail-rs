@@ -35,18 +35,29 @@ normal SDK way (env, profile, instance role, …).
 
 Builds the `Engine` from the rules document, prints rule/pattern counts, and
 warns (to stderr, non-fatally) about every rule the index could not anchor by
-`eventSource` (see [the `always` bucket](rules.md#the-rule-index-and-the-always-bucket)).
-Exit code is non-zero **only** on an actual config/build error (bad YAML, invalid
-semver, unresolvable regex, duplicate rule name, empty `matches`, etc.) — this is
-what CI should gate on.
+`eventSource` or `eventName` (see [the `always` bucket](rules.md#the-rule-index-and-the-always-bucket)).
+Exit code is non-zero on an actual config/build error (bad YAML, invalid
+semver, unresolvable regex, duplicate rule name, empty `matches`, etc.).
 
 ```sh
 cloudtrail-rs validate examples/rules.example.yaml
 # 25 rules, 81 patterns compiled
-# warning: rule "IAM Session Renewals" not indexed by eventSource (no eventSource condition): checked against every record
-# warning: rule "AWS Config Recorder" not indexed by eventSource (pattern ".*\.amazonaws\.com$" could not be reduced to a fixed set of literals): checked against every record
-# warning: rule "Automated Tool Describe Operations" not indexed by eventSource (no eventSource condition): checked against every record
+# warning: rule "AWS Config Recorder" not indexed (eventSource regex ".*\.amazonaws\.com$", eventName regex "^(Describe|List|Get).*$" could not be reduced to a fixed set of literals): checked against every record
+# warning: rule "Automated Tool Describe Operations" not indexed (eventName regex "^Describe.*$" could not be reduced to a fixed set of literals): checked against every record
 echo $?   # 0
+```
+
+`--max-unindexed <PERCENT>` is an opt-in CI gate: if more than `PERCENT`
+percent of rules land in the `always` bucket, `validate` exits 1 instead of 0.
+Omit it and behaviour is unchanged — the warnings still print, the exit code
+is still 0. Useful in CI to catch a ruleset that has silently lost its index
+(e.g. a regex edit that broke the anchored-literal shape the index extracts).
+
+```sh
+cloudtrail-rs validate examples/rules.example.yaml --max-unindexed 5
+# ...same warnings as above...
+# error: 2 of 25 rules (8%) could not be indexed, exceeding --max-unindexed 5
+echo $?   # 1
 ```
 
 ## `validate-settings [path]`
