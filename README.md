@@ -64,6 +64,14 @@ and [Configuration](docs/configuration.md) for the full `CT_*` reference.
 
 ## Quickstart (local, no AWS)
 
+The binary for macOS is available as a brew formula.
+
+```sh
+brew install boogy/tap/cloudtrail-rs
+```
+
+Or build from source:
+
 ```sh
 cargo build --release -p cloudtrail-rs
 mkdir -p in out && cp your-cloudtrail-*.json.gz in/
