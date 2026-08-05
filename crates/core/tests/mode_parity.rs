@@ -33,7 +33,8 @@
 
 mod common;
 
-use common::{Verdict, assert_parity, drop_decrypt_engine, gzip, no_op_engine};
+use cloudtrail_rs_core::config::Processing;
+use common::{Verdict, assert_parity, drop_decrypt_engine, gzip, no_op_engine, run_buffer};
 
 // ---------------------------------------------------------------------------
 // Ordinary envelopes
@@ -450,4 +451,35 @@ async fn records_are_written_back_byte_for_byte() {
         ),
     )
     .await;
+}
+
+#[tokio::test]
+async fn an_unparseable_record_survives_inside_a_written_object_and_is_counted() {
+    // Unlike `a_failure_after_records_were_evaluated_publishes_no_per_rule_drops`,
+    // nothing here makes the *object* fail: the lone UTF-16 surrogate escape is
+    // kept, not dropped, so the object is written with all three records intact
+    // and the parse error still shows up in the count.
+    let input =
+        gzip(br#"{"Records":[{"eventName":"A"},{"eventName":"\ud800"},{"eventName":"B"}]}"#);
+    let expected = Verdict::Written(
+        r#"{"Records":[{"eventName":"A"},{"eventName":"\ud800"},{"eventName":"B"}]}"#.to_string(),
+    );
+
+    assert_parity(
+        "one unparseable record among two ordinary ones, object still written",
+        &input,
+        &no_op_engine(),
+        expected,
+    )
+    .await;
+
+    let (_, _, metrics) = run_buffer(&input, &no_op_engine(), &Processing::default());
+    assert_eq!(
+        metrics.parse_errors, 1,
+        "the \\ud800 record is one parse error"
+    );
+    assert_eq!(
+        metrics.records_kept, 3,
+        "all three records survive, including the unparseable one"
+    );
 }
