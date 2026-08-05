@@ -2,9 +2,12 @@
 //! records against it. AND within a rule, OR across rules.
 //!
 //! `evaluate_linear` walks `rules` in order and, within a rule, `matches` in
-//! order — no rule index yet (that is a later task; `evaluate` does not
-//! exist here). It is kept permanently as the correctness oracle any indexed
-//! evaluator must agree with.
+//! order, checking every rule — the correctness oracle, kept permanently so
+//! the indexed `evaluate` always has something to be checked against.
+//! `evaluate` narrows that same walk to the candidates a `RuleIndex` selects
+//! by `eventSource`/`eventName`. `evaluate_raw` is the entry point proper:
+//! it parses only the fields the ruleset references (or falls back to a full
+//! parse when a `[*]` wildcard is present) and calls `evaluate`.
 
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;

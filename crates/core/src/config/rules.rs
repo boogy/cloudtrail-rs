@@ -12,15 +12,16 @@ use regex::RegexBuilder;
 
 use crate::error::ConfigError;
 
-/// Upper bound on a single compiled regex's internal size, well below the
-/// `regex` crate's own default (10 MiB): a pathological pattern is rejected
-/// at config load, not left to blow up memory on the first match.
-/// Compiled-size ceiling for a single rule pattern, 1 MiB.
+/// Compiled-size ceiling for a single rule pattern, 1 MiB — well below the
+/// `regex` crate's own default (10 MiB), so a pathological pattern is
+/// rejected at config load rather than left to blow up memory on the first
+/// match.
 ///
-/// `RuleSet::parse` uses this to reject a pattern that cannot be compiled within
-/// budget. `Engine::new` performs the *real* compile later and MUST use this same
-/// constant — a smaller limit there would let a ruleset pass validation and then
-/// fail to build, which at runtime means falling back to `on_config_error`.
+/// `RuleSet::parse` uses this to reject a pattern that cannot be compiled
+/// within budget. `Engine::new` performs the *real* compile later and MUST
+/// use this same constant — a smaller limit there would let a ruleset pass
+/// validation and then fail to build, which at runtime means falling back to
+/// `on_config_error`.
 pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// One exclusion rule: fires (drops the record) only if *all* of its
@@ -278,7 +279,7 @@ impl RuleSet {
         let parts: Vec<String> = ["eventSource", "eventName"]
             .into_iter()
             .filter_map(|field| {
-                let m = matches.iter().find(|m| m.field == field)?;
+                let m = matches.iter().find(|m| !m.negate && m.field == field)?;
                 // Quoted via Display, never Debug: the pattern must appear
                 // verbatim so a user can find it in their YAML, and Debug
                 // would double every backslash in a regex.
@@ -613,9 +614,10 @@ rules:
         regex: "^Describe"
 "#;
         let rs = RuleSet::parse(v1).expect("must parse");
-        // Display, not Debug: `crates/cli/tests/cli.rs:80` asserts the raw
-        // pattern text appears in the warning, and Debug would escape the
-        // backslashes into `\\.` and break it.
+        // Display, not Debug: `crates/cli/tests/cli.rs`'s
+        // `validate_example_ruleset_exits_zero_and_warns_about_always_rules`
+        // asserts the raw pattern text appears in the warning, and Debug
+        // would escape the backslashes into `\\.` and break it.
         assert_eq!(
             rs.index_key_description(0).as_deref(),
             Some(r#"eventSource regex "^kms\.amazonaws\.com$""#)

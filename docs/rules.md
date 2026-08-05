@@ -64,8 +64,9 @@ rules:
 
 Version `2.x` replaces `field_name`/`regex` with `field` plus exactly one of
 four operators, and an optional `negate`. v1 documents (`version: 1.x`,
-`field_name`/`regex` only) continue to load and evaluate byte-identically —
-migrating to v2 is optional, not forced.
+`field_name`/`regex` only) keep evaluating unchanged: v1's `field_name` is a
+literal dotted key path, with no subscript or wildcard syntax — v2's `field`
+is what adds them. Migrating to v2 is optional, not forced.
 
 ```yaml
 version: 2.0.0
@@ -85,6 +86,12 @@ rules:
         equals: "arn:aws:s3:::noisy-bucket"
         negate: true
 ```
+
+> **The wildcard cliff.** A single `[*]` anywhere in the ruleset — like
+> `resources[*].ARN` above — disables the projected-parse optimization for
+> the _whole_ ruleset, not just that rule: every record is now fully parsed
+> instead of only the fields rules reference. Functionally identical, just
+> slower; worth knowing before copying this example into a large ruleset.
 
 | Field              | Meaning                                                                                                                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
