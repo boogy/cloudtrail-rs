@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
 use crate::filter::index::{RuleIndex, RuleKeys, extract_literals};
-use crate::filter::path::{Path, Segment, parse_path, visit_values};
+use crate::filter::path::{Path, Segment, literal_path, parse_path, visit_values};
 use crate::filter::project::{Projection, project};
 use crate::filter::resolve;
 
@@ -116,6 +116,14 @@ impl Engine {
     /// `RuleSet::parse` validates against, reused here (not redefined) so a
     /// ruleset that passes validation cannot then fail to build.
     pub fn new(rules: RuleSet) -> Result<Engine, ConfigError> {
+        // `RuleSet::parse` already validated `version`, so this cannot fail.
+        // v1's `field_name` must lower to literal key segments, never parsed
+        // subscripts: before v2, `resolve` did literal object-key lookup
+        // only, and a deployed v1 ruleset must keep evaluating exactly as it
+        // did then (`path::literal_path`'s doc comment).
+        let major = semver::Version::parse(&rules.version)
+            .expect("RuleSet::parse already validated version")
+            .major;
         let mut compiled = Vec::with_capacity(rules.rules.len());
         for rule in rules.rules {
             let mut matches = Vec::with_capacity(rule.matches.len());
@@ -136,12 +144,19 @@ impl Engine {
                     MatchOp::AnyOf(v) => Op::AnyOf(v.into_iter().collect()),
                     MatchOp::Absent(b) => Op::Absent(b),
                 };
-                let path = parse_path(&m.field).map_err(|e| {
-                    ConfigError::Parse(format!(
-                        "rule {:?}: invalid field path {:?}: {e}",
-                        rule.name, m.field
-                    ))
-                })?;
+                // v1 paths are literal dotted keys only (`path::resolve`'s
+                // documented limitation) and never fail to build; v2 adds
+                // subscript syntax, so it goes through the fallible parser.
+                let path = if major == 1 {
+                    literal_path(&m.field)
+                } else {
+                    parse_path(&m.field).map_err(|e| {
+                        ConfigError::Parse(format!(
+                            "rule {:?}: invalid field path {:?}: {e}",
+                            rule.name, m.field
+                        ))
+                    })?
+                };
                 matches.push(CompiledMatch {
                     path,
                     op,
@@ -734,6 +749,82 @@ rules:
             engine.evaluate(&json!({"resources": [{"ARN": "arn:aws:s3:::quiet-bucket"}]})),
             Decision::Keep
         );
+    }
+
+    /// v1 `field_name` must lower to a literal dotted key path, never a
+    /// parsed subscript: `path::resolve`'s documented v1 limitation. Before
+    /// this branch, `"requestParameters.tag[0]"` could only ever match a
+    /// record with a literal `"tag[0]"` key, never index into an array.
+    #[test]
+    fn v1_field_name_is_a_literal_key_never_a_parsed_subscript() {
+        let yaml = br#"
+version: 1.0.0
+rules:
+  - name: Literal Tag Key
+    matches:
+      - field_name: requestParameters.tag[0]
+        regex: "^x$"
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+
+        assert_eq!(
+            engine.evaluate(&json!({"requestParameters": {"tag": ["x", "y"]}})),
+            Decision::Keep,
+            "v1 must not parse [0] as an array subscript"
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"requestParameters": {"tag[0]": "x"}})),
+            Decision::Drop { rule_idx: 0 },
+            "v1 must treat \"tag[0]\" as a literal object key"
+        );
+    }
+
+    /// Same field text, v2: the opposite of the test above, because v2's
+    /// `field` goes through `parse_path` and understands `[0]` as a subscript.
+    #[test]
+    fn v2_field_parses_the_same_text_as_a_subscript() {
+        let yaml = br#"
+version: 2.0.0
+rules:
+  - name: Literal Tag Key
+    matches:
+      - field: requestParameters.tag[0]
+        equals: "x"
+"#;
+        let engine = Engine::new(RuleSet::parse(yaml).expect("must parse")).expect("must build");
+
+        assert_eq!(
+            engine.evaluate(&json!({"requestParameters": {"tag": ["x", "y"]}})),
+            Decision::Drop { rule_idx: 0 },
+            "v2 must index into the array"
+        );
+        assert_eq!(
+            engine.evaluate(&json!({"requestParameters": {"tag[0]": "x"}})),
+            Decision::Keep,
+            "v2 must not treat \"tag[0]\" as a literal object key"
+        );
+    }
+
+    /// This closes finding T05 as a side effect: a v1 `field_name` that
+    /// `parse_path` would reject is no longer a fatal config error, because
+    /// `literal_path` has no syntax to reject — it just becomes a key that
+    /// never matches, the pre-v2 behaviour.
+    #[test]
+    fn v1_ruleset_with_a_malformed_field_name_builds_and_never_matches() {
+        for bad in ["a[", "a..b", ".a", ""] {
+            let yaml = format!(
+                "version: 1.0.0\nrules:\n  - name: Malformed\n    matches:\n      - field_name: {bad:?}\n        regex: \".*\"\n"
+            );
+            let rule_set = RuleSet::parse(yaml.as_bytes())
+                .unwrap_or_else(|e| panic!("v1 ruleset with field_name {bad:?} must parse: {e}"));
+            let engine = Engine::new(rule_set)
+                .unwrap_or_else(|e| panic!("v1 ruleset with field_name {bad:?} must build: {e}"));
+            assert_eq!(
+                engine.evaluate(&json!({"a": "x", "b": "y"})),
+                Decision::Keep,
+                "malformed v1 path {bad:?} must simply never match"
+            );
+        }
     }
 
     #[test]

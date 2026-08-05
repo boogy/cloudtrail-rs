@@ -106,6 +106,21 @@ pub fn parse_path(s: &str) -> Result<Path, PathParseError> {
     Ok(Path { segments })
 }
 
+/// Lower a v1 `field_name` into a `Path` exactly the way `resolve` traverses
+/// it: split on `.`, every part a literal object key, no subscript syntax.
+/// Infallible — there is no syntax to reject, which is the point: a v1 path
+/// that `parse_path` would reject (`a[`, `a..b`, `.a`, `""`) instead becomes a
+/// key segment that simply never matches a real record, the same as it always
+/// has for v1.
+pub fn literal_path(s: &str) -> Path {
+    Path {
+        segments: s
+            .split('.')
+            .map(|part| Segment::Key(part.to_string()))
+            .collect(),
+    }
+}
+
 /// Call `f` with every scalar `path` resolves to against `v`, stopping at the
 /// first call that returns `true`. Returns whether any call returned `true`.
 ///

@@ -7,4 +7,4 @@ pub mod path;
 mod project;
 
 pub use engine::{Decision, Engine};
-pub use path::{Path, PathParseError, Segment, parse_path, resolve, visit_values};
+pub use path::{Path, PathParseError, Segment, literal_path, parse_path, resolve, visit_values};
