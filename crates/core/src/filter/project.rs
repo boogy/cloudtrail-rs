@@ -5,7 +5,7 @@
 //! bulky `requestParameters`/`responseElements` subtrees no rule touches.
 //! Fully materialising a `serde_json::Value` dominates per-record time (spec
 //! F4/F5). Measured on the 14-record corpus (~1.16 KB mean, ~70% of bytes
-//! skipped), this walk is ~1.4x cheaper end-to-end than parse-then-evaluate —
+//! skipped), this walk is ~1.3x cheaper end-to-end than parse-then-evaluate —
 //! not the ~3x the spec predicted for its 4.2 KB synthetic records, because
 //! the JSON is still scanned byte-for-byte whether a subtree is captured or
 //! skipped. `crates/core/benches/filter.rs` is the measurement.
