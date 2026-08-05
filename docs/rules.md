@@ -103,8 +103,8 @@ uncompilable regex or an empty `matches` list.
 
 ```mermaid
 flowchart TD
-    REC["CloudTrail record"] --> IDX{"Look up record's<br/>eventSource in the<br/>rule index"}
-    IDX -->|"matched literal(s)"| SUB["Candidate rules for<br/>this eventSource"]
+    REC["CloudTrail record"] --> IDX{"Look up the record's<br/>eventSource and eventName<br/>in the rule index"}
+    IDX -->|"rules permitted by<br/>both dimensions"| SUB["Candidate rules"]
     IDX --> ALW["+ every rule in the<br/>'always' bucket"]
     SUB --> EVAL
     ALW --> EVAL
@@ -113,58 +113,85 @@ flowchart TD
     EVAL -->|"no rule matches"| KEEP["KEEP record"]
 ```
 
-Only rules that _could_ apply to the record's `eventSource` are evaluated, plus
-the `always` bucket — the rest are skipped entirely. This is what keeps
-per-record cost low even with a large ruleset.
+Only rules that _could_ apply to the record's `eventSource` and `eventName` are
+evaluated, plus the `always` bucket — the rest are skipped entirely. This is
+what keeps per-record cost low even with a large ruleset.
 
 ## The rule index and the `always` bucket
 
-The rule index extracts literal `eventSource` values from each rule
+The index has two dimensions, `eventSource` and `eventName`. For each rule it
+extracts the literal values that rule restricts each field to, so filtering a
+record only checks the rules that could possibly apply to it. Constraining
+either field is enough; constraining both narrows further.
+
+`equals` and `any_of` supply their literals directly. A `regex` supplies
+literals only when the pattern is an anchored alternation of plain strings
 (`^kms\.amazonaws\.com$` → one literal;
-`^(cloudwatch|logs|ec2)\.amazonaws\.com$` → three) so that filtering a record
-only checks the rules that could possibly apply to its `eventSource`, instead of
-every rule.
+`^(cloudwatch|logs|ec2)\.amazonaws\.com$` → three).
 
-Extraction is **conservative**. Any of these send a rule into a catch-all
+Extraction is **conservative**: a rule is only skipped when the index can prove
+it cannot fire. A rule constrained on neither field lands in a catch-all
 `always` bucket that is checked against _every_ record, defeating the
-optimization for that rule:
+optimization for that rule. These are the ways a condition fails to yield
+literals:
 
-- inline flags (`(?i)`),
-- character classes, quantifiers, nested groups,
-- non-anchored patterns,
-- **no `eventSource` condition at all**.
+- a `regex` with inline flags (`(?i)`), character classes, quantifiers, nested
+  groups, or no anchors,
+- `absent` — it says the field has no value, which narrows nothing,
+- `negate: true` on the condition — it says which values must _not_ appear,
+  which excludes nothing,
+- a condition on a nested path (`userIdentity.type`) rather than on
+  `eventSource` or `eventName` itself.
 
 ```yaml
 # Falls into `always`: no anchors, index extraction gives up.
 - name: KMS operations
   matches:
-    - field_name: eventSource
+    - field: eventSource
       regex: "kms.amazonaws.com"
 
 # Indexed: a single anchored literal.
 - name: KMS operations
   matches:
-    - field_name: eventSource
+    - field: eventSource
       regex: "^kms\\.amazonaws\\.com$"
 
 # Also indexed: an anchored literal alternation.
 - name: Monitoring services
   matches:
-    - field_name: eventSource
+    - field: eventSource
       regex: "^(cloudwatch|logs|ec2)\\.amazonaws\\.com$"
+
+# Also indexed, on both dimensions, without a regex.
+- name: KMS decrypts
+  matches:
+    - field: eventSource
+      equals: kms.amazonaws.com
+    - field: eventName
+      any_of: ["Decrypt", "GenerateDataKey"]
+
+# Indexed on eventName alone: no eventSource condition is fine.
+- name: Console logins
+  matches:
+    - field: eventName
+      equals: ConsoleLogin
 ```
 
-Rules with no `eventSource` match at all (filtering purely on `eventName`,
-`userIdentity.*`, etc.) are legitimate and will always land in `always` — the
-warning is informational there, not necessarily something to fix.
+Rules that constrain neither field (filtering purely on `userIdentity.*`,
+`userAgent`, etc.) are legitimate and will always land in `always` — the warning
+is informational there, not necessarily something to fix.
 
 ## Validating a ruleset
 
 [`cloudtrail-rs validate <rules-uri>`](cli.md#validate-uri) compiles the ruleset,
 prints rule/pattern counts, and warns about every rule that landed in `always` —
-that warning is your lever to get the speedup back. It exits non-zero only on an
-actual config error (bad YAML, invalid semver, unresolvable regex, duplicate rule
-name, empty `matches`), which is what CI should gate on.
+that warning is your lever to get the speedup back. By default it exits non-zero
+only on an actual config error (bad YAML, invalid semver, unresolvable regex,
+duplicate rule name, empty `matches`), which is the minimum CI should gate on.
+
+Pass `--max-unindexed <PERCENT>` to also fail when too large a fraction of the
+ruleset landed in `always`, so a ruleset that silently loses its index fails CI
+instead of quietly getting slower.
 
 Use [`cloudtrail-rs test <rules> <sample.json.gz>`](cli.md#test-rules-samplejsongz)
 against a real sample to confirm rules fire as intended before shipping.
