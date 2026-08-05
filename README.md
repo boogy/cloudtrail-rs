@@ -35,7 +35,7 @@ flowchart LR
 | 🎯 **One decoder per binary** | Each trigger topology is a separate binary compiling in exactly one `EventDecoder` via a feature. No runtime source sniffing, no dead decoder code in the artifact.                                                     |
 | ⚡ **Fast warm path**         | The per-record path is pure computation, no trait dispatch — dispatch happens once per object or once per invocation, not once per record.                                                                              |
 | 🌊 **Streaming or buffered**  | Constant-memory streaming with S3 multipart for large objects, in-memory buffering for small ones, `auto` by size.                                                                                                      |
-| 🔎 **Indexed rules**          | Rules are indexed by `eventSource` literal, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                                             |
+| 🔎 **Indexed rules**          | Rules are indexed by `eventSource` and `eventName` literals, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                           |
 | 📊 **Alarmable metrics**      | Every invocation emits a snapshot, success or failure, with two reconciliation identities (`RecordsIn == RecordsKept + RecordsDropped`, `sum(RuleDrops) == RecordsDropped`) so a silent drop cannot stay silent.        |
 | 🔒 **Minimal, signed images** | Distroless static images (<10 MB), cosign-signed, with build-provenance attestation.                                                                                                                                    |
 
