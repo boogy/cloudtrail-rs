@@ -35,7 +35,7 @@ flowchart LR
 | 🎯 **One decoder per binary** | Each trigger topology is a separate binary compiling in exactly one `EventDecoder` via a feature. No runtime source sniffing, no dead decoder code in the artifact.                                                     |
 | ⚡ **Fast warm path**         | The per-record path is pure computation, no trait dispatch — dispatch happens once per object or once per invocation, not once per record.                                                                              |
 | 🌊 **Streaming or buffered**  | Constant-memory streaming with S3 multipart for large objects, in-memory buffering for small ones, `auto` by size.                                                                                                      |
-| 🔎 **Indexed rules**          | Rules are indexed by `eventSource` and `eventName` literals, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                           |
+| 🔎 **Indexed rules**          | Rules are indexed by `eventSource` and `eventName` literals, so a record only checks the rules that could apply to it — per-record cost stays low even with a large ruleset.                                            |
 | 📊 **Alarmable metrics**      | Every invocation emits a snapshot, success or failure, with two reconciliation identities (`RecordsIn == RecordsKept + RecordsDropped`, `sum(RuleDrops) == RecordsDropped`) so a silent drop cannot stay silent.        |
 | 🔒 **Minimal, signed images** | Distroless static images (<10 MB), cosign-signed, with build-provenance attestation.                                                                                                                                    |
 
@@ -61,6 +61,66 @@ rules:
 
 See [Rules](docs/rules.md) for the schema and the `always`-bucket optimization,
 and [Configuration](docs/configuration.md) for the full `CT_*` reference.
+
+## Performance
+
+Filtering a record costs **~2.5 µs**, or about **400k records/s** on one core —
+roughly **475 MB/s** of decompressed CloudTrail JSON.
+
+| Path                                      | per record | records/s | throughput   |
+| ----------------------------------------- | ---------- | --------- | ------------ |
+| Full `serde_json::Value` parse + evaluate | 3.3 µs     | 306k      | 358 MB/s     |
+| **Projected parse + indexed evaluate**    | **2.5 µs** | **406k**  | **474 MB/s** |
+
+Two things get it there, and they compound:
+
+**Only the fields a rule reads are parsed.** The ruleset's field paths are compiled
+into a trie that drives the JSON deserializer, so untouched subtrees are skipped
+rather than materialized — **1.32×** faster than parsing each record into a
+`serde_json::Value` first (1.25–1.33× across runs). The win scales with how much
+of a record your rules ignore, which for CloudTrail is most of it. One caveat: a
+single `[*]` wildcard anywhere in the ruleset disables projection for **every**
+record, because a wildcard can reach any element; see [Rules](docs/rules.md).
+
+**Only rules that could match are evaluated.** The two-dimensional index on
+`eventSource`/`eventName` is **2.25×** faster than testing every rule linearly
+(364 µs vs 162 µs per 500 records), and that margin widens as the ruleset grows,
+since indexed cost tracks the _matching_ rules rather than the total. Rules that
+constrain neither field land in an `always` bucket checked against every record —
+`cloudtrail-rs validate` reports them, and `--max-unindexed <PERCENT>` will fail
+CI when too many accumulate.
+
+<details>
+<summary>Methodology</summary>
+
+`cargo bench --features testing --bench filter` ([source](crates/core/benches/filter.rs)),
+Criterion, three runs, medians reported. Apple M4 Max, rustc 1.97.1.
+
+Benchmarks were built at the shipped artifacts' optimization level, not the default
+one: `cargo bench` inherits `profile.release`, which is deliberately lean
+(`opt-level = 1`) for fast CI smoke builds, while released binaries use `profile.dist`
+(`opt-level = 3`, thin LTO). Reproduce with:
+
+```sh
+CARGO_PROFILE_BENCH_OPT_LEVEL=3 CARGO_PROFILE_BENCH_LTO=thin \
+CARGO_PROFILE_BENCH_CODEGEN_UNITS=16 \
+cargo bench --features testing --bench filter
+```
+
+A plain `cargo bench` reports roughly 20% slower across the board and is not
+representative of a deployed Lambda.
+
+The workload is 500 records from `testing::corpus` (570 KiB, mean 1168 B/record) —
+realistic CloudTrail events, deliberately including values serde would re-render
+differently — against [`examples/rules.example.yaml`](examples/rules.example.yaml).
+Run-to-run spread was under 3%; treat the ratios as approximate and the absolute
+numbers as specific to this machine.
+
+**This measures the filter core only.** It excludes gzip decompression, S3 I/O, and
+Lambda cold start, which dominate wall-clock time in a real deployment. It is a
+guard against per-record regressions, not a prediction of end-to-end throughput.
+
+</details>
 
 ## Quickstart (local, no AWS)
 
