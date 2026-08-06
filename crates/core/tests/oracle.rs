@@ -61,6 +61,78 @@ fn example_ruleset_copies_are_identical() {
     );
 }
 
+/// `examples/rules.v2.example.yaml` is the documentation users copy from, so a
+/// silent break there is a broken doc. Compiling it here makes it a live test
+/// input: it must parse, build an engine, and agree three ways over the whole
+/// corpus.
+///
+/// Note which path this actually covers: the file demonstrates `[*]`, so
+/// `has_wildcard()` holds and `evaluate_raw` takes the full-parse fallback
+/// rather than the projected parse. That makes this the widest coverage of the
+/// *fallback* branch in the suite -- 16 rules over every operator -- while the
+/// projected branch is covered by the wildcard-free shipped ruleset.
+#[test]
+fn v2_reference_example_compiles_and_agrees_three_ways() {
+    let text = include_str!("../../../examples/rules.v2.example.yaml");
+    let engine =
+        Engine::new(RuleSet::parse(text.as_bytes()).expect("v2 reference example must parse"))
+            .expect("v2 reference example must build an engine");
+
+    let mut checked = 0usize;
+    for record in corpus::records() {
+        let value: Value =
+            serde_json::from_str(record.json).expect("corpus record must be valid JSON");
+        let linear = engine.evaluate_linear(&value);
+        assert_eq!(
+            linear,
+            engine.evaluate(&value),
+            "indexed evaluator disagreed with the oracle on {:?}",
+            record.name
+        );
+        assert_eq!(
+            linear,
+            engine
+                .evaluate_raw(record.json)
+                .expect("corpus record must parse via the projected path"),
+            "projected evaluator disagreed with the oracle on {:?}",
+            record.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "corpus was empty: the property proved nothing");
+}
+
+/// The reference example earns its name only if it actually exercises every v2
+/// option. Without this, an operator could be dropped from the file and the
+/// docs would quietly stop demonstrating it.
+#[test]
+fn v2_reference_example_uses_every_option() {
+    let text = include_str!("../../../examples/rules.v2.example.yaml");
+    for needle in [
+        "version: 2.",  // v2 schema
+        "meta:",        // optional metadata block
+        "equals:",      // operator 1
+        "any_of:",      // operator 2
+        "regex:",       // operator 3
+        "absent: true", // operator 4, both polarities
+        "absent: false",
+        "negate: true", // condition-level negation
+        "[0].",         // fixed array subscript
+        "[*].",         // wildcard array subscript
+    ] {
+        assert!(
+            text.contains(needle),
+            "v2 reference example no longer demonstrates {needle:?}"
+        );
+    }
+
+    // Nested traversal deeper than one level -- the `a.b.c` path form.
+    assert!(
+        text.contains("userIdentity.sessionContext.sessionIssuer."),
+        "v2 reference example no longer demonstrates a deep nested path"
+    );
+}
+
 #[test]
 fn example_ruleset_is_v2_and_uses_absent() {
     let shipped = include_str!("fixtures/rules.example.yaml");

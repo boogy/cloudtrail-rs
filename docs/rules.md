@@ -106,6 +106,24 @@ Exactly one of `regex` / `equals` / `any_of` / `absent` must be set per match;
 zero or more than one is a validation error at load, same tier as an
 uncompilable regex or an empty `matches` list.
 
+### A worked reference
+
+[`examples/rules.v2.example.yaml`](../examples/rules.v2.example.yaml) is a
+complete, annotated ruleset that uses **every** v2 option on realistic
+CloudTrail noise — each operator, both `absent` polarities, `negate` combined
+with each operator, fixed and wildcard subscripts, deep nested paths, and the
+`always`-bucket and condition-ordering cases explained inline. It is compiled
+and checked by the test suite, so it cannot drift from the code.
+
+```sh
+cloudtrail-rs validate examples/rules.v2.example.yaml
+```
+
+Values are compared as scalars: a number or bool is matched against its JSON
+text, so `readOnly: true` is written `equals: "true"`. A path landing on an
+object, an array, `null`, or nothing resolves to nothing — which is what
+`absent: true` matches.
+
 ## How a record is evaluated
 
 ```mermaid
