@@ -188,6 +188,55 @@ Rules that constrain neither field (filtering purely on `userIdentity.*`,
 `userAgent`, etc.) are legitimate and will always land in `always` — the warning
 is informational there, not necessarily something to fix.
 
+## Tuning a ruleset for speed
+
+Four things are worth knowing when a ruleset gets large enough for throughput to
+matter.
+
+**Prefer `equals` and `any_of` over an equivalent `regex`.** They are cheaper to
+evaluate and, more importantly, they always supply index literals. Regex literal
+extraction is deliberately conservative and gives up on many patterns that look
+harmless — most surprisingly, a **non-capturing** group:
+
+```yaml
+# Indexed.
+regex: "^(Get|Put)Object$"
+
+# NOT indexed — `(?` disables extraction, so this rule is checked
+# against every record. Same language, silently slower.
+regex: "^(?:Get|Put)Object$"
+
+# Best: no regex engine involved at all.
+any_of: ["GetObject", "PutObject"]
+```
+
+Whenever a pattern is really just a set of fixed strings, write it as `any_of`.
+That removes the extraction question entirely.
+
+**Order the conditions within a rule cheapest-first.** Conditions are evaluated in
+the order you write them and short-circuit on the first failure. The compiler only
+reorders one case — it demotes regexes starting with `.*` or `^.*` to the end —
+so everything else keeps your authored order. Put the narrow `equals` before the
+expensive regex:
+
+```yaml
+matches:
+  - field: eventSource # cheap, and highly selective
+    equals: s3.amazonaws.com
+  - field: userAgent # expensive; only reached when the above matched
+    regex: "^aws-sdk-go/1\\.[0-9]+\\.[0-9]+.*$"
+```
+
+**An `always` rule costs its full condition list on every record.** That is the
+real price of falling out of the index: not a bit test, but regex execution and
+path resolution per record per unindexed rule. A handful is fine; dozens is the
+thing `--max-unindexed` exists to catch.
+
+**Avoid `[*]` wildcards unless you need them.** A single wildcard anywhere in the
+ruleset disables projected parsing for **every** record, so each record is parsed
+in full. Prefer a fixed subscript (`resources[0].ARN`) when the position is known.
+See [Schema v2](#schema-v2).
+
 ## Validating a ruleset
 
 [`cloudtrail-rs validate <rules-uri>`](cli.md#validate-uri) compiles the ruleset,
@@ -199,6 +248,10 @@ duplicate rule name, empty `matches`), which is the minimum CI should gate on.
 Pass `--max-unindexed <PERCENT>` to also fail when too large a fraction of the
 ruleset landed in `always`, so a ruleset that silently loses its index fails CI
 instead of quietly getting slower.
+
+The percentage is **rounded up**, so the gate is never satisfied by rounding a
+real regression away. On a small ruleset this matters: 1 unindexed rule out of 3
+reports 34%, which fails `--max-unindexed 33`.
 
 Use [`cloudtrail-rs test <rules> <sample.json.gz>`](cli.md#test-rules-samplejsongz)
 against a real sample to confirm rules fire as intended before shipping.
