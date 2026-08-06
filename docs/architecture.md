@@ -137,6 +137,41 @@ sequenceDiagram
     PIPE->>MS: flush counters (once)
 ```
 
+### Three evaluators, one production path
+
+`Engine` exposes three evaluators. Only the last one filters records in
+production; the other two exist so the fast one can be checked.
+
+| Evaluator                 | Input          | Rule index | Projected parse | Used by                                       |
+| ------------------------- | -------------- | ---------- | --------------- | --------------------------------------------- |
+| `evaluate_linear(&Value)` | parsed `Value` | no         | no              | tests and benchmarks only                     |
+| `evaluate(&Value)`        | parsed `Value` | yes        | no              | `cloudtrail-rs test`                          |
+| `evaluate_raw(&str)`      | raw JSON text  | yes        | yes             | **production** — `process::buffer` / `stream` |
+
+Each rung adds exactly **one** optimization, which is the point: when they
+disagree, the disagreement localizes the defect. `evaluate_linear` vs `evaluate`
+isolates the rule index; `evaluate` vs `evaluate_raw` isolates the projection.
+A single fast path that returned a wrong answer would say nothing about which
+optimization broke.
+
+`evaluate_linear` is the **oracle**. Having neither an index nor a projection, it
+cannot fail in the ways the optimized paths can — index over-exclusion or
+projection mis-capture. That matters more here than in most systems: an
+over-excluding index silently drops records that should have been kept, which for
+an audit-log filter means destroyed evidence that nothing downstream would notice.
+`crates/core/tests/oracle.rs` enforces three-way agreement over the corpus,
+generated records, and a proptest.
+
+They are also the **benchmark controls**. `benches/filter.rs` measures all three,
+so a change can be attributed to the optimization it targeted rather than to the
+machine: when path interning cut `evaluate_raw` by ~39%, `evaluate` and
+`evaluate_linear` stayed flat, which is what made the result credible.
+
+`evaluate_raw` returns `Result` because it parses; it must return `Err` exactly
+when `serde_json::from_str::<Value>` would, since an unparseable record is
+**kept**. It falls back to a full parse when any rule uses a `[*]` path — see
+the wildcard cliff in [rules.md](rules.md#tuning-a-ruleset-for-speed).
+
 ## Processing modes: buffer vs stream
 
 `CT_PROCESSING_MODE` selects how each object is processed. `auto` (default)
