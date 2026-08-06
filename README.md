@@ -64,31 +64,33 @@ and [Configuration](docs/configuration.md) for the full `CT_*` reference.
 
 ## Performance
 
-Filtering a record costs **~2.5 µs**, or about **400k records/s** on one core —
-roughly **475 MB/s** of decompressed CloudTrail JSON.
+Filtering a record costs **~1.5 µs**, or about **680k records/s** on one core —
+roughly **790 MB/s** of decompressed CloudTrail JSON.
 
 | Path                                      | per record | records/s | throughput   |
 | ----------------------------------------- | ---------- | --------- | ------------ |
-| Full `serde_json::Value` parse + evaluate | 3.3 µs     | 306k      | 358 MB/s     |
-| **Projected parse + indexed evaluate**    | **2.5 µs** | **406k**  | **474 MB/s** |
+| Full `serde_json::Value` parse + evaluate | 3.2 µs     | 314k      | 366 MB/s     |
+| **Projected parse + indexed evaluate**    | **1.5 µs** | **679k**  | **792 MB/s** |
 
 Two things get it there, and they compound:
 
 **Only the fields a rule reads are parsed.** The ruleset's field paths are compiled
 into a trie that drives the JSON deserializer, so untouched subtrees are skipped
-rather than materialized — **1.32×** faster than parsing each record into a
-`serde_json::Value` first (1.25–1.33× across runs). The win scales with how much
+rather than materialized — **2.16×** faster than parsing each record into a
+`serde_json::Value` first (2.1–2.3× across runs). The win scales with how much
 of a record your rules ignore, which for CloudTrail is most of it. One caveat: a
 single `[*]` wildcard anywhere in the ruleset disables projection for **every**
 record, because a wildcard can reach any element; see [Rules](docs/rules.md).
 
 **Only rules that could match are evaluated.** The two-dimensional index on
-`eventSource`/`eventName` is **2.25×** faster than testing every rule linearly
-(364 µs vs 162 µs per 500 records), and that margin widens as the ruleset grows,
-since indexed cost tracks the _matching_ rules rather than the total. Rules that
-constrain neither field land in an `always` bucket checked against every record —
-`cloudtrail-rs validate` reports them, and `--max-unindexed <PERCENT>` will fail
-CI when too many accumulate.
+`eventSource`/`eventName` is **2.13×** faster than testing every rule linearly
+(330 µs vs 155 µs per 500 records). What the index removes is the per-rule
+_condition_ work — regex execution, path resolution, set lookups. What remains is
+a two-bit test per rule per record, so the residual cost still tracks the total
+rule count, not the matching count; it is just several orders of magnitude cheaper
+per rule. Rules that constrain neither field land in an `always` bucket whose
+conditions are evaluated against every record — `cloudtrail-rs validate` reports
+them, and `--max-unindexed <PERCENT>` will fail CI when too many accumulate.
 
 <details>
 <summary>Methodology</summary>
@@ -113,8 +115,8 @@ representative of a deployed Lambda.
 The workload is 500 records from `testing::corpus` (570 KiB, mean 1168 B/record) —
 realistic CloudTrail events, deliberately including values serde would re-render
 differently — against [`examples/rules.example.yaml`](examples/rules.example.yaml).
-Run-to-run spread was under 3%; treat the ratios as approximate and the absolute
-numbers as specific to this machine.
+Run-to-run spread reached ~9% on the projected-parse path; treat the ratios as
+approximate and the absolute numbers as specific to this machine.
 
 **This measures the filter core only.** It excludes gzip decompression, S3 I/O, and
 Lambda cold start, which dominate wall-clock time in a real deployment. It is a
