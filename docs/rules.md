@@ -208,8 +208,41 @@ is informational there, not necessarily something to fix.
 
 ## Tuning a ruleset for speed
 
-Four things are worth knowing when a ruleset gets large enough for throughput to
-matter.
+### First: a rule that matches means DROP
+
+Every rule here is an **exclusion**. Matching means "this event is noise, discard
+it", and the ruleset is a disjunction — the first rule that fires ends the record.
+That asymmetry is what drives all the advice below:
+
+- A **dropped** record short-circuits. Evaluation stops at the first rule that
+  fires, and at the first condition within that rule that fails on the way there.
+- A **kept** record is the expensive case. "Keep" means _no rule matched_, which
+  can only be established by evaluating every candidate rule to completion.
+
+So the records you pay most for are the ones you are keeping — the interesting
+ones you are not filtering. You cannot short-circuit them by writing better rules;
+you can only stop them from reaching rules in the first place, which is what the
+index does. That makes index coverage the primary lever, and everything else
+secondary.
+
+One correctness caution before optimizing: a broader rule drops more, and a rule
+that over-matches silently destroys audit evidence. Verify with
+[`cloudtrail-rs test`](cli.md#test-rules-samplejsongz) against a real sample
+before shipping a rule written for speed.
+
+### Order rules by how often they fire
+
+Rules are evaluated in the order they appear in the file, first match wins. Put
+the rules that drop the most volume at the top: a record dropped by rule 1 never
+touches rules 2..N. Ordering the highest-volume noise first (typically KMS
+`Decrypt`, S3 reads, CloudWatch Logs `PutLogEvents`, `AssumeRole`) is free and
+costs nothing to get wrong.
+
+This is the opposite of the guidance for conditions _within_ a rule, which are
+AND-ed — there you want the most selective first, so the rule fails fast. Rules
+are OR-ed, so you want the most likely to succeed first.
+
+### The remaining four levers
 
 **Prefer `equals` and `any_of` over an equivalent `regex`.** They are cheaper to
 evaluate and, more importantly, they always supply index literals. Regex literal
