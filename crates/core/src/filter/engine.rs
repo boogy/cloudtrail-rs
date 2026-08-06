@@ -179,21 +179,43 @@ impl Engine {
             });
         }
 
-        // One projection over every path the ruleset names. `path_id` on each
-        // compiled match indexes into the projected slot vector.
+        // One projection over every *distinct* path the ruleset names.
+        // `path_id` on each compiled match indexes into the projected slot
+        // vector.
+        //
+        // Interning matters: real rulesets name the same field over and over
+        // (the shipped example has 81 match paths but only 16 distinct ones —
+        // `eventName` alone appears 25 times). The projection trie already
+        // merges those structurally, but a per-occurrence slot would make
+        // `capture_terminals` clone the captured `String` once per occurrence
+        // on every record. Deduplicating here is worth ~40% of `evaluate_raw`.
         let mut paths: Vec<Path> = Vec::new();
+        let intern = |paths: &mut Vec<Path>, path: &Path| -> usize {
+            match paths.iter().position(|seen| seen == path) {
+                Some(id) => id,
+                None => {
+                    paths.push(path.clone());
+                    paths.len() - 1
+                }
+            }
+        };
         for rule in &mut compiled {
             for m in &mut rule.matches {
-                m.path_id = paths.len();
-                paths.push(m.path.clone());
+                m.path_id = intern(&mut paths, &m.path);
             }
         }
         // Dedicated slots for the index keys, so `evaluate_raw` can select
-        // candidates without a second pass over the record.
-        let event_source_slot = paths.len();
-        paths.push(parse_path("eventSource").expect("literal path is valid"));
-        let event_name_slot = paths.len();
-        paths.push(parse_path("eventName").expect("literal path is valid"));
+        // candidates without a second pass over the record. These intern
+        // against the rule paths too — `eventSource` and `eventName` are
+        // almost always already present.
+        let event_source_slot = intern(
+            &mut paths,
+            &parse_path("eventSource").expect("literal path is valid"),
+        );
+        let event_name_slot = intern(
+            &mut paths,
+            &parse_path("eventName").expect("literal path is valid"),
+        );
         let projection = Projection::build(&paths);
 
         let keys: Vec<RuleKeys> = compiled
