@@ -1,0 +1,298 @@
+# =============================================================================
+# cloudtrail-rs — rules schema v2, complete reference
+# =============================================================================
+#
+# Every v2 option appears at least once here, on realistic CloudTrail noise.
+# `examples/rules.example.yaml` is the v1-style ruleset (dotted `field_name` +
+# `regex` only); this file is the one to copy from when writing new rules.
+#
+# EVALUATION MODEL
+#   - AND within a rule  — every condition in `matches[]` must match.
+#   - OR across rules    — if ANY rule matches, the record is DROPPED.
+#   Rules are exclusions. Matching means "this event is noise, drop it".
+#
+# WHAT A CONDITION LOOKS LIKE
+#   - field:  a dotted path, with optional `[N]` / `[*]` array subscripts
+#   - then EXACTLY ONE of: regex | equals | any_of | absent
+#   - plus optional `negate: true`, which inverts that one condition
+#   Zero operators, or two, is a load-time error — not resolved by precedence.
+#
+# VALUE COERCION
+#   A path resolves to a *scalar* — string, number, or bool. Numbers and bools
+#   are compared as their JSON text, so `readOnly: true` is matched with
+#   `equals: "true"`, and `eventVersion: 1.08` with `equals: "1.08"`. A path
+#   landing on an object, an array, `null`, or nothing at all resolves to
+#   nothing — that is what `absent: true` tests for.
+#
+# VALIDATE BEFORE SHIPPING
+#   cloudtrail-rs validate examples/rules.v2.example.yaml
+#   cloudtrail-rs validate examples/rules.v2.example.yaml --max-unindexed 25
+#   cloudtrail-rs test examples/rules.v2.example.yaml sample.json.gz
+#
+# See docs/rules.md for the schema tables and the tuning section.
+# =============================================================================
+
+version: 2.0.0
+
+# Optional, informational only. Never used for filtering; free-form YAML, so
+# `created_at: 2024-01-01` may be a YAML date rather than a string.
+meta:
+  description: Complete v2 reference — every operator, path form, and negation
+  author: security-team
+  created_at: 2024-01-01
+  updated_at: 2024-01-15
+  tags: [reference, documentation, v2]
+  labels:
+    environment: example
+    team: security
+
+rules:
+  # ===========================================================================
+  # 1. `equals` — exact string comparison, no regex engine
+  # ===========================================================================
+  # The baseline you should reach for first. Cheapest to evaluate, and it always
+  # supplies index literals, so this rule is only ever checked against records
+  # whose eventSource AND eventName actually match.
+  - name: KMS Decrypt from EKS
+    matches:
+      - field: eventSource
+        equals: kms.amazonaws.com
+      - field: eventName
+        equals: Decrypt
+      - field: sourceIPAddress
+        equals: eks.amazonaws.com
+
+  # ===========================================================================
+  # 2. `any_of` — a fixed set of allowed values
+  # ===========================================================================
+  # Prefer this over an equivalent alternation regex: no regex engine, and the
+  # index takes all of its literals directly.
+  - name: KMS data-key operations
+    matches:
+      - field: eventSource
+        equals: kms.amazonaws.com
+      - field: eventName
+        any_of:
+          - GenerateDataKey
+          - GenerateDataKeyWithoutPlaintext
+          - Encrypt
+          - ReEncrypt
+
+  # `any_of` on both dimensions at once — the index intersects them, so this
+  # rule is a candidate only for the 3x2 combinations it actually names.
+  - name: Routine S3 object reads by internal tooling
+    matches:
+      - field: eventSource
+        any_of: [s3.amazonaws.com, s3-outposts.amazonaws.com]
+      - field: eventName
+        any_of: [GetObject, HeadObject, ListObjects, ListObjectsV2]
+      - field: userIdentity.type
+        equals: AssumedRole
+
+  # ===========================================================================
+  # 3. `regex` — Rust-regex, matched against the resolved scalar
+  # ===========================================================================
+  # Anchored alternation of plain literals: still indexed, because extraction
+  # can reduce it to a fixed set {CreateLogStream, PutLogEvents, ...}.
+  # Mind the YAML quoting trap — inside double quotes, `\\.` is one backslash
+  # plus a dot, i.e. the regex `\.` (a literal dot).
+  - name: CloudWatch Logs ingestion chatter
+    matches:
+      - field: eventSource
+        regex: "^logs\\.amazonaws\\.com$"
+      - field: eventName
+        regex: "^(CreateLogStream|PutLogEvents|DescribeLogStreams)$"
+
+  # Regex where a regex is genuinely warranted: an unbounded shape no fixed set
+  # can express. NOTE this rule constrains eventName with a character class, so
+  # eventName supplies no literals — but eventSource still does, so the rule is
+  # still indexed on one dimension. Constraining either field is enough.
+  - name: SSM parameter reads by Lambda
+    matches:
+      - field: eventSource
+        equals: ssm.amazonaws.com
+      - field: eventName
+        regex: "^GetParameters?$"
+      - field: userIdentity.sessionContext.sessionIssuer.arn
+        regex: "^arn:aws:iam::\\d{12}:role/service-role/.*$"
+
+  # ===========================================================================
+  # 4. `absent` — the operator v1 could not express at all
+  # ===========================================================================
+  # `absent: true` matches when the path resolves to NOTHING: the key is
+  # missing, or it is `null`, or it lands on an object/array rather than a
+  # scalar. Here: successful calls only, since a failure sets `errorCode`.
+  - name: Successful read-only describes from automation
+    matches:
+      - field: eventSource
+        equals: ec2.amazonaws.com
+      - field: eventName
+        regex: "^Describe[A-Za-z]+$"
+      - field: readOnly
+        equals: "true" # JSON `true` compares as the string "true"
+      - field: errorCode
+        absent: true # drop only when the call succeeded
+
+  # `absent: false` is the inverse: the field must resolve to a scalar. Use it
+  # to require that a field is present without pinning its value.
+  - name: Failed STS calls that carry any error code
+    matches:
+      - field: eventSource
+        equals: sts.amazonaws.com
+      - field: eventName
+        equals: AssumeRole
+      - field: errorCode
+        absent: false # present, value irrelevant
+
+  # ===========================================================================
+  # 5. `negate` — invert one condition, then AND it with the rest
+  # ===========================================================================
+  # `negate` applies to its own condition only, never to the whole rule.
+  # Read this as: DynamoDB reads that are NOT from the console.
+  - name: DynamoDB reads outside the console
+    matches:
+      - field: eventSource
+        equals: dynamodb.amazonaws.com
+      - field: eventName
+        any_of: [GetItem, BatchGetItem, Query, Scan]
+      - field: userAgent
+        equals: console.amazonaws.com
+        negate: true
+
+  # `negate` with `any_of` — "none of these values".
+  - name: Lambda invokes from unexpected principals
+    matches:
+      - field: eventSource
+        equals: lambda.amazonaws.com
+      - field: eventName
+        equals: Invoke
+      - field: userIdentity.type
+        any_of: [AWSService, AssumedRole]
+        negate: true
+
+  # `negate` with `regex` — "does not match this pattern". Useful for carving
+  # an exception out of a broad rule: drop ECR pulls, except the ones coming
+  # from a production account role.
+  - name: ECR image pulls from non-production roles
+    matches:
+      - field: eventSource
+        equals: ecr.amazonaws.com
+      - field: eventName
+        any_of: [GetDownloadUrlForLayer, BatchGetImage]
+      - field: userIdentity.sessionContext.sessionIssuer.arn
+        regex: "^arn:aws:iam::\\d{12}:role/prod-.*$"
+        negate: true
+
+  # `negate` with `absent` — "this field DOES resolve to a scalar", the long way
+  # round. `absent: false` says the same thing more directly; both are shown so
+  # the negation semantics are unambiguous.
+  - name: Config recorder writes that carry a session
+    matches:
+      - field: eventSource
+        equals: config.amazonaws.com
+      - field: eventName
+        any_of: [PutEvaluations, PutConfigRule]
+      - field: userIdentity.sessionContext.sessionIssuer.userName
+        absent: true
+        negate: true
+
+  # ===========================================================================
+  # 6. Nested paths — dotted traversal into objects
+  # ===========================================================================
+  # Any depth is fine. Each segment is a literal object key; there is no
+  # globbing over key names, only over array elements (see section 7).
+  - name: Service-linked role sessions doing routine work
+    matches:
+      - field: userIdentity.sessionContext.sessionIssuer.type
+        equals: Role
+      - field: userIdentity.sessionContext.attributes.mfaAuthenticated
+        equals: "false"
+      - field: userIdentity.invokedBy
+        regex: "^[a-z0-9.-]+\\.amazonaws\\.com$"
+      - field: readOnly
+        equals: "true"
+  # NOTE: this rule names neither eventSource nor eventName, so it lands in the
+  # `always` bucket and its conditions run against EVERY record. That is a
+  # legitimate thing to want — it is just the expensive shape. `validate` warns
+  # about it, and `--max-unindexed` is the CI gate on how many you accumulate.
+
+  # ===========================================================================
+  # 7. Array subscripts — `[N]` for a fixed slot, `[*]` for any element
+  # ===========================================================================
+  # A fixed subscript costs nothing extra: it addresses exactly one element and
+  # keeps the projected-parse optimization intact. Prefer it whenever the
+  # position is known — CloudTrail's `resources` usually has the primary
+  # resource first.
+  - name: S3 writes to the known noisy bucket
+    matches:
+      - field: eventSource
+        equals: s3.amazonaws.com
+      - field: eventName
+        any_of: [PutObject, DeleteObject]
+      - field: resources[0].type
+        equals: AWS::S3::Object
+      - field: resources[0].ARN
+        regex: "^arn:aws:s3:::build-artifacts-[a-z0-9-]+/.*$"
+
+  # ---------------------------------------------------------------------------
+  # THE WILDCARD CLIFF — read before copying the next rule
+  # ---------------------------------------------------------------------------
+  # `[*]` matches if ANY element satisfies the condition. It is the only way to
+  # ask "does any resource look like this" when the position is unknown.
+  #
+  # The cost is not local to this rule: because a wildcard can reach any
+  # element, ONE `[*]` anywhere in the ruleset disables projected parsing for
+  # the WHOLE ruleset, so every record is parsed in full instead of only the
+  # fields rules reference. Results are identical; throughput is roughly half.
+  #
+  # Delete this rule, or rewrite it with a fixed subscript, if you care about
+  # throughput more than this particular match.
+  # ---------------------------------------------------------------------------
+  - name: Events touching any sandbox-account resource
+    matches:
+      - field: eventSource
+        equals: sts.amazonaws.com
+      - field: eventName
+        equals: AssumeRole
+      - field: resources[*].accountId
+        equals: "111122223333"
+
+  # Negated wildcard: "no element matches". `negate` inverts the whole
+  # existential test, so this reads as "none of the resources is KMS".
+  - name: Sandbox assume-role with no KMS resource involved
+    matches:
+      - field: eventSource
+        equals: sts.amazonaws.com
+      - field: eventName
+        equals: AssumeRoleWithWebIdentity
+      - field: resources[*].type
+        equals: AWS::KMS::Key
+        negate: true
+
+  # ===========================================================================
+  # 8. Condition order — cheapest and most selective first
+  # ===========================================================================
+  # Conditions short-circuit on the first failure, in the order written. The
+  # compiler reorders only one case (it demotes regexes starting with `.*` or
+  # `^.*`), so the order below is the order that runs. Put the narrow `equals`
+  # ahead of the expensive regex, not the other way round.
+  - name: Well-ordered rule — equals gate, then the costly pattern
+    matches:
+      - field: eventSource # cheap, highly selective, indexed
+        equals: elasticloadbalancing.amazonaws.com
+      - field: eventName # cheap, indexed
+        equals: DescribeTargetHealth
+      - field: userAgent # only reached when both above matched
+        regex: "^aws-sdk-go/1\\.[0-9]+\\.[0-9]+ .*$"
+
+  # ===========================================================================
+  # 9. Single-dimension rules
+  # ===========================================================================
+  # Constraining only eventName is fine — the index uses whichever dimensions a
+  # rule supplies, and one is enough to skip most records.
+  - name: Console login noise
+    matches:
+      - field: eventName
+        equals: ConsoleLogin
+      - field: errorCode
+        absent: true
