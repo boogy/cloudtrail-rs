@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-06
+
+Two changes to the filtering core, developed together because the second
+depends on the first: a **v2 rules schema** that can express matches v1 could
+not, and a **projected JSON parse** that makes per-record cost scale with the
+fields a ruleset actually reads rather than with the size of the record.
+
+Filtering a record now costs **~1.5 µs** — about **679k records/s** on one core,
+roughly **792 MB/s** of decompressed CloudTrail JSON, against 3.2 µs / 314k /
+366 MB/s for the full-parse path this replaces. Scope: filter core only. It
+excludes gzip decompression, S3 I/O and cold start, which dominate real
+wall-clock time.
+
+**v1 rulesets (`version: 1.x`, `field_name`/`regex`) keep working unchanged.
+Migrating is optional.**
+
+### Added
+
+- **Rules schema v2.** A condition is now `field` plus exactly one of `regex`,
+  `equals`, `any_of` or `absent`, with an optional `negate`, and field paths
+  take array subscripts (`resources[0].ARN`, `resources[*].ARN`). Zero
+  operators, or two, is a load-time error rather than something resolved by
+  precedence. `absent` is the only way to express "this field was never set",
+  which v1 could not say at all — the idiom it replaces (a regex that matches
+  everything, negated) could not distinguish a missing key from an empty one.
+- **`cloudtrail-rs validate --max-unindexed <PERCENT>`.** An opt-in CI gate that
+  fails when too large a fraction of a ruleset lands in the catch-all `always`
+  bucket, where conditions run against every record instead of being skipped by
+  a bit test. The percentage rounds **up**: 1 unindexed rule out of 3 reports
+  34% and fails `--max-unindexed 33`.
+- **`examples/rules.v2.example.yaml`**, a complete worked reference — 17
+  annotated rules over realistic CloudTrail noise covering every v2 option:
+  each operator, both `absent` polarities, `negate` paired with all four, fixed
+  and wildcard subscripts, deep nested paths, single-dimension rules, and
+  scalar coercion (`readOnly: true` matched as `equals: "true"`). The shipped
+  `examples/rules.example.yaml` could not absorb these: it is byte-pinned to a
+  core test fixture and doubles as the benchmark corpus. Two tests stop the new
+  file rotting — it is compiled and checked three ways against the corpus, and
+  a second test asserts it still contains every operator, both subscript forms
+  and a deep path, so an option cannot be dropped without failing CI.
+- **A tuning section in `docs/rules.md`** for the configuration choices that
+  decide throughput, written from the semantics they follow from: a matching
+  rule DROPS, so a dropped record short-circuits at the first rule that fires
+  while a *kept* record is the expensive case — "no rule matched" can only be
+  established by running every candidate rule to completion. The records
+  costing the most are therefore the ones being kept, and no rule-writing makes
+  them cheaper; only keeping them away from rules does, which is the index.
+- **A "three evaluators" section in `docs/architecture.md`.** `Engine` exposes
+  three and nothing in prose said why: only `evaluate_raw` filters in
+  production; `evaluate` and `evaluate_linear` exist so it can be checked.
+- A Performance section in `README.md` with the measured per-record cost, each
+  optimization's individual contribution, and a methodology block stating what
+  the benchmark excludes.
+
+### Changed
+
+- **Projected JSON parse (~2.16x).** A projection trie built from the ruleset's
+  field paths drives a `serde` deserializer that walks and discards untouched
+  subtrees instead of materialising a full `Value`. Discarded subtrees are
+  still *validated* — the skip type is a hand-written `Skip` rather than
+  `serde::de::IgnoredAny`, so escapes and surrogates in a subtree no rule reads
+  still fail the parse exactly as a full parse would. That is load-bearing, not
+  incidental: `project()` must return `Err` in exactly the cases
+  `serde_json::from_str::<Value>` does, because an `Err` makes the record
+  **kept**.
+- **The rule index is now two-dimensional (~2.13x)** — `eventSource` *and*
+  `eventName` — and takes literals from `equals` and `any_of`, not just from
+  anchored regex alternations. Selection is bitset-based: one hash lookup per
+  dimension per record, two bit tests per rule, no per-record allocation.
+- **`Engine::new` interns duplicate field paths into one projection slot.**
+  Every match condition previously got its own slot even when several named the
+  same path — the shipped example ruleset has 81 match paths but only 16
+  distinct ones, `eventName` alone appearing 25 times. The trie already merged
+  them structurally, but the duplicate terminals made the capture step clone
+  the captured `String` once per occurrence, per record. Interning by path
+  equality is worth **-38.9%** on the projected path, measured back-to-back
+  with the two unaffected evaluators as controls.
+- `examples/rules.example.yaml` migrated to the v2 schema.
+- 17 transitive dependencies updated, including `rustls` 0.23.42 -> 0.23.43.
+  `aws-lc-rs`/`aws-lc-sys` remain absent from the lockfile and `ring` stays at
+  0.17.14, so the rustls bump did not drag the banned backend in.
+
+### Fixed
+
+- **v1 field paths are lowered literally, so v1 rulesets evaluate unchanged.**
+  Development had `Engine::new` compiling *every* field path through the new
+  subscript-aware parser, v1 included — but v1 resolution splits on `.` and
+  does literal object-key lookup only, with no subscript syntax. An unchanged
+  v1 rule therefore changed meaning: `field_name: "requestParameters.tag[0]"`
+  stopped matching the literal key `tag[0]` and started matching the first
+  element of an array named `tag`, silently dropping records a deployed ruleset
+  used to keep. v1 paths now go through an infallible literal lowering. Never
+  released, but the shape is worth recording: it was caught by review, not by
+  the suite.
+- An inverted describe rule in the shipped example ruleset.
+
+### Testing
+
+- **Three evaluators must agree on every record, permanently.**
+  `evaluate_linear` (no index, full `Value`) is the oracle, `evaluate` adds the
+  index, `evaluate_raw` adds the projection. Each rung adds exactly one
+  optimization, so a disagreement localizes the defect. Over-inclusion by the
+  index is safe; **over-exclusion is silent data loss**, which for a CloudTrail
+  filter means destroyed audit evidence. Enforced in `crates/core/tests/oracle.rs`,
+  including a proptest generator.
+- Two blind spots were found by *neutralisation* — removing a behaviour and
+  confirming a test fails — rather than by a green suite. The parity suites are
+  differential, comparing buffer against stream, so they go quiet when both
+  modes are wrong together: nothing had asserted that an unparseable record
+  inside a **successfully written** object survives verbatim with
+  `parse_errors: 1`. Separately, the oracle passed 10/10 with a genuine index
+  over-exclusion bug injected, because no fixture constructed a record that
+  reached it. Both now have permanent fixtures.
+- `cargo bench` inherits `profile.release`, which is deliberately lean
+  (`opt-level = 1`) for CI smoke builds, while shipped binaries use
+  `profile.dist` (`opt-level = 3`, thin LTO). A plain `cargo bench` reports
+  ~20% slower than what actually deploys; the README documents the env-var
+  override that reproduces the published numbers.
+
 ## [0.4.0] - 2026-07-31
 
 Round five: a full-codebase review rather than a diff review, run across
@@ -439,7 +558,8 @@ processing.stream_threshold_bytes`; `processing.multipart_part_bytes` must
   GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.1.1...v0.2.0
