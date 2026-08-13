@@ -29,7 +29,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 proptest = "1"
 
 [[bench]]
