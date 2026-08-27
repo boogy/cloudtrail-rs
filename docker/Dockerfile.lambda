@@ -6,7 +6,7 @@
 # the Runtime API endpoint is localhost HTTP). The release workflow lays the
 # per-arch static binary under $TARGETPLATFORM in the build context — this is a
 # COPY-only stage, so buildx needs no QEMU.
-FROM gcr.io/distroless/static-debian13:latest@sha256:9197324ba51d9cd071af8505989365c006adf9d6d2067eada25aef00abbb5278
+FROM gcr.io/distroless/static-debian13:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/bootstrap /bootstrap
 ENTRYPOINT ["/bootstrap"]
