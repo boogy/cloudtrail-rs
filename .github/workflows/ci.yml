@@ -71,7 +71,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
           tool: cargo-llvm-cov
       - name: Start MiniStack
@@ -167,7 +167,7 @@ jobs:
           toolchain: stable
           cache: false
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
           tool: cargo-audit,cargo-deny
       # Blocking. Enforces the aws-lc-rs/aws-lc-sys/openssl-sys bans, the
