@@ -1,10 +1,7 @@
-//! The agreement property: every evaluator must return the identical
-//! `Decision` for every record. `evaluate_linear` is the oracle -- it has no
-//! index and no projection, so it cannot be wrong in the ways the optimised
-//! paths can. Over-exclusion by the index is silent data loss, which is why
-//! this property is enforced rather than assumed.
-//!
-//! Needs the `testing` feature; `make test` / `make ci` run `--all-features`.
+//! The agreement property: every evaluator must return the identical `Decision`
+//! for every record. `evaluate_linear` is the oracle — no index, no projection,
+//! so it cannot be wrong in the ways the optimised paths can. Over-exclusion by
+//! the index is silent data loss. Needs the `testing` feature.
 #![cfg(feature = "testing")]
 
 use cloudtrail_rs_core::config::rules::RuleSet;
@@ -19,10 +16,9 @@ fn engine() -> Engine {
         .expect("engine must build")
 }
 
-/// Built once and shared across every generated case in
-/// `raw_agrees_with_linear_on_generated_records`: constructing an `Engine` per
-/// case (256 by default) is a repeat compile of the same 25-rule ruleset and
-/// dominates that test's runtime for no property-strengthening reason.
+/// Built once and shared: constructing an `Engine` per generated case is a
+/// repeat compile of the same 25-rule ruleset and dominates the runtime of
+/// `raw_agrees_with_linear_on_generated_records`.
 fn cached_engine() -> &'static Engine {
     static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(engine)
@@ -46,10 +42,8 @@ fn indexed_agrees_with_linear_on_corpus() {
     assert!(checked > 0, "corpus was empty: the property proved nothing");
 }
 
-/// The example ruleset is committed in two places and they must not drift:
-/// `examples/` is what users copy, `tests/fixtures/` is what the suite
-/// compiles against. Nothing enforced this before -- a fix applied to one
-/// copy would silently leave the other wrong.
+/// The example ruleset is committed in two places and must not drift:
+/// `examples/` is what users copy, `tests/fixtures/` is what the suite compiles.
 #[test]
 fn example_ruleset_copies_are_identical() {
     let shipped = include_str!("../../../examples/rules.example.yaml");
@@ -61,16 +55,12 @@ fn example_ruleset_copies_are_identical() {
     );
 }
 
-/// `examples/rules.v2.example.yaml` is the documentation users copy from, so a
-/// silent break there is a broken doc. Compiling it here makes it a live test
-/// input: it must parse, build an engine, and agree three ways over the whole
-/// corpus.
+/// Compiling the documented example makes it a live test input: it must parse,
+/// build an engine, and agree three ways over the whole corpus.
 ///
-/// Note which path this actually covers: the file demonstrates `[*]`, so
-/// `has_wildcard()` holds and `evaluate_raw` takes the full-parse fallback
-/// rather than the projected parse. That makes this the widest coverage of the
-/// *fallback* branch in the suite -- 16 rules over every operator -- while the
-/// projected branch is covered by the wildcard-free shipped ruleset.
+/// The file demonstrates `[*]`, so `has_wildcard()` holds and `evaluate_raw`
+/// takes the full-parse fallback: this is the suite's widest coverage of that
+/// branch, while the projected branch is covered by the wildcard-free ruleset.
 #[test]
 fn v2_reference_example_compiles_and_agrees_three_ways() {
     let text = include_str!("../../../examples/rules.v2.example.yaml");
@@ -102,9 +92,8 @@ fn v2_reference_example_compiles_and_agrees_three_ways() {
     assert!(checked > 0, "corpus was empty: the property proved nothing");
 }
 
-/// The reference example earns its name only if it actually exercises every v2
-/// option. Without this, an operator could be dropped from the file and the
-/// docs would quietly stop demonstrating it.
+/// Without this, an operator could be dropped from the reference example and
+/// the docs would quietly stop demonstrating it.
 #[test]
 fn v2_reference_example_uses_every_option() {
     let text = include_str!("../../../examples/rules.v2.example.yaml");
@@ -147,8 +136,8 @@ fn example_ruleset_is_v2_and_uses_absent() {
     RuleSet::parse(shipped.as_bytes()).expect("shipped example must parse");
 }
 
-/// Guards spec finding F1 against a revert: with the old `errorCode` regex
-/// this pair collapses to Keep/Drop the wrong way round.
+/// Falsifiable: with the old `errorCode` regex this pair collapses to Keep/Drop
+/// the wrong way round.
 #[test]
 fn shipped_describe_rule_keeps_denied_and_drops_successful() {
     let engine = engine();
@@ -176,9 +165,6 @@ fn shipped_describe_rule_keeps_denied_and_drops_successful() {
     );
 }
 
-/// The three-way agreement property. `evaluate_linear` has no index and no
-/// projection, so it is the oracle; the other two must match it on every
-/// record. A divergence is silent data loss.
 #[test]
 fn raw_agrees_with_linear_and_indexed_on_corpus() {
     let engine = engine();
@@ -199,8 +185,7 @@ fn raw_agrees_with_linear_and_indexed_on_corpus() {
 }
 
 /// The shape `testing::corpus` never constructs: an `eventSource`-unconstrained
-/// rule ("IAM Session Renewals") firing under the `sts.amazonaws.com` bucket
-/// key that "Service Role STS Operations" also owns.
+/// rule firing under a bucket key another rule also owns.
 #[test]
 fn indexed_agrees_with_linear_when_an_any_event_source_rule_shares_anothers_bucket() {
     let engine = engine();
@@ -239,12 +224,9 @@ fn raw_errors_exactly_when_full_parse_errors() {
         r#"{"eventName":"A""#,
         r#"not json at all"#,
         r#""#,
-        // T13: a lone (unpaired) UTF-16 surrogate escape in a subtree no
-        // rule references. `serde::de::IgnoredAny` skips a value's bytes
-        // structurally without decoding string escapes, so it used to
-        // accept this where a full `Value` parse rejects it -- silently
-        // turning an unparseable record into one the engine evaluated (and
-        // could drop) instead of keeping.
+        // A lone UTF-16 surrogate escape in a subtree no rule references.
+        // `serde::de::IgnoredAny` skips a value's bytes without decoding string
+        // escapes, so it accepts what a full `Value` parse rejects.
         r#"{"eventName":"A","x":"\uD800"}"#,
     ] {
         let full_ok = serde_json::from_str::<Value>(bad).is_ok();
@@ -253,15 +235,13 @@ fn raw_errors_exactly_when_full_parse_errors() {
     }
 }
 
-/// The wildcard fallback is load-bearing, not an optimization: with no `[*]`
-/// path in the ruleset, `has_wildcard()` is always false and this branch never
-/// runs. The shipped example ruleset has no such path, so the corpus and
-/// proptest properties above never exercise it.
+/// With no `[*]` path in a ruleset `has_wildcard()` is always false and this
+/// branch never runs; the shipped example has none, so the corpus and proptest
+/// properties never reach it.
 ///
-/// This ruleset has only a `[*]` path -- no fixed subscript sharing its array
-/// node -- so projection's wildcard capture is plain first-scalar-wins
-/// (`project.rs`'s `projects_wildcard_as_first_scalar`). The matching element
-/// here is the *second* one, which first-scalar-wins misses but
+/// This ruleset has only a `[*]` path — no fixed subscript sharing its array
+/// node — so projection's wildcard capture is plain first-scalar-wins. The
+/// matching element is the *second* one, which that misses and
 /// `evaluate_linear`'s existential `visit_values` does not.
 #[test]
 fn evaluate_raw_wildcard_fallback_handles_a_non_first_match() {
@@ -289,14 +269,10 @@ rules:
     );
 }
 
-/// A fixed subscript and a wildcard addressing the same array node: per
-/// project.rs's `wildcard_sharing_a_node_with_a_fixed_index_skips_that_element`,
-/// `visit_seq` gives the indexed child priority at that position, so the
-/// wildcard child in `project()` never sees element 0 -- while
-/// `evaluate_linear`'s existential wildcard checks element 0 first (and
-/// short-circuits there, since it matches). Without the fallback, `evaluate_raw`
-/// would see only element 1 through the wildcard slot and disagree with
-/// `evaluate_linear`.
+/// A fixed subscript and a wildcard on the same array node: `visit_seq` gives
+/// the indexed child priority at that position, so the wildcard child never sees
+/// element 0, while `evaluate_linear`'s existential wildcard checks it first.
+/// Without the fallback the two disagree.
 #[test]
 fn evaluate_raw_wildcard_fallback_handles_index_and_wildcard_sharing_a_node() {
     let yaml = br#"
@@ -327,25 +303,17 @@ rules:
     );
 }
 
-/// The example ruleset (80 `regex:` + 1 `absent: true`) and the two wildcard
-/// fallback tests above never exercise `Op::Equals`, `Op::AnyOf`,
-/// `Op::Absent(false)`, or `negate` through `match_fires_projected` -- the
-/// example has none of them, and the wildcard tests take the full-parse
-/// early return before `match_fires_projected` ever runs. This ruleset
-/// deliberately has no `[*]` segment anywhere, so `Projection::has_wildcard`
-/// is false by construction and `evaluate_raw` cannot take that early
-/// return; there is no record that would separate "fell back" from "went
-/// through projection" to assert against, so this doc comment is the pin.
+/// The example ruleset and the two wildcard fallback tests never reach
+/// `Op::Equals`, `Op::AnyOf`, `Op::Absent(false)` or `negate` through
+/// `match_fires_projected`. No `[*]` segment appears anywhere here, so
+/// `Projection::has_wildcard` is false by construction and `evaluate_raw` cannot
+/// take the full-parse early return; no record separates "fell back" from "went
+/// through projection", so this comment is the pin.
 ///
-/// Covers, each via a rule reachable only by dodging the earlier ones:
-/// `equals`, `any_of`, `negate` on both `equals` and `any_of`, `absent: true`,
-/// `absent: false`, a nested path (`userIdentity.type`), a fixed array
-/// subscript (`resources[0].ARN`), a bool leaf, an integer leaf, and two
-/// float-lexed leaves whose JSON text disagrees with `f64::to_string()`
-/// (`1.0`, `1.5e-7` -- T11's bug). Missing-entirely, `null`, object, and
-/// array leaves are exercised against `equals`/`any_of`/`absent` alike,
-/// since `path.rs` yields nothing for all four and a coercion bug would
-/// treat one of them as an empty-string match instead.
+/// Each rule is reachable only by dodging the earlier ones. Missing-entirely,
+/// `null`, object and array leaves are all exercised against
+/// `equals`/`any_of`/`absent`, since `path.rs` yields nothing for all four and a
+/// coercion bug would treat one as an empty-string match.
 #[test]
 fn evaluate_raw_agrees_with_linear_across_operators_and_value_shapes() {
     let yaml = br#"
@@ -402,11 +370,8 @@ rules:
     let rule_count = rule_set.rules.len();
     let engine = Engine::new(rule_set).expect("inline ruleset must compile");
 
-    // Every record below shares this prefix unless noted: it dodges rules
-    // 0-3 (eventName != "Decrypt", eventName == "ConsoleLogin" so the
-    // negated equals doesn't fire, eventSource not in the any_of set,
-    // userIdentity.type == "IAMUser" so the negated any_of doesn't fire) so
-    // later cases can isolate rules 4-10 without an earlier broad rule
+    // Every record below shares this prefix unless noted: it dodges rules 0-3
+    // so later cases can isolate rules 4-10 without an earlier broad rule
     // shadowing them.
     let neutral = || {
         json!({
@@ -595,8 +560,6 @@ rules:
 }
 
 proptest::proptest! {
-    /// Generated records, including missing fields and non-scalar leaves, must
-    /// not separate the three evaluators.
     #[test]
     fn raw_agrees_with_linear_on_generated_records(
         event_source in proptest::option::of("[a-z]{1,8}\\.amazonaws\\.com"),

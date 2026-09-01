@@ -1,11 +1,8 @@
 //! Rule index: narrows candidate rules by `eventSource` and `eventName`
-//! literals, so `Engine::evaluate` only checks a candidate subset of rules
-//! instead of scanning all of them (`evaluate_linear`, the oracle, still does
-//! the latter).
+//! literals, so `Engine::evaluate` checks a subset instead of every rule.
 //!
-//! Over-inclusion (a rule landing in `always` when it didn't need to) is
-//! safe; over-exclusion is a silent correctness bug, so extraction is
-//! deliberately conservative.
+//! Over-inclusion (a rule landing in `always` unnecessarily) is safe;
+//! over-exclusion is a silent correctness bug, so extraction is conservative.
 
 use std::collections::HashMap;
 
@@ -144,10 +141,8 @@ impl RuleIndex {
         }
     }
 
-    /// Candidate rules for a record, in ascending `rule_idx` order so
-    /// first-match-wins agrees with `evaluate_linear`. Kept for this module's
-    /// own tests; the engine walks `Candidates::permits` directly to avoid
-    /// the `Vec`.
+    /// Candidate rules for a record, in ascending `rule_idx` order. Kept for
+    /// this module's tests; the engine walks `Candidates::permits` directly.
     #[cfg(test)]
     pub(super) fn candidates(
         &self,
@@ -202,10 +197,8 @@ impl RuleIndex {
     }
 
     /// Whether the rule at `idx` must be considered for a record with the
-    /// given `eventSource`/`eventName`. The sole implementation of the
-    /// conservative selection rule, restated here for tests that check one
-    /// index at a time; the engine's hot path calls `candidates_for` once per
-    /// record instead.
+    /// given `eventSource`/`eventName`. Restated here for tests that check one
+    /// index at a time; the hot path calls `candidates_for` once per record.
     #[cfg(test)]
     pub(super) fn permits(
         &self,
@@ -301,12 +294,10 @@ fn find_unescaped_parens(s: &str) -> Vec<(usize, char)> {
     positions
 }
 
-/// Unescape a fragment of a regex that is claimed to contain no metacharacter
-/// with special meaning — i.e. it must match only the literal string it
-/// spells out. Returns `None` the moment that claim looks false: any
-/// unescaped metacharacter, or a backslash-escape of an alphanumeric (`\d`,
-/// `\w`, `\s`, `\b`, ...), which denotes a character class or anchor rather
-/// than an escaped literal.
+/// Unescape a regex fragment claimed to contain no metacharacter. Returns
+/// `None` the moment that claim looks false: any unescaped metacharacter, or a
+/// backslash-escape of an alphanumeric (`\d`, `\w`, ...), which denotes a
+/// character class or anchor rather than an escaped literal.
 fn unescape_literal(s: &str) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -466,8 +457,7 @@ mod tests {
 
     #[test]
     fn a_negated_condition_never_supplies_an_index_key() {
-        // Enforced in engine.rs, asserted here as documentation of the rule:
-        // a rule that fires when eventSource is NOT kms must not be filed
+        // A rule that fires when eventSource is NOT kms must not be filed
         // under "kms", or it would be skipped for every other source.
         let keys = vec![RuleKeys {
             event_source: None,

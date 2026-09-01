@@ -1,11 +1,10 @@
-//! A dependency-free stand-in for the AWS Lambda Runtime API, plus a helper
-//! for spawning the real `bootstrap` binary against it.
+//! A dependency-free stand-in for the AWS Lambda Runtime API, plus a helper for
+//! spawning the real `bootstrap` binary against it.
 //!
 //! The Runtime API is plain HTTP/1.1 with no auth and three endpoints, so a
-//! `TcpListener` and ~200 lines of hand-rolled parsing beat pulling a server
-//! framework into the dev-dependency graph. Serving it lets a test drive a
-//! Lambda binary's **actual `main`** — cold-start init included — which is the
-//! only way to cover a composition root.
+//! `TcpListener` beats pulling a server framework into the dev-dependency graph.
+//! Serving it lets a test drive a Lambda binary's **actual `main`**, cold-start
+//! init included — the only way to cover a composition root.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -55,10 +54,9 @@ pub struct FakeRuntimeApi {
 }
 
 impl FakeRuntimeApi {
-    /// Binds a listener and queues `events`, each to be handed out once, in
-    /// order. Once they are exhausted, `next` long-polls forever — exactly
-    /// what real Lambda does to an idle container, and what keeps the binary
-    /// alive and observable instead of racing us to exit.
+    /// Binds a listener and queues `events`, each handed out once, in order.
+    /// Once exhausted, `next` long-polls forever as real Lambda does to an idle
+    /// container, keeping the binary alive and observable.
     pub fn start(events: &[serde_json::Value]) -> Self {
         let pending = events
             .iter()
@@ -286,11 +284,8 @@ pub struct LambdaProcess {
 
 impl LambdaProcess {
     /// Spawns `binary` wired to `runtime_api`, with a **cleared** environment
-    /// plus `extra_env`.
-    ///
-    /// Clearing matters: an ambient `AWS_PROFILE`, `AWS_REGION`, or real
-    /// credentials on a developer machine would otherwise leak into the child
-    /// and make the test pass or fail for reasons unrelated to the code.
+    /// plus `extra_env`: an ambient `AWS_PROFILE`, `AWS_REGION` or real
+    /// credentials would otherwise leak into the child.
     pub fn spawn<K, V>(binary: &str, runtime_api: &str, extra_env: &[(K, V)]) -> Self
     where
         K: AsRef<std::ffi::OsStr>,
@@ -341,14 +336,12 @@ impl LambdaProcess {
         self.log.lock().expect("log lock").clone()
     }
 
-    /// Blocks until `api` has recorded at least `n` outcomes, panicking with
-    /// the child's logs if it exits first or `timeout` elapses.
+    /// Blocks until `api` has recorded at least `n` outcomes, panicking with the
+    /// child's logs if it exits first or `timeout` elapses.
     ///
-    /// Liveness is polled alongside the outcome count on purpose: a
-    /// composition root that panics during init never reaches the runtime
-    /// loop, so it reports *nothing* — waiting on the count alone would burn
-    /// the full timeout and then fail with no explanation. Catching the exit
-    /// turns that into an immediate failure quoting the panic.
+    /// Liveness is polled alongside the count: a composition root that panics
+    /// during init reports nothing, so waiting on the count alone would burn the
+    /// timeout and fail with no explanation.
     pub fn wait_for_outcomes(
         &mut self,
         api: &FakeRuntimeApi,

@@ -1,7 +1,5 @@
-//! End-to-end tests for the `cloudtrail-rs` CLI binary (task 17), driven
-//! through `assert_cmd` so they exercise the compiled binary exactly as a
-//! user would invoke it — argument parsing, exit codes, and stdout/stderr
-//! included.
+//! End-to-end tests for the `cloudtrail-rs` binary, driven through
+//! `assert_cmd`: argument parsing, exit codes and stdout/stderr included.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,8 +12,7 @@ use flate2::write::GzEncoder;
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
-/// A path under the OS temp dir, unique per call so parallel tests never
-/// collide (same approach `FileConfigSource`'s own tests use).
+/// A path under the OS temp dir, unique per call.
 fn temp_path(label: &str) -> PathBuf {
     let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
@@ -37,11 +34,9 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
-/// Gzip with the deflate compressor switched off (stored blocks), so the
-/// object is *larger* compressed than decompressed by a known ~23 bytes. That
-/// is what makes an object over `max_object_bytes` on the wire but under it
-/// once decompressed — the only shape that can tell a capped fetch from an
-/// uncapped one.
+/// Gzip with the compressor switched off (stored blocks), so the object is
+/// ~23 bytes *larger* compressed than decompressed — the only shape that can
+/// tell a capped fetch from an uncapped one.
 fn gzip_stored(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
     encoder.write_all(body).unwrap();
@@ -483,8 +478,8 @@ fn validate_settings_env_override_wins_over_file() {
 }
 
 // ---------------------------------------------------------------------------
-// `filter --settings`: a backfill must select and process the same objects,
-// the same way, as the deployment whose settings it is handed.
+// `filter --settings`: a backfill must select and process what the deployment
+// whose settings it is handed does.
 // ---------------------------------------------------------------------------
 
 /// A rules document that drops exactly `Decrypt`, reused by the tests below.
@@ -523,11 +518,6 @@ fn kept_event_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// #10: the key filter comes from `source.include_key_regex` /
-/// `exclude_key_regex`, not from a hardcoded `.json.gz` check. With a
-/// deployment that names its objects `.log.gz`, a backfill must pick up
-/// exactly those — and must skip what the deployment's exclude pattern
-/// skips — or it selects a different object set than production.
 #[test]
 fn filter_settings_key_regexes_select_the_production_object_set() {
     let rules_path = drop_decrypt_rules("filter-keys-rules");
@@ -592,13 +582,9 @@ fn filter_settings_key_regexes_select_the_production_object_set() {
     std::fs::remove_dir_all(&out_dir).unwrap();
 }
 
-/// #11: `mode: stream` must actually stream — through `stream_run`, writing
-/// via the destination store — and an all-dropped object must leave nothing
-/// behind, not even the partial file the streaming write goes through.
-///
-/// `max_object_bytes` is what makes this a real test of the mode rather than
-/// of the output: it is buffer mode's memory cap and stream mode has
-/// none, so the kept object here can only be written by streaming it.
+/// `max_object_bytes` is what makes this a test of the mode rather than of the
+/// output: it is buffer mode's memory cap and stream mode has none, so the kept
+/// object here can only be written by streaming it.
 #[test]
 fn filter_settings_stream_mode_round_trips_and_leaves_no_partial() {
     let rules_path = drop_decrypt_rules("filter-stream-rules");
@@ -670,11 +656,9 @@ fn filter_settings_stream_mode_round_trips_and_leaves_no_partial() {
     std::fs::remove_dir_all(&out_dir).unwrap();
 }
 
-/// #11: an object the Lambda handles must not fail the CLI. In `auto` mode a
-/// small-but-highly-compressible object is routed to buffer mode and blows
-/// `max_object_bytes` (buffer mode's memory cap); the pipeline retries
-/// it through stream mode, and so must `filter`. Under an explicit
-/// `mode: buffer` the operator opted out of streaming, so the error stands.
+/// A small-but-highly-compressible object is routed to buffer mode and blows
+/// `max_object_bytes`; `auto` must retry it through stream mode as the pipeline
+/// does, while an explicit `mode: buffer` opted out and must still fail.
 #[test]
 fn filter_auto_mode_retries_oversized_object_through_stream() {
     let rules_path = drop_decrypt_rules("filter-oversize-rules");
@@ -747,9 +731,6 @@ fn filter_auto_mode_retries_oversized_object_through_stream() {
     std::fs::remove_file(&output_path).unwrap();
 }
 
-/// #11: one unreadable object must not abandon the rest of the batch. The
-/// run continues, the summary still prints, every failure is listed, and the
-/// exit code is non-zero.
 #[test]
 fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     let rules_path = drop_decrypt_rules("filter-failure-rules");
@@ -758,8 +739,8 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     let out_dir = temp_path("filter-failure-out");
     std::fs::create_dir_all(&in_dir).unwrap();
     let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#;
-    // Enumeration is sorted, so the corrupt object sits between two healthy
-    // ones: the object after it proves the run did not stop.
+    // Enumeration is sorted: the corrupt object sits between two healthy ones,
+    // so the object after it proves the run did not stop.
     std::fs::write(in_dir.join("a.json.gz"), gzip_bytes(body)).unwrap();
     std::fs::write(in_dir.join("b-corrupt.json.gz"), b"this is not gzip").unwrap();
     std::fs::write(in_dir.join("c.json.gz"), gzip_bytes(body)).unwrap();
@@ -806,8 +787,6 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     std::fs::remove_dir_all(&out_dir).unwrap();
 }
 
-/// #9: `behavior.dry_run` is the deployment's "evaluate but write nothing"
-/// switch; a backfill handed those settings must honour it.
 #[test]
 fn filter_settings_dry_run_evaluates_and_writes_nothing() {
     let rules_path = drop_decrypt_rules("filter-dryrun-rules");
@@ -857,9 +836,6 @@ fn filter_settings_dry_run_evaluates_and_writes_nothing() {
     std::fs::remove_file(&input_path).unwrap();
 }
 
-/// #9: `behavior.on_unrecognized_object` decides what happens to an object
-/// with no `Records` array. The default copies it verbatim; a deployment set
-/// to `skip` must not have its backfill copy it.
 #[test]
 fn filter_settings_on_unrecognized_object_skip_does_not_copy() {
     let rules_path = drop_decrypt_rules("filter-unrecognized-rules");
@@ -917,9 +893,8 @@ fn filter_settings_on_unrecognized_object_skip_does_not_copy() {
     std::fs::remove_file(&copied_path).unwrap();
 }
 
-/// The fixture the `max_object_bytes` tests share: a JSON envelope whose
-/// *decompressed* body fits under 1024 bytes but whose *compressed* form does
-/// not. Returns `(gzip bytes, decompressed length)`.
+/// A gzip object whose *decompressed* body fits under 1024 bytes but whose
+/// *compressed* form does not.
 fn over_cap_on_the_wire() -> Vec<u8> {
     let shell =
         r#"{"Records":[{"eventName":"ConsoleLogin","userAgent":""},{"eventName":"Decrypt"}]}"#;
@@ -941,15 +916,8 @@ fn over_cap_on_the_wire() -> Vec<u8> {
     gz
 }
 
-/// `processing.max_object_bytes` is buffer mode's memory cap, and the docs and
-/// the code's own comment say it applies to the **fetch** as well as to the
-/// decompressed body — the `Pipeline` applies it there. The CLI read through
-/// the uncapped `ObjectStore::get`, so the cap only ever caught the
-/// decompressed size and a multi-gigabyte object was pulled fully into memory
-/// before anything could reject it.
-///
-/// Falsifiable: this object is under the cap decompressed, so with an uncapped
-/// fetch `mode: buffer` succeeds and writes output. It must fail instead.
+/// Falsifiable: this object is under the cap decompressed, so an uncapped fetch
+/// lets `mode: buffer` succeed and write output. It must fail instead.
 #[test]
 fn filter_buffer_mode_caps_the_fetch_not_only_the_decompressed_body() {
     let rules_path = drop_decrypt_rules("filter-fetchcap-rules");
@@ -981,9 +949,8 @@ fn filter_buffer_mode_caps_the_fetch_not_only_the_decompressed_body() {
     );
     assert!(!output_path.exists());
 
-    // Same object, same cap, `auto`: the retry through stream mode carries it,
-    // exactly as the pipeline's does. The cap is a buffer-mode cap, not a
-    // ceiling on what a backfill can process.
+    // Same object, same cap, `auto`: the retry through stream mode carries it.
+    // The cap is a buffer-mode cap, not a ceiling on a backfill.
     let auto_settings = write_settings(
         "filter-fetchcap-auto.yaml",
         &format!("version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}auto\n"),
@@ -1017,14 +984,53 @@ fn filter_buffer_mode_caps_the_fetch_not_only_the_decompressed_body() {
     std::fs::remove_file(&auto_out).unwrap();
 }
 
-/// `behavior.dry_run` selects the destination, not the mode. It used to
-/// short-circuit into buffer-mode evaluation, which made the one setting meant
-/// for a pre-flight check the one setting whose verdict could differ from the
-/// real run's: this object fails buffer mode's cap and streams fine, so the
-/// preview reported a failure the real run does not have.
-///
-/// Falsifiable: with the old short-circuit the dry run exits non-zero on an
-/// object the very next line proves a real run writes.
+/// Falsifiable: with a wrapping `limit + 1` this run cannot succeed — a debug
+/// build panics on the overflow, a release build reads zero bytes.
+#[test]
+fn filter_buffer_mode_at_uncapped_max_object_bytes_reads_the_whole_object() {
+    let rules_path = drop_decrypt_rules("filter-nocap-rules");
+    let input_path = temp_path("filter-nocap-input.json.gz");
+    let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#;
+    std::fs::write(&input_path, gzip_bytes(body)).unwrap();
+
+    let settings_path = write_settings(
+        "filter-nocap-settings.yaml",
+        "version: 1\ndestination:\n  bucket: unused-by-the-cli\n\
+         processing:\n  mode: buffer\n  max_object_bytes: 18446744073709551615\n",
+    );
+    let output_path = temp_path("filter-nocap-output.json.gz");
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&output_path)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
+        .assert();
+    let output = assert.get_output();
+    assert!(
+        output.status.success(),
+        "an uncapped max_object_bytes must read the object whole, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        kept_event_names(&std::fs::read(&output_path).expect("filter must write an output file")),
+        vec!["ConsoleLogin"]
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_file(&input_path).unwrap();
+    std::fs::remove_file(&output_path).unwrap();
+}
+
+/// `behavior.dry_run` selects the destination, not the mode. Falsifiable: this
+/// object fails buffer mode's cap and streams fine, so a preview that
+/// short-circuits into buffer evaluation exits non-zero on an object the very
+/// next line proves a real run writes.
 #[test]
 fn filter_dry_run_previews_an_oversized_object_through_stream_mode() {
     let rules_path = drop_decrypt_rules("filter-dryrun-stream-rules");
@@ -1060,9 +1066,8 @@ fn filter_dry_run_previews_an_oversized_object_through_stream_mode() {
     );
     assert!(!output_path.exists(), "a dry run must write nothing");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The record counters must survive the trip through the discard
-    // destination: `stream_run` publishes to a scratch `Metrics`, and
-    // everything except `BytesOut` is folded back.
+    // The record counters must survive the discard destination: `stream_run`
+    // publishes to a scratch `Metrics`, and all but `BytesOut` is folded back.
     assert!(
         stdout.contains("records: 2 in, 1 kept, 1 dropped"),
         "the streamed preview must still report what would be filtered, got stdout: {stdout}"
@@ -1073,12 +1078,8 @@ fn filter_dry_run_previews_an_oversized_object_through_stream_mode() {
     std::fs::remove_file(&input_path).unwrap();
 }
 
-/// A dry run discarded its own outcome classification, so the number of
-/// objects the real run would hand to `behavior.on_unrecognized_object` —
-/// copied verbatim, skipped, or under `error` *failed* — was invisible in the
-/// one mode whose entire job is to say what the real run will do.
-///
-/// Falsifiable: the count is not printed at all without the fix.
+/// Falsifiable: the count of objects the real run would hand to
+/// `behavior.on_unrecognized_object` is not printed at all without the fix.
 #[test]
 fn filter_dry_run_reports_unrecognized_objects() {
     let rules_path = drop_decrypt_rules("filter-dryrun-unrec-rules");
@@ -1132,12 +1133,8 @@ fn filter_dry_run_reports_unrecognized_objects() {
     std::fs::remove_dir_all(&in_dir).unwrap();
 }
 
-/// `Pipeline` refuses to reprocess its own output (`CoreError::SelfTrigger`);
-/// the CLI had no equivalent, so `filter ./logs ./logs` rewrote a directory of
-/// CloudTrail objects in place and destroyed every original.
-///
-/// Falsifiable: without the guard the run exits zero and the source objects on
-/// disk are the filtered ones.
+/// Falsifiable: without the guard `filter ./logs ./logs` exits zero and the
+/// source objects on disk are the filtered ones.
 #[test]
 fn filter_refuses_to_write_over_its_own_source() {
     let rules_path = drop_decrypt_rules("filter-selfoverwrite-rules");
@@ -1148,7 +1145,7 @@ fn filter_refuses_to_write_over_its_own_source() {
     let before = std::fs::read(dir.join("a.json.gz")).unwrap();
 
     // The same directory, spelled differently on each side: a string compare
-    // would not have caught this one.
+    // would not catch it.
     let assert = Command::cargo_bin("cloudtrail-rs")
         .unwrap()
         .arg("filter")
@@ -1177,13 +1174,9 @@ fn filter_refuses_to_write_over_its_own_source() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Stream mode reaches `on_unrecognized_object` with the upload already
-/// aborted and nothing buffered. It used to re-fetch the whole object before
-/// even consulting the policy — buffering, on the one path reached by objects
-/// too large to buffer, and reading an object `skip` and `error` never need.
-/// It now decides first and, for `copy`, streams source → destination.
-///
-/// Guards the new streaming copy: the object must arrive byte-identical.
+/// Stream mode reaches `on_unrecognized_object` with the upload aborted and
+/// nothing buffered, so the policy decides before anything is fetched and
+/// `copy` streams source → destination. The object must arrive byte-identical.
 #[test]
 fn filter_stream_mode_copies_an_unrecognized_object_verbatim() {
     let rules_path = drop_decrypt_rules("filter-stream-unrec-rules");

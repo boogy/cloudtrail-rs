@@ -1,12 +1,7 @@
-//! Version and commit metadata baked in at compile time by [`build.rs`].
+//! Version and commit metadata baked in at compile time by `build.rs`.
 //!
-//! `build.rs` resolves the version from (in order) the CI-injected
-//! `CLOUDTRAIL_RS_VERSION` env var (the release tag), `git describe`, then the
-//! crate semver; the short commit SHA likewise from `CLOUDTRAIL_RS_GIT_SHA` or
-//! `git rev-parse`. Each binary logs [`LONG`] once at cold start so the running
-//! build is visible in CloudWatch, and the CLI exposes it via `--version`.
-//!
-//! [`build.rs`]: https://doc.rust-lang.org/cargo/reference/build-scripts.html
+//! Each binary logs [`LONG`] once at cold start so the running build is visible
+//! in CloudWatch; the CLI exposes it via `--version`.
 
 /// Release version — a git tag like `v1.2.3` on shipped builds, a `git
 /// describe` string locally, or the crate semver as a last resort.

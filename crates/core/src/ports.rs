@@ -50,9 +50,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    // Throwaway implementations whose only purpose is to prove each trait
-    // is object-safe (`Arc<dyn Trait>` compiles and is callable) across
-    // every method, including the `Box<dyn AsyncRead>` ones.
+    // Prove each trait is object-safe across every method, including the
+    // `Box<dyn AsyncRead>` ones.
 
     struct NullDecoder;
     impl EventDecoder for NullDecoder {

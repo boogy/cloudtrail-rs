@@ -1,27 +1,22 @@
-//! Parsing, defaults, and environment overrides for the settings document
-//! (fetched from `SETTINGS_URI`).
+//! Parsing, defaults, and environment overrides for the settings document.
 //!
-//! Env wins over file, always. To keep that logic testable without touching
-//! process-global `std::env` state (`cargo test` runs in parallel, and
-//! `std::env::set_var`/`remove_var` would flake or corrupt sibling tests),
-//! the override step is a pure function of an injected `env` lookup:
-//! `Settings::load()` is the only place that closes over `std::env::var`.
+//! Env wins over file, always. The override step is a pure function of an
+//! injected `env` lookup — `Settings::load()` is the only place that closes
+//! over `std::env::var`, so tests never touch process-global state.
 
 use regex::{Regex, RegexBuilder};
 
 use crate::config::rules::REGEX_SIZE_LIMIT;
 use crate::error::ConfigError;
 
-/// S3's hard minimum for a non-final multipart upload part. A smaller
+/// S3's hard minimum for a non-final multipart part. A smaller
 /// `processing.multipart_part_bytes` fails `CompleteMultipartUpload` with
-/// `EntityTooSmall` mid-object, after bytes are already uploaded — so this is
-/// rejected at config load instead (Fix D).
+/// `EntityTooSmall` mid-object, so it is rejected at config load.
 const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Highest gzip compression level `flate2`'s `rust_backend` (miniz_oxide)
-/// accepts. `Compression::new(11)` panics (`assertion failed: level.level()
-/// <= 10` inside `buffer_run`/`stream_run`, on the first object — not at
-/// init), so this is rejected at config load instead (Fix A).
+/// Highest gzip level `flate2`'s `rust_backend` accepts. A higher one panics
+/// inside `buffer_run`/`stream_run` on the first object — not at init — so it
+/// is rejected at config load.
 const MAX_GZIP_LEVEL: u32 = 9;
 
 /// How an object's size determines buffer vs. stream processing.
@@ -229,16 +224,13 @@ impl Default for Source {
     }
 }
 
-/// The compiled [`Source`] pair, and the single definition of "is this key
-/// in scope" in the workspace.
+/// The compiled [`Source`] pair, and the single definition of "is this key in
+/// scope" in the workspace.
 ///
-/// One type rather than three call sites compiling their own regexes,
-/// because the three consumers must agree exactly on which objects exist:
-/// `Settings::validate` (pre-deploy), `Pipeline` (production), and the CLI's
-/// `filter` batch enumeration (backfill). A backfill that selected a
-/// different object set than production would either skip objects the
-/// operator believes were re-filtered, or write objects production never
-/// touches — both invisible until someone audits the destination bucket.
+/// One type rather than three call sites compiling their own regexes:
+/// `Settings::validate`, `Pipeline` and the CLI's `filter` batch enumeration
+/// must agree exactly on which objects exist, or a backfill silently covers a
+/// different object set than production.
 #[derive(Debug, Clone)]
 pub struct KeyFilter {
     include: Regex,
@@ -442,10 +434,9 @@ impl Default for Document {
     }
 }
 
-/// Parse `key`'s value out of `env` and apply it to `settings` via `f`,
-/// short-circuiting with a `ConfigError` that names the offending key on a
-/// bad value. A no-op when `key` is unset — env overrides are opt-in per
-/// field, file (or built-in default) value stands otherwise.
+/// Parse `key`'s value out of `env` and apply it via `f`, short-circuiting with
+/// a `ConfigError` naming the offending key. A no-op when `key` is unset — env
+/// overrides are opt-in per field.
 fn apply<T>(
     env: &dyn Fn(&str) -> Option<String>,
     key: &str,
@@ -524,13 +515,9 @@ impl Document {
             ));
         }
 
-        // Fix B (F4): compile both key regexes here, at load time. Left
-        // uncompiled, an invalid pattern panics inside `Pipeline::new` —
-        // a cold-start crash loop unreachable from pre-deploy validation.
-        // Discarded once built: this is validation only. It is the same
-        // `KeyFilter` — same patterns, same size limit — that `Pipeline::new`
-        // and the CLI's `filter` build for real, so a pattern accepted here
-        // is guaranteed to compile in both.
+        // Compiled at load time: left uncompiled, an invalid pattern panics
+        // inside `Pipeline::new` — a cold-start crash loop unreachable from
+        // pre-deploy validation. Discarded; this is validation only.
         KeyFilter::compile(&self.source)?;
 
         // Fix A (F3): flate2's rust_backend panics on a gzip level above 9
@@ -544,11 +531,9 @@ impl Document {
             )));
         }
 
-        // Fix C (F5): stream_threshold_bytes is a COMPRESSED-size estimate
-        // that routes an object to buffer vs. stream mode; max_object_bytes
-        // is buffer mode's memory cap, applied to both the compressed fetch
-        // and the decompressed body. If max_object_bytes is smaller, every
-        // object routed to buffer mode is guaranteed to blow the cap.
+        // `stream_threshold_bytes` is a compressed-size estimate routing an
+        // object to buffer vs. stream mode; `max_object_bytes` is buffer mode's
+        // memory cap. If the cap is smaller, every buffer-routed object blows it.
         if self.processing.max_object_bytes < self.processing.stream_threshold_bytes {
             return Err(ConfigError::Parse(format!(
                 "processing.max_object_bytes ({} bytes, buffer mode's memory cap) is \
@@ -559,9 +544,8 @@ impl Document {
             )));
         }
 
-        // Fix D (F7): S3's hard minimum for a non-final multipart part. A
-        // smaller value fails CompleteMultipartUpload with EntityTooSmall
-        // mid-object, after bytes are already uploaded.
+        // Below S3's minimum, `CompleteMultipartUpload` fails with
+        // `EntityTooSmall` after bytes are already uploaded.
         if self.processing.multipart_part_bytes < S3_MIN_MULTIPART_PART_BYTES {
             return Err(ConfigError::Parse(format!(
                 "processing.multipart_part_bytes ({} bytes) is below S3's hard minimum of {} \
@@ -588,14 +572,12 @@ impl Document {
 }
 
 impl Settings {
-    /// Production entry point: reads `SETTINGS_URI` and every `CT_*` var
-    /// from the process environment.
+    /// Production entry point: reads `SETTINGS_URI` and every `CT_*` var from
+    /// the process environment.
     ///
-    /// `SETTINGS_URI` is optional (an env-only deployment is valid). If set,
-    /// only `file://` is resolved here — `core` has no `aws-sdk-*`
-    /// dependency, so an `s3://`/`ssm://` settings URI needs a
-    /// composition root that can reach those services and hand this
-    /// function the fetched bytes instead.
+    /// `SETTINGS_URI` is optional, and only `file://` is resolved here — `core`
+    /// has no AWS dependency, so an `s3://`/`ssm://` URI needs a composition
+    /// root to fetch the bytes and call [`Settings::from_parts`].
     pub async fn load() -> Result<Settings, ConfigError> {
         let bytes = match std::env::var("SETTINGS_URI") {
             Ok(uri) => Some(read_settings_uri(&uri)?),
@@ -604,14 +586,12 @@ impl Settings {
         Self::from_parts(bytes.as_deref(), &|key| std::env::var(key).ok())
     }
 
-    /// Parse `bytes` (or fall back to built-in defaults when `None`), apply
-    /// `env` overrides, and validate. Pure function of its arguments — no
-    /// process environment or filesystem access — so every override and
-    /// default combination is directly testable without `std::env` global
-    /// state.
+    /// Parse `bytes` (or built-in defaults when `None`), apply `env` overrides,
+    /// and validate. A pure function of its arguments — no process environment,
+    /// no filesystem.
     ///
-    /// `pub` so the CLI's `validate-settings` subcommand can run the exact
-    /// same validation the Lambda binaries do, instead of reimplementing it.
+    /// `pub` so the CLI's `validate-settings` runs the exact same validation the
+    /// Lambda binaries do.
     pub fn from_parts(
         bytes: Option<&[u8]>,
         env: &dyn Fn(&str) -> Option<String>,

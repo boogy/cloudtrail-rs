@@ -59,7 +59,7 @@ check: ## Fast type-check without producing binaries
 	$(CARGO) check $(LINT_FLAGS)
 
 .PHONY: ci
-ci: fmt-check clippy tree-features test audit ## Everything CI enforces: fmt + clippy + one-decoder-per-binary + tests + audit
+ci: fmt-check clippy tree-features core-no-aws test audit ## Everything CI enforces: fmt + clippy + one-decoder-per-binary + core-has-no-AWS + tests + audit
 
 # ---- security & coverage ----------------------------------------------
 .PHONY: audit

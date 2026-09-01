@@ -1,27 +1,10 @@
-//! An [`ObjectStore`] that accepts writes and throws them away.
+//! An [`ObjectStore`] that accepts writes and throws them away, so
+//! `behavior.dry_run` can run the real stream path instead of a second
+//! evaluator that could disagree with it.
 //!
-//! `behavior.dry_run` means "evaluate everything, write nothing", and until
-//! now that was implemented by refusing to take the stream path at all: dry
-//! run always ran buffer mode. That made the one mode meant for a pre-flight
-//! check the one mode whose answer could differ from the live run's — an
-//! object over `max_object_bytes` failed the dry run with `ObjectTooLarge`
-//! while `mode: auto` would have streamed it successfully, so the preview
-//! reported a failure the real thing does not have.
-//!
-//! `stream_run` writes through the [`ObjectStore`] port, so the fix is a
-//! destination rather than a second evaluator: run the real stream path
-//! against a store that drains its reader and keeps nothing. Two properties
-//! make it a faithful stand-in and not merely a silent sink:
-//!
-//! - it **drains to EOF**, so the producer side runs to completion exactly as
-//!   it would against S3 — records are evaluated, the gzip encoder is driven,
-//!   `Deserializer::end()` still verifies the trailer;
-//! - it **propagates a reader error**, so `stream_run`'s abort sentinel still
-//!   fails the "upload". A sink that swallowed it would turn every aborted
-//!   object into a successful write in the preview.
-//!
-//! The caller is responsible for not billing `BytesOut` for what lands here —
-//! see `Pipeline::process_dry_run_stream`.
+//! Faithful, not a silent sink: it drains to EOF so the producer runs to
+//! completion, and propagates a reader error so `stream_run`'s abort sentinel
+//! still fails the "upload". The caller must not bill `BytesOut` for it.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -36,8 +19,7 @@ pub struct DiscardStore;
 
 #[async_trait]
 impl ObjectStore for DiscardStore {
-    /// Never a source. Dry run reads through the real store; this type is
-    /// only ever the destination half.
+    /// Never a source: this type is only ever the destination half.
     async fn get(&self, bucket: &str, key: &str) -> Result<Bytes, StoreError> {
         Err(StoreError::NotFound {
             bucket: bucket.to_string(),
@@ -92,10 +74,6 @@ mod tests {
         content_encoding: "gzip",
     };
 
-    /// Asserting `is_ok()` would pass against a `put_stream` that ignored the
-    /// reader entirely, which is the one thing this type must not do — the
-    /// producer has to run to completion for the preview to mean anything. So
-    /// count what was actually read.
     #[tokio::test]
     async fn put_stream_drains_the_whole_reader() {
         use std::sync::Arc;
@@ -134,10 +112,6 @@ mod tests {
         assert_eq!(read.load(Ordering::Relaxed), len, "reader not drained");
     }
 
-    /// The property that makes this a stand-in for a real destination rather
-    /// than a sink: `stream_run` aborts an upload by failing the reader, so a
-    /// discard store that swallowed the error would report every aborted
-    /// object as written.
     #[tokio::test]
     async fn put_stream_propagates_a_reader_error() {
         struct Failing;

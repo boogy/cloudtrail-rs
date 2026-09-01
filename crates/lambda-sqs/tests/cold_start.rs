@@ -1,14 +1,10 @@
-//! Drives the **real** `bootstrap` binary of the SQS Lambda end to end
-//! against a live MiniStack, via a fake Lambda Runtime API.
+//! Drives the **real** `bootstrap` binary of the SQS Lambda end to end against a
+//! live MiniStack, via a fake Lambda Runtime API.
 //!
-//! Beyond covering the composition root's cold-start init, this is the only
-//! test that observes the *actual* partial-batch response the event source
-//! mapping would receive — `batch_response` is unit-tested against a
-//! hand-built `BatchOutcome`, but nothing else checks that the document
-//! reaches the Runtime API intact.
+//! Beyond the composition root's cold-start init, this is the only test that
+//! observes the actual partial-batch response the event source mapping receives.
 //!
-//! `#[ignore]`d: needs the container from `docker-compose.test.yml`. Run with
-//! `cargo test --workspace -- --ignored`.
+//! `#[ignore]`d: needs the container from `docker-compose.test.yml`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -63,10 +59,9 @@ async fn real_bootstrap_binary_processes_an_sqs_batch_and_reports_no_failures() 
     assert_eq!(gunzip(&written), expected_body);
 }
 
-/// A message naming an object that does not exist must come back as an
-/// `itemIdentifier` so the mapping re-drives *only* that message. With
-/// `on_missing_object` at its `error` default, this is the real production
-/// failure path.
+/// A message naming a missing object must come back as an `itemIdentifier` so
+/// the mapping re-drives only that message. `on_missing_object` at its `error`
+/// default is the production failure path.
 #[tokio::test]
 #[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
 async fn missing_object_is_reported_as_a_partial_batch_failure() {
@@ -98,9 +93,8 @@ async fn missing_object_is_reported_as_a_partial_batch_failure() {
     );
 }
 
-/// S3 -> SNS -> SQS fan-out: the message body is an SNS envelope wrapping the
-/// S3 notification. Covers `CT_SQS_BODY_FORMAT=sns` reaching the decoder
-/// through the real binary's settings load.
+/// S3 -> SNS -> SQS fan-out, covering `CT_SQS_BODY_FORMAT=sns` reaching the
+/// decoder through the real binary's settings load.
 #[tokio::test]
 #[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
 async fn sns_wrapped_message_bodies_are_decoded_when_configured() {
@@ -129,9 +123,8 @@ async fn sns_wrapped_message_bodies_are_decoded_when_configured() {
     assert_eq!(gunzip(&written), expected_body);
 }
 
-/// Two invocations on one container: proves the init-once design actually
-/// holds — the second event is served from the same process, reusing the
-/// primed `ConfigStore` and every adapter built during cold start.
+/// Two invocations on one container: the second is served from the same process,
+/// reusing the primed `ConfigStore` and every adapter built at cold start.
 #[tokio::test]
 #[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
 async fn a_warm_container_serves_a_second_invocation() {

@@ -2,19 +2,12 @@
 //!
 //! Selection happens before any of the processing in `corpus_parity.rs`: an
 //! object the filter rejects is never read, so a mistake here is invisible in
-//! every downstream test. The two failure directions are asymmetric and both
-//! bad — rejecting real trail objects silently stops filtering (the source
-//! bucket keeps the unfiltered copies, the destination quietly falls behind),
-//! while accepting digest or Insights objects feeds the pipeline envelopes
-//! that are valid `.json.gz` but a completely different schema, which it then
-//! rewrites as unrecognized.
+//! every downstream test. Both failure directions are bad — rejecting real trail
+//! objects silently stops filtering, while accepting digest or Insights objects
+//! feeds the pipeline valid `.json.gz` of a different schema.
 //!
-//! [`corpus::KEYS`] carries the layouts AWS actually produces — single-account,
-//! organization (`o-*`), custom prefix, digest, Insights, the console's
-//! zero-byte directory marker — each with the verdict the **default** filter
-//! must reach.
-//!
-//! Needs the `testing` feature; `make test` / `make ci` run `--all-features`.
+//! [`corpus::KEYS`] carries the layouts AWS produces, each with the verdict the
+//! **default** filter must reach. Needs the `testing` feature.
 #![cfg(feature = "testing")]
 
 use cloudtrail_rs_core::config::{KeyFilter, Source};
@@ -35,10 +28,8 @@ fn the_default_filter_classifies_every_corpus_key_as_declared() {
     }
 }
 
-/// The exclusions are the whole reason the default `exclude_key_regex` exists,
-/// so pin them by name rather than trusting the table above to keep containing
-/// one of each. A corpus edit that dropped the digest key would otherwise
-/// leave this file passing while testing nothing.
+/// Pinned by name rather than trusting the table to keep containing one of each:
+/// a corpus edit dropping the digest key would leave this file testing nothing.
 #[test]
 fn digest_and_insight_objects_are_excluded_despite_matching_the_include() {
     let filter = KeyFilter::compile(&Source::default()).expect("default regexes must compile");
@@ -67,9 +58,8 @@ fn digest_and_insight_objects_are_excluded_despite_matching_the_include() {
     }
 }
 
-/// Organization trails insert an `o-*` segment and custom prefixes prepend
-/// arbitrary path components. Both are ordinary trail objects; a filter that
-/// only recognized the single-account layout would drop them.
+/// Organization trails insert an `o-*` segment and custom prefixes prepend path
+/// components; a filter recognizing only the single-account layout drops them.
 #[test]
 fn organization_and_prefixed_trail_objects_are_accepted() {
     let filter = KeyFilter::compile(&Source::default()).expect("default regexes must compile");

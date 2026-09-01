@@ -1,30 +1,16 @@
-//! A realistic CloudTrail corpus: records shaped the way AWS actually emits
-//! them, kept as **verbatim source text** rather than `serde_json::json!`
-//! values.
+//! A realistic CloudTrail corpus, kept as **verbatim source text** rather than
+//! `serde_json::json!` values.
 //!
-//! # Why raw text, not `json!`
-//!
-//! Both processing modes copy a surviving record with `RawValue::get()` — the
-//! *original bytes*, never re-serialized — and assemble the output as
-//! `{"Records":[` + survivors joined by `,` + `]}`. A corpus built from
-//! `json!` + `to_string()` would be pre-normalized by serde and could not
-//! detect a regression that re-serializes instead of copying: escapes would be
-//! re-escaped identically, numbers re-rendered identically, key order
-//! preserved by luck. Storing the exact bytes and rebuilding the expected
-//! output from those same bytes makes the verbatim-copy claim falsifiable.
-//!
-//! That is also why the records below are compact single-line JSON with
-//! deliberate irregularities (mixed key order, `1.0` and exponent numbers,
-//! `\u` escapes, literal non-ASCII, embedded JSON-in-a-string): each one is a
+//! Both modes copy a surviving record with `RawValue::get()` — the original
+//! bytes, never re-serialized. A corpus built from `json!` + `to_string()` is
+//! pre-normalized by serde and could not detect a regression that re-serializes
+//! instead of copying, so the records here are compact single-line JSON with
+//! deliberate irregularities (mixed key order, `1.0` and exponent numbers, `\u`
+//! escapes, literal non-ASCII, embedded JSON-in-a-string) — each one a
 //! normalization a re-serializing implementation would silently "fix".
 //!
-//! # Why synthetic, and how to keep it that way
-//!
-//! Real CloudTrail carries account IDs, role and user names, source IPs, and
-//! occasionally sensitive `requestParameters` — none of which belongs in a
-//! public repository. Every identifier here is from a documentation-reserved
-//! range: accounts [`ALLOWED_ACCOUNT_IDS`], addresses from TEST-NET-1
-//! (`192.0.2.0/24`) and TEST-NET-2 (`198.51.100.0/24`), and `EXAMPLE`-suffixed
+//! Every identifier is synthetic and from a documentation-reserved range:
+//! accounts [`ALLOWED_ACCOUNT_IDS`], TEST-NET-1/2 addresses, `EXAMPLE`-suffixed
 //! principal IDs. [`unexpected_account_ids`] enforces it, so a real log pasted
 //! in later fails a test instead of shipping.
 
@@ -36,11 +22,11 @@ pub struct CorpusRecord {
     pub name: &'static str,
     pub event_source: &'static str,
     pub event_name: &'static str,
-    /// The record exactly as it would appear inside a real `Records` array.
-    /// Compact, single-line, byte-for-byte what the output must reproduce.
+    /// The record exactly as it appears inside a real `Records` array: compact,
+    /// single-line, byte-for-byte what the output must reproduce.
     pub json: &'static str,
-    /// The `eventID` value as it literally appears in `json`. Used by
-    /// [`scale_envelope`] to mint distinct copies, and asserted to be present.
+    /// The `eventID` value as it literally appears in `json`, minted into
+    /// distinct copies by [`scale_envelope`].
     pub event_id: &'static str,
     /// The `requestID` value as it literally appears in `json`, same purpose.
     pub request_id: &'static str,
@@ -48,13 +34,12 @@ pub struct CorpusRecord {
     pub notes: &'static str,
 }
 
-/// Account IDs permitted to appear anywhere in the corpus. `123456789012` and
-/// `210987654321` are AWS's documentation examples; `000000000000` is the
-/// MiniStack placeholder already used by `fixtures.rs`.
+/// Account IDs permitted anywhere in the corpus: two AWS documentation examples
+/// and the MiniStack placeholder `fixtures.rs` uses.
 pub const ALLOWED_ACCOUNT_IDS: &[&str] = &["123456789012", "210987654321", "000000000000"];
 
 /// The corpus. Ordering is stable and load-bearing: [`full_envelope`] emits
-/// them in this order, so expected bodies stay predictable.
+/// them in this order.
 pub const RECORDS: &[CorpusRecord] = &[
     CorpusRecord {
         name: "sts-assume-role-service-role",
@@ -226,15 +211,13 @@ pub const RECORDS: &[CorpusRecord] = &[
 #[derive(Debug, Clone, Copy)]
 pub struct CorpusKey {
     pub key: &'static str,
-    /// Expected result of `KeyFilter::accepts` under `Source::default()`:
-    /// include `\.json\.gz$`, exclude
-    /// `(/CloudTrail-Digest/|/CloudTrail-Insight/|/$)`.
+    /// Expected `KeyFilter::accepts` under `Source::default()`.
     pub accepted_by_default: bool,
     pub notes: &'static str,
 }
 
-/// Keys as CloudTrail actually lays them out, including the three prefixes the
-/// default exclude regex exists to reject.
+/// Keys as CloudTrail lays them out, including the three prefixes the default
+/// exclude regex exists to reject.
 pub const KEYS: &[CorpusKey] = &[
     CorpusKey {
         key: "AWSLogs/123456789012/CloudTrail/eu-west-1/2026/07/29/123456789012_CloudTrail_eu-west-1_20260729T0915Z_a1B2c3D4e5F6g7H8.json.gz",
@@ -276,9 +259,9 @@ pub const KEYS: &[CorpusKey] = &[
     },
 ];
 
-/// Wraps `records` in the `{"Records":[...]}` envelope **verbatim**, joined
-/// exactly the way `buffer_run` and `stream_run` assemble their output — so an
-/// expected body built here is byte-comparable with what the pipeline writes.
+/// Wraps `records` in the `{"Records":[...]}` envelope **verbatim**, joined the
+/// way `buffer_run` and `stream_run` assemble their output, so an expected body
+/// built here is byte-comparable with what the pipeline writes.
 pub fn envelope<'a, I>(records: I) -> String
 where
     I: IntoIterator<Item = &'a CorpusRecord>,
@@ -287,10 +270,8 @@ where
     envelope_of(&bodies)
 }
 
-/// [`envelope`] over record bodies that are not corpus constants — the output
-/// of [`scale_records`], or a hand-built variant. Kept public so a test can
-/// build an *expected* body the same way the pipeline builds the real one,
-/// instead of re-hardcoding the envelope format in the test.
+/// [`envelope`] over record bodies that are not corpus constants, so a test
+/// builds an *expected* body the way the pipeline builds the real one.
 pub fn envelope_of<S: AsRef<str>>(bodies: &[S]) -> String {
     let joined = bodies
         .iter()
@@ -310,10 +291,8 @@ pub fn records() -> &'static [CorpusRecord] {
     RECORDS
 }
 
-/// The envelope of every record satisfying `keep` — i.e. the output expected
-/// from an engine that drops exactly the complement. Returns `None` when
-/// nothing is kept, which is the pipeline's `NothingKept` outcome rather than
-/// an empty envelope.
+/// The envelope of every record satisfying `keep`. `None` when nothing is kept
+/// — the pipeline's `NothingKept` outcome, not an empty envelope.
 pub fn envelope_where(keep: impl Fn(&CorpusRecord) -> bool) -> Option<String> {
     let kept: Vec<&CorpusRecord> = RECORDS.iter().filter(|r| keep(r)).collect();
     if kept.is_empty() {
@@ -335,27 +314,25 @@ pub fn find(name: &str) -> &'static CorpusRecord {
 /// An object of `count` records, cycling the corpus and giving every copy a
 /// distinct `eventID` and `requestID`.
 ///
-/// The uniqueness is the point. A large fixture built by repeating one record
-/// compresses far better than real CloudTrail, so any test that reasons about
-/// `stream_threshold_bytes` against such a fixture is reasoning about a ratio
-/// production never produces. Cycling 14 distinct records and perturbing two
-/// identifiers per copy lands in the neighbourhood of a real object's ratio.
+/// The uniqueness is the point: a fixture built by repeating one record
+/// compresses far better than real CloudTrail, so any test reasoning about
+/// `stream_threshold_bytes` against it reasons about a ratio production never
+/// produces.
 pub fn scale_envelope(count: usize) -> String {
     envelope_of(&scale_records(count))
 }
 
-/// The bodies [`scale_envelope`] wraps, in order. A test that expects a
-/// *filtered* large object builds its expectation from these — same bytes, own
-/// predicate — rather than trying to reconstruct the substitutions.
+/// The bodies [`scale_envelope`] wraps, in order, so a test expecting a
+/// *filtered* large object builds its expectation from these rather than
+/// reconstructing the substitutions.
 pub fn scale_records(count: usize) -> Vec<String> {
     (0..count)
         .map(|i| with_unique_ids(&RECORDS[i % RECORDS.len()], i))
         .collect()
 }
 
-/// One corpus record with fresh identifiers. Both substitutions are asserted:
-/// a silently-missed replacement would produce a uniform fixture again, which
-/// is exactly the failure mode [`scale_envelope`] exists to avoid.
+/// One corpus record with fresh identifiers. Both substitutions are asserted: a
+/// silently-missed replacement produces a uniform fixture again.
 fn with_unique_ids(record: &CorpusRecord, idx: usize) -> String {
     let event_id = synthetic_id("ev", idx);
     let request_id = synthetic_id("rq", idx);
@@ -377,18 +354,17 @@ fn with_unique_ids(record: &CorpusRecord, idx: usize) -> String {
     out.replace(record.request_id, &request_id)
 }
 
-/// A UUID-shaped identifier derived from `idx`. Deterministic — the corpus
-/// must produce identical bytes on every run so failures are reproducible.
+/// A UUID-shaped identifier derived from `idx`. Deterministic, so the corpus
+/// produces identical bytes on every run.
 fn synthetic_id(tag: &str, idx: usize) -> String {
     format!("{tag}{idx:06}-0000-4000-8000-{idx:012}")
 }
 
-/// Every 12-digit run in the corpus that is not an allowed documentation
-/// account ID. A non-empty result means someone pasted in real data.
+/// Every 12-digit run in the corpus that is not an allowed documentation account
+/// ID. A non-empty result means someone pasted in real data.
 ///
-/// Deliberately blunt: it flags any 12-digit sequence, so a realistic-looking
-/// sequence number would trip it too. That is the right bias — a false
-/// positive costs one edit, a false negative publishes a customer's account.
+/// Deliberately blunt — a realistic-looking sequence number trips it too: a
+/// false positive costs one edit, a false negative publishes an account ID.
 pub fn unexpected_account_ids() -> Vec<String> {
     let mut found = Vec::new();
     for record in RECORDS {
@@ -408,8 +384,7 @@ pub fn unexpected_account_ids() -> Vec<String> {
     found
 }
 
-/// Maximal runs of exactly 12 digits (a longer run is not an account ID, and
-/// splitting one into 12-digit windows would report noise).
+/// Maximal runs of exactly 12 digits; a longer run is not an account ID.
 fn twelve_digit_runs(text: &str) -> Vec<String> {
     let mut runs = Vec::new();
     let mut current = String::new();
@@ -470,16 +445,9 @@ mod tests {
         assert_eq!(before, names.len(), "corpus record names must be unique");
     }
 
-    /// The corpus is only useful as a verbatim reference if its records are
-    /// *not* what serde would have produced — otherwise it cannot distinguish
-    /// a copy from a re-serialization.
-    ///
     /// Two records are named explicitly rather than counting divergences over
-    /// the whole corpus, because how many records diverge depends on the build:
-    /// with `serde_json/preserve_order` off, every record differs by key order
-    /// alone and the count is meaningless; with it on (which workspace feature
-    /// unification turns on here), only genuine value-level differences remain.
-    /// These two diverge either way — see the bait tokens below.
+    /// the whole corpus: with `serde_json/preserve_order` off every record
+    /// differs by key order alone. These two diverge either way.
     #[test]
     fn the_designated_records_differ_from_serdes_rendering() {
         for name in ["escapes-and-unicode", "numeric-edge-cases"] {
@@ -494,14 +462,10 @@ mod tests {
         }
     }
 
-    /// The specific bytes the test above depends on, pinned by name so that
-    /// "tidying up" a fixture fails here with an explanation instead of
-    /// silently defusing the verbatim-copy check.
-    ///
-    /// `\u00fc` and `\/` are the load-bearing pair: serde_json *decodes* both
-    /// and re-emits them as `ü` and `/`, so their presence guarantees
-    /// divergence under any feature set. The rest are checked because they are
-    /// the escapes most likely to be "simplified" by a well-meaning edit.
+    /// The bytes the test above depends on, pinned by name so "tidying up" a
+    /// fixture fails here instead of silently defusing the verbatim-copy check.
+    /// `\u00fc` and `\/` are the load-bearing pair: serde_json decodes both and
+    /// re-emits them as `ü` and `/` under any feature set.
     #[test]
     fn the_normalization_bait_is_still_in_place() {
         let escapes = find("escapes-and-unicode").json;

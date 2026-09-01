@@ -1,15 +1,9 @@
 //! Decodes S3 EventBridge notifications (feature `decode-eventbridge`).
 //!
-//! Only `detail-type: "Object Created"` carries an object worth copying;
-//! every other S3 EventBridge detail type (`Object Deleted`, `Object
-//! Restore Completed`, `Object Annotation Created`, ...) decodes to an
-//! empty `Vec` rather than an error — it is a real event, just not one
-//! this pipeline acts on.
-//!
-//! Unlike S3 bucket notifications, EventBridge object keys are **not**
-//! form-urlencoded (safety invariant 4) — `decode_form_urlencoded_key`
-//! from `s3.rs` must never be applied here, or a key containing `+` or `%`
-//! is corrupted.
+//! Only `detail-type: "Object Created"` carries an object worth copying; every
+//! other detail type decodes to an empty `Vec`, not an error. EventBridge keys
+//! are **not** form-urlencoded — never apply `s3.rs`'s
+//! `decode_form_urlencoded_key` here (safety invariant 4).
 
 use crate::error::DecodeError;
 use crate::model::{ObjectRef, SourceItem};

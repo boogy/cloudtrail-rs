@@ -1,10 +1,6 @@
-//! Test doubles for the ports in `ports.rs`, gated behind the `testing`
-//! feature so they never ship in a Lambda binary. `StaticConfigSource` and
-//! `RecordingSink` arrived with task-12; `InMemoryStore` arrives here
-//! (task-13), needed to assert what `stream_run` leaves at a destination key.
-//!
-//! [`corpus`] holds the realistic CloudTrail *data* these doubles are fed:
-//! records with the shape and byte-level irregularity of production logs.
+//! Test doubles for the ports in `ports.rs`, gated behind the `testing` feature
+//! so they never ship in a Lambda binary. [`corpus`] holds the realistic
+//! CloudTrail data they are fed.
 
 pub mod corpus;
 
@@ -20,10 +16,9 @@ use crate::error::{ConfigError, StoreError};
 use crate::model::{MetricSnapshot, PutMeta, VersionTag};
 use crate::ports::{ConfigSource, MetricsSink, ObjectStore};
 
-/// A `ConfigSource` double whose content, version, and failures are all
-/// controlled by the test. Counts calls to `version()`/`fetch()` so a
-/// `ConfigStore` test can assert exactly how many round trips a scenario
-/// costs (e.g. "unchanged past TTL costs one `version()` and zero fetches").
+/// A `ConfigSource` double whose content, version and failures are controlled by
+/// the test. Counts `version()`/`fetch()` calls, so a `ConfigStore` test can
+/// assert how many round trips a scenario costs.
 pub struct StaticConfigSource {
     state: Mutex<StaticState>,
     version_calls: AtomicUsize,
@@ -57,8 +52,7 @@ impl StaticConfigSource {
         }
     }
 
-    /// Replaces the content and version an upcoming `fetch()`/`version()`
-    /// call will see — simulates the document changing at the source.
+    /// Replaces the content and version an upcoming `fetch()`/`version()` sees.
     pub fn set(&self, bytes: impl Into<Vec<u8>>, version: VersionTag) {
         let mut state = self.state.lock().expect("StaticConfigSource poisoned");
         state.bytes = bytes.into();
@@ -117,8 +111,8 @@ impl ConfigSource for StaticConfigSource {
     }
 }
 
-/// Records every `MetricSnapshot` passed to `emit`, in order. Lets a test
-/// assert what a pipeline actually reported without parsing EMF off stdout.
+/// Records every `MetricSnapshot` passed to `emit`, in order, so a test can
+/// assert what a pipeline reported without parsing EMF off stdout.
 #[derive(Default)]
 pub struct RecordingSink {
     snapshots: Mutex<Vec<MetricSnapshot>>,
@@ -147,24 +141,18 @@ impl MetricsSink for RecordingSink {
     }
 }
 
-/// An in-memory `ObjectStore`: `get`/`put` against a `Mutex<HashMap>` keyed
-/// by `(bucket, key)`, plus `put_stream` accumulating the body it is handed
-/// so a `stream_run` test can assert exactly what landed at a destination
-/// key — including "nothing", when the upload was aborted.
+/// An in-memory `ObjectStore` keyed by `(bucket, key)`, with `put_stream`
+/// accumulating the body it is handed so a `stream_run` test can assert what
+/// landed at a destination key — including "nothing", when the upload aborted.
 ///
-/// `put_stream` treats an `Err` from the body reader as the abort signal
-/// (how the abort is triggered without a new port method):
-/// on `Err`, it returns `Err` itself *without* inserting into `objects`, so
-/// the destination key is left holding whatever it held before the call
-/// (nothing, for a fresh key) — simulating `AbortMultipartUpload` leaving no
-/// object behind.
+/// `put_stream` treats an `Err` from the body reader as the abort signal: it
+/// returns `Err` without inserting, leaving the key holding what it held before,
+/// as `AbortMultipartUpload` does.
 ///
-/// `put_stream_progress()` reports cumulative bytes read so far by the
-/// *most recent* `put_stream` call (reset to 0 at the start of each call) —
-/// a live progress counter a concurrently-polling test can sample to prove
-/// the store started receiving bytes before the producer finished, i.e.
-/// that the two sides are actually pipelined rather than "buffer everything,
-/// then write everything".
+/// `put_stream_progress()` reports bytes read so far by the *most recent*
+/// `put_stream` call (reset per call), so a concurrently-polling test can prove
+/// the store received bytes before the producer finished — that the two sides
+/// are pipelined rather than buffer-everything-then-write.
 #[derive(Default)]
 pub struct InMemoryStore {
     objects: Mutex<HashMap<(String, String), Bytes>>,
@@ -207,9 +195,8 @@ impl InMemoryStore {
         self.put_stream_progress.load(Ordering::SeqCst)
     }
 
-    /// Number of `get()` calls made so far — including the internal `get()`
-    /// that `get_stream()`'s default-ish implementation delegates to here,
-    /// so e.g. "one `get_stream()` plus one re-fetch `get()`" reads as 2.
+    /// Number of `get()` calls so far, including the one `get_stream()`
+    /// delegates to here.
     pub fn read_calls(&self) -> usize {
         self.read_calls.load(Ordering::SeqCst)
     }
@@ -261,8 +248,7 @@ impl ObjectStore for InMemoryStore {
                         .fetch_add(n as u64, Ordering::SeqCst);
                 }
                 Err(e) => {
-                    // The reader failed mid-stream: simulate
-                    // AbortMultipartUpload by leaving the destination
+                    // Simulate AbortMultipartUpload: leave the destination
                     // untouched instead of committing a partial object.
                     return Err(StoreError::Backend(format!(
                         "put_stream aborted after {} bytes: {e}",
@@ -387,9 +373,8 @@ mod tests {
         );
     }
 
-    /// An `AsyncRead` whose one and only `poll_read` call reports an error —
-    /// the abort-triggering shape `stream_run` needs (how the
-    /// abort is triggered without a new port method).
+    /// An `AsyncRead` whose one and only `poll_read` reports an error — the
+    /// abort-triggering shape `stream_run` needs.
     struct FailingReader;
 
     impl tokio::io::AsyncRead for FailingReader {
