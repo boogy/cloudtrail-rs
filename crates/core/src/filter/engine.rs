@@ -9,6 +9,7 @@
 
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
+use std::borrow::Cow;
 
 use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
@@ -286,8 +287,8 @@ impl Engine {
     }
 
     /// Whether one condition holds against an already-projected record.
-    fn match_fires_projected(m: &CompiledMatch, slots: &[Option<String>]) -> bool {
-        let value = slots[m.path_id].as_deref();
+    fn match_fires_projected(m: &CompiledMatch, slots: &[Option<Cow<'_, str>>]) -> bool {
+        let value: Option<&str> = slots[m.path_id].as_deref();
         let holds = match &m.op {
             Op::Regex(re) => value.is_some_and(|v| re.is_match(v)),
             Op::Equals(want) => value == Some(want.as_str()),

@@ -9,6 +9,7 @@
 
 use crate::filter::path::{Path, Segment};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -93,11 +94,11 @@ impl Projection {
 /// Errors exactly when `serde_json::from_str::<Value>` would: a skipped subtree
 /// is walked and discarded via [`Skip`], which decodes string escapes rather
 /// than skipping past them structurally the way `IgnoredAny` does.
-pub(crate) fn project(
-    json: &str,
+pub(crate) fn project<'a>(
+    json: &'a str,
     projection: &Projection,
-) -> Result<Vec<Option<String>>, serde_json::Error> {
-    let mut out = vec![None; projection.len()];
+) -> Result<Vec<Option<Cow<'a, str>>>, serde_json::Error> {
+    let mut out: Vec<Option<Cow<'a, str>>> = vec![None; projection.len()];
     let mut de = serde_json::Deserializer::from_str(json);
     LevelSeed {
         node: &projection.root,
@@ -138,20 +139,26 @@ impl<'de, 'a> Visitor<'de> for KeyLookup<'a> {
 }
 
 /// Walks one JSON value against one trie node.
-struct LevelSeed<'a> {
+struct LevelSeed<'a, 'de> {
     node: &'a Node,
-    out: &'a mut Vec<Option<String>>,
+    out: &'a mut Vec<Option<Cow<'de, str>>>,
 }
 
-impl LevelSeed<'_> {
-    fn capture_terminals(&mut self, value: Option<String>) {
-        for &id in &self.node.terminals {
-            self.out[id] = value.clone();
+impl<'de> LevelSeed<'_, 'de> {
+    fn capture_terminals(&mut self, value: Option<Cow<'de, str>>) {
+        match self.node.terminals.split_first() {
+            None => {}
+            Some((&first, rest)) => {
+                for &id in rest {
+                    self.out[id] = value.clone();
+                }
+                self.out[first] = value;
+            }
         }
     }
 }
 
-impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a> {
+impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a, 'de> {
     type Value = ();
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
@@ -159,7 +166,7 @@ impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a> {
     }
 }
 
-impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
+impl<'de, 'a> Visitor<'de> for LevelSeed<'a, 'de> {
     type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -234,30 +241,35 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     }
 
     fn visit_str<E>(mut self, v: &str) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
+        Ok(())
+    }
+    /// The escape-free case: the scalar is a slice of the record itself.
+    fn visit_borrowed_str<E>(mut self, v: &'de str) -> Result<(), E> {
+        self.capture_terminals(Some(Cow::Borrowed(v)));
         Ok(())
     }
     fn visit_string<E>(mut self, v: String) -> Result<(), E> {
-        self.capture_terminals(Some(v));
+        self.capture_terminals(Some(Cow::Owned(v)));
         Ok(())
     }
     fn visit_bool<E>(mut self, v: bool) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Borrowed(if v { "true" } else { "false" })));
         Ok(())
     }
     fn visit_i64<E>(mut self, v: i64) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
         Ok(())
     }
     fn visit_u64<E>(mut self, v: u64) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
         Ok(())
     }
     fn visit_f64<E>(mut self, v: f64) -> Result<(), E> {
         // `f64::to_string()` disagrees with `Number`'s Display on float-lexed
         // literals (`1.0` -> "1"); go through `Number` to match `path::walk`.
         // `from_f64` is `None` only for NaN/infinity, which JSON cannot express.
-        self.capture_terminals(serde_json::Number::from_f64(v).map(|n| n.to_string()));
+        self.capture_terminals(serde_json::Number::from_f64(v).map(|n| Cow::Owned(n.to_string())));
         Ok(())
     }
     // `null` and a bare `visit_none` both yield nothing, as in `path::walk`:
@@ -412,8 +424,8 @@ mod tests {
             let projected = project(record, &proj).expect("must project");
             for (id, path) in p.iter().enumerate() {
                 assert_eq!(
-                    projected[id],
-                    first_value(&value, path),
+                    projected[id].as_deref(),
+                    first_value(&value, path).as_deref(),
                     "path {:?} diverged on record {record}",
                     specs[id]
                 );
@@ -503,8 +515,8 @@ mod tests {
             let value: Value = serde_json::from_str(record).expect("test record must parse");
             let projected = project(record, &proj).expect("must project");
             assert_eq!(
-                projected[0],
-                first_value(&value, &p[0]),
+                projected[0].as_deref(),
+                first_value(&value, &p[0]).as_deref(),
                 "numeric literal diverged on record {record}"
             );
         }
@@ -522,8 +534,8 @@ mod tests {
         let projected = project(json, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?} diverged",
                 specs[id]
             );
@@ -571,8 +583,8 @@ mod tests {
         let projected = project(json, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?} diverged",
                 p[id]
             );
@@ -647,8 +659,8 @@ mod tests {
         let projected = project(record, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?}",
                 specs[id]
             );
@@ -705,7 +717,8 @@ mod tests {
         assert_eq!(indexed, Some("a".to_string()));
         let projected = project(record, &proj).expect("must project");
         assert_eq!(
-            projected[0], indexed,
+            projected[0].as_deref(),
+            indexed.as_deref(),
             "fixed-index slot must agree with visit_values"
         );
 
@@ -750,8 +763,8 @@ mod tests {
             let projected = project(record, &proj).expect("must project");
             for (id, path) in p.iter().enumerate() {
                 assert_eq!(
-                    projected[id],
-                    first_value(&value, path),
+                    projected[id].as_deref(),
+                    first_value(&value, path).as_deref(),
                     "path {:?} diverged on record {record}",
                     specs[id]
                 );
