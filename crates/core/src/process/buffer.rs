@@ -129,8 +129,16 @@ pub fn buffer_run(
         return Ok((Outcome::NothingKept, tally));
     }
 
-    let body = format!("{{\"Records\":[{}]}}", survivors.join(","));
-    let gzipped = gzip_compress(body.as_bytes(), cfg.gzip_level)?;
+    let mut body = Vec::with_capacity(survivors.iter().map(|s| s.len() + 1).sum::<usize>() + 14);
+    body.extend_from_slice(b"{\"Records\":[");
+    for (i, s) in survivors.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(s.as_bytes());
+    }
+    body.extend_from_slice(b"]}");
+    let gzipped = gzip_compress(&body, cfg.gzip_level)?;
     Ok((Outcome::Written(Some(Bytes::from(gzipped))), tally))
 }
 
