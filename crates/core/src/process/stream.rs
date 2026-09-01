@@ -1139,4 +1139,59 @@ rules:
             "every record must have been kept by the no-op engine"
         );
     }
+
+    #[test]
+    fn gzencoder_flush_changes_output_bytes() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let body = b"{\"Records\":[{\"eventName\":\"A\"},{\"eventName\":\"B\"}]}";
+
+        let mut plain = GzEncoder::new(Vec::new(), Compression::new(6));
+        plain.write_all(body).expect("write");
+        let plain = plain.finish().expect("finish");
+
+        let mut flushed = GzEncoder::new(Vec::new(), Compression::new(6));
+        flushed.write_all(&body[..20]).expect("write");
+        flushed.flush().expect("flush");
+        flushed.write_all(&body[20..]).expect("write");
+        let flushed = flushed.finish().expect("finish");
+
+        assert_ne!(
+            plain, flushed,
+            "flush must remain observable: if these are equal, the no-flush \
+             invariant in this module's docs is no longer load-bearing and the \
+             buffer/stream byte-parity guarantee needs re-deriving"
+        );
+    }
+
+    #[test]
+    fn gzencoder_write_granularity_does_not_change_output_bytes() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut body: Vec<u8> = Vec::new();
+        for i in 0..8192u32 {
+            body.extend_from_slice(format!("{{\"n\":{i}}},").as_bytes());
+        }
+
+        for level in 0..=9u32 {
+            let mut one = GzEncoder::new(Vec::new(), Compression::new(level));
+            one.write_all(&body).expect("write");
+            let one = one.finish().expect("finish");
+
+            let mut many = GzEncoder::new(Vec::new(), Compression::new(level));
+            for chunk in body.chunks(97) {
+                many.write_all(chunk).expect("write");
+            }
+            let many = many.finish().expect("finish");
+
+            assert_eq!(
+                one, many,
+                "write granularity changed output at level {level}"
+            );
+        }
+    }
 }
