@@ -132,9 +132,10 @@ observability:
 
 #### Choosing a `gzip_level`
 
-Compression is roughly 77% of per-object CPU, so this setting is the largest
-single performance lever. Measured on a 4.5 MB / 4,000-record CloudTrail
-object with the `rust_backend` (miniz_oxide) compressor:
+Compression is the largest single stage of per-object CPU — 13.42 ms against
+5.97 ms for filtering — so this setting is the biggest lever available.
+Measured on a 4.5 MB / 4,000-record CloudTrail object with the `rust_backend`
+(miniz_oxide) compressor:
 
 | level           | time         | output size   | vs. default           |
 | --------------- | ------------ | ------------- | --------------------- |
