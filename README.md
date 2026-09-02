@@ -120,7 +120,9 @@ approximate and the absolute numbers as specific to this machine.
 
 **This measures the filter core only.** It excludes gzip decompression, S3 I/O, and
 Lambda cold start, which dominate wall-clock time in a real deployment. It is a
-guard against per-record regressions, not a prediction of end-to-end throughput.
+guard against per-record regressions, not a prediction of end-to-end throughput. For
+the per-object picture, including what gzip costs relative to filtering, see
+[what an object costs](docs/architecture.md#what-an-object-costs).
 
 </details>
 

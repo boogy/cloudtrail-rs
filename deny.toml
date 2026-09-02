@@ -42,10 +42,19 @@ wildcards = "deny"
 allow-wildcard-paths = true
 # Guard the hexagonal boundary at the dependency level: aws-lc-rs must never
 # reappear (we standardize on rustls + ring — see crates/aws/src/http_client.rs).
+# The zlib *-sys crates are banned for the same reason: a C toolchain in the
+# graph breaks the static-musl / ARM64 Lambda cross-build. zlib-rs is pure Rust
+# but banned too: these bans pin flate2 to one compressor, since a backend swap
+# silently changes output bytes and object size, which the parity oracle can't catch.
 deny = [
     { name = "aws-lc-rs" },
     { name = "aws-lc-sys" },
     { name = "openssl-sys" },
+    { name = "libz-sys" },
+    { name = "libz-ng-sys" },
+    { name = "zlib-ng-sys" },
+    { name = "cloudflare-zlib-sys" },
+    { name = "zlib-rs" },
 ]
 
 [sources]

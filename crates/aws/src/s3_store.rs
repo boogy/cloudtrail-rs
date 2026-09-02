@@ -20,13 +20,9 @@ use crate::http_client::ring_http_client;
 /// documented default. Override with `with_multipart_part_bytes`.
 pub const DEFAULT_MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 
-/// `T::try_from(v).unwrap_or(default)` — a value that doesn't fit `T` falls
-/// back rather than panics. Generic (rather than inlined as `usize::try_from`
-/// in `from_settings`) so its overflow branch is provable in a test: on every
-/// real (64-bit) Lambda target `usize` is exactly as wide as `u64`, so
-/// `u64::MAX` never actually overflows `usize` there — instantiating this
-/// with a narrower type in a test exercises the identical fallback logic
-/// `from_settings` runs in production.
+/// `T::try_from(v).unwrap_or(default)`. Generic rather than inlined in
+/// `from_settings` so the overflow branch is provable in a test: on a 64-bit
+/// target `u64::MAX` never overflows `usize`.
 fn checked_or_default<T: TryFrom<u64>>(v: u64, default: T) -> T {
     T::try_from(v).unwrap_or(default)
 }
@@ -46,19 +42,13 @@ impl S3ObjectStore {
     }
 
     /// The one constructor every composition root should use: builds the S3
-    /// client from `conf` (as `new` does) and carries `processing`'s
-    /// `multipart_part_bytes` through, so a value set in the operator's
-    /// settings actually reaches the store instead of silently falling back
-    /// to the default.
+    /// client from `conf` and carries `processing.multipart_part_bytes` through.
     ///
-    /// `processing.multipart_part_bytes` is a `u64` (it's deserialized
-    /// straight off the settings document); the store's `usize` can't
-    /// represent every `u64` on a 32-bit target. Rather than panic in a
-    /// `panic = "abort"` release profile — which would kill the Lambda at
-    /// cold start — a value that doesn't fit falls back to
+    /// That value is a `u64` and the store's `usize` cannot represent every
+    /// `u64` on a 32-bit target; under `panic = "abort"` a panic here kills the
+    /// Lambda at cold start, so a value that doesn't fit falls back to
     /// `DEFAULT_MULTIPART_PART_BYTES`. `Document::validate()` already rejects
-    /// anything below S3's 5 MiB minimum at config load, so this is not
-    /// re-validated here.
+    /// anything below S3's 5 MiB minimum.
     pub fn from_settings(conf: &SdkConfig, processing: &Processing) -> Self {
         let part_bytes = checked_or_default(
             processing.multipart_part_bytes,
@@ -81,11 +71,9 @@ impl S3ObjectStore {
         self
     }
 
-    /// The multipart part size this store uploads with. Public so
-    /// composition roots can prove `processing.multipart_part_bytes` actually
-    /// reached the store they built (see `crates/lambda-*/src/main.rs`'s
-    /// `build_store` tests), not just that it parsed out of the settings
-    /// document.
+    /// The multipart part size this store uploads with. Public so a composition
+    /// root can prove `processing.multipart_part_bytes` reached the store it
+    /// built, not just that it parsed.
     pub fn multipart_part_bytes(&self) -> usize {
         self.multipart_part_bytes
     }
@@ -94,10 +82,8 @@ impl S3ObjectStore {
     /// `ListObjectsV2` pagination to completion.
     ///
     /// Inherent rather than part of the `ObjectStore` port: only the CLI's
-    /// batch/backfill mode enumerates a bucket. The Lambda hot path is handed
-    /// exact keys by its event decoder and never lists, so keeping this off
-    /// the trait avoids burdening `InMemoryStore` and every future adapter
-    /// with a method they do not need.
+    /// batch mode enumerates a bucket, so `InMemoryStore` and every future
+    /// adapter are spared a method they do not need.
     pub async fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, StoreError> {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
@@ -361,13 +347,8 @@ mod tests {
         assert_eq!(checked_or_default::<u32>(42, 8), 42);
     }
 
-    /// `from_settings` calls exactly this generic function (with `T =
-    /// usize`) to convert `multipart_part_bytes`. `u64::MAX` never overflows
-    /// a real (64-bit) `usize`, so the fallback can't be forced through
-    /// `from_settings` itself on this target — instantiating with `u32`
-    /// forces the identical `T::try_from(v).unwrap_or(default)` logic down
-    /// its overflow branch instead, proving it falls back rather than
-    /// panics or truncates.
+    /// `from_settings` calls this with `T = usize`, where `u64::MAX` cannot
+    /// overflow on a 64-bit target; `u32` forces the identical fallback branch.
     #[test]
     fn checked_or_default_falls_back_when_the_value_overflows_the_target_type() {
         assert_eq!(checked_or_default::<u32>(u64::MAX, 8), 8);
@@ -482,8 +463,8 @@ mod tests {
         }
     }
 
-    /// Serves `first_chunk` once, then fails every subsequent read — models
-    /// task 13 cancelling an in-flight upload by failing the body reader.
+    /// Serves `first_chunk` once, then fails every subsequent read — the shape
+    /// that cancels an in-flight upload.
     struct FailingReader {
         first_chunk: Option<Vec<u8>>,
     }
@@ -625,8 +606,8 @@ mod tests {
             content_type: "application/x-gzip",
             content_encoding: "gzip",
         };
-        // First read serves a full part ("abcd"); the second read fails,
-        // simulating task 13 cancelling an in-flight upload.
+        // First read serves a full part; the second fails, cancelling the
+        // in-flight upload.
         let body = Box::new(FailingReader {
             first_chunk: Some(b"abcd".to_vec()),
         });

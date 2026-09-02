@@ -32,4 +32,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 cloudtrail-rs-testkit = { path = "../testkit" }
 tokio = { version = "1", features = ["macros", "rt"] }
 cloudtrail-rs-core = { path = "../core", features = ["decode-sqs", "testing"] }
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

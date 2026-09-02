@@ -9,10 +9,8 @@ pub enum DecodeError {
     InvalidPayload(String),
 }
 
-/// Failure performing an `ObjectStore` operation.
-///
-/// `NotFound` is a distinct variant (not folded into a generic error) because
-/// `on_missing_object` policy dispatches on it specifically.
+/// Failure performing an `ObjectStore` operation. `NotFound` is distinct
+/// because `on_missing_object` dispatches on it.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("object not found: {bucket}/{key}")]
@@ -31,12 +29,7 @@ pub enum ConfigError {
     Parse(String),
 }
 
-/// The pipeline/process error type: what `buffer_run`/`stream_run`/
-/// `Pipeline::handle` return on failure. Carries a `StoreError` and a
-/// `ConfigError` without losing the `NotFound` distinction (Task 14
-/// dispatches `on_missing_object` off `CoreError::Store(StoreError::NotFound
-/// { .. })`), plus the data-error cases (bad gzip, bad JSON, an
-/// object too large to buffer) that only arrive with the processors.
+/// What `buffer_run`/`stream_run`/`Pipeline::handle` return on failure.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error(transparent)]
@@ -52,15 +45,11 @@ pub enum CoreError {
          mode refuses to keep reading rather than risk OOM on an oversized or bomb-like object"
     )]
     ObjectTooLarge { limit: u64 },
-    /// Failure decoding the raw Lambda event payload itself (`Pipeline::handle`'s
-    /// first step) — distinct from a per-object data error, since it means no
-    /// `SourceItem`s could be extracted at all.
+    /// Failure decoding the raw event payload: no `SourceItem`s at all.
     #[error("failed to decode event payload: {0}")]
     Decode(#[from] DecodeError),
-    /// Safety invariant #1: the computed destination
-    /// `(bucket, key)` equals the source `(bucket, key)`. Refusing to write
-    /// here is what stops an infinite self-triggering loop that would
-    /// otherwise bill until someone notices.
+    /// Safety invariant #1: destination `(bucket, key)` equals the source's.
+    /// Refusing the write is what stops an infinite self-trigger loop.
     #[error(
         "destination ({dest_bucket}/{dest_key}) equals source: refusing to process to avoid an infinite self-triggering loop"
     )]
@@ -68,9 +57,8 @@ pub enum CoreError {
         dest_bucket: String,
         dest_key: String,
     },
-    /// `behavior.on_unrecognized_object == error`: the object parsed as JSON
-    /// but had no `Records` array, and the configured policy is to fail
-    /// rather than copy or skip it.
+    /// The object parsed as JSON but had no `Records` array, under
+    /// `behavior.on_unrecognized_object = error`.
     #[error("unrecognized object shape ({bucket}/{key}): on_unrecognized_object is 'error'")]
     UnrecognizedObject { bucket: String, key: String },
 }

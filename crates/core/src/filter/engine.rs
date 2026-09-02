@@ -1,16 +1,15 @@
-//! Rule evaluation: compiles a `RuleSet` into a set of regexes and evaluates
-//! records against it. AND within a rule, OR across rules.
+//! Rule evaluation: compiles a `RuleSet` into regexes and evaluates records
+//! against it. AND within a rule, OR across rules.
 //!
-//! `evaluate_linear` walks `rules` in order and, within a rule, `matches` in
-//! order, checking every rule — the correctness oracle, kept permanently so
-//! the indexed `evaluate` always has something to be checked against.
-//! `evaluate` narrows that same walk to the candidates a `RuleIndex` selects
-//! by `eventSource`/`eventName`. `evaluate_raw` is the entry point proper:
-//! it parses only the fields the ruleset references (or falls back to a full
-//! parse when a `[*]` wildcard is present) and calls `evaluate`.
+//! `evaluate_linear` checks every rule in order — the correctness oracle, kept
+//! permanently. `evaluate` narrows the same walk to the candidates a
+//! `RuleIndex` selects. `evaluate_raw` is the entry point proper: it parses
+//! only the fields the ruleset references (or falls back to a full parse when
+//! a `[*]` wildcard is present) and calls `evaluate`.
 
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
+use std::borrow::Cow;
 
 use crate::config::rules::{MatchOp, REGEX_SIZE_LIMIT, RuleSet};
 use crate::error::ConfigError;
@@ -24,9 +23,8 @@ use crate::filter::resolve;
 pub enum Decision {
     /// No rule matched: forward the record.
     Keep,
-    /// The rule at `rule_idx` matched (all its `matches` matched): drop the
-    /// record. `rule_idx` indexes into the `RuleSet` the engine was built
-    /// from, and is stable input to `Engine::rule_name`.
+    /// The rule at `rule_idx` matched: drop the record. `rule_idx` indexes
+    /// into the `RuleSet` the engine was built from.
     Drop { rule_idx: usize },
 }
 
@@ -59,11 +57,9 @@ struct CompiledRule {
     matches: Vec<CompiledMatch>,
 }
 
-/// Compiled, ready-to-evaluate exclusion rules.
-///
-/// Built once, at config load (`Engine::new`), from a validated `RuleSet`.
-/// The per-record hot path (`evaluate_linear`) does no compilation, no
-/// allocation beyond what `resolve` already returns.
+/// Compiled, ready-to-evaluate exclusion rules, built once at config load.
+/// The per-record hot path compiles nothing and allocates nothing beyond what
+/// `resolve` returns.
 pub struct Engine {
     rules: Vec<CompiledRule>,
     index: RuleIndex,
@@ -75,12 +71,9 @@ pub struct Engine {
     event_name_slot: usize,
 }
 
-/// Cheap selectivity ordinal used to order a rule's conditions
-/// most-selective-first: an exact literal anchored on both ends
-/// (`^kms\.amazonaws\.com$`) is checked before a `.*`-prefixed pattern, which
-/// can only reject after scanning past the wildcard. AND is order-independent
-/// for correctness — this only changes which field gets resolved and matched
-/// first when a rule ultimately fails.
+/// Cheap selectivity ordinal ordering a rule's conditions most-selective-first:
+/// a both-ends-anchored literal before a `.*`-prefixed pattern. AND is
+/// order-independent, so this only changes which field is resolved first.
 fn selectivity_rank(pattern: &str) -> u8 {
     if pattern.starts_with(".*") || pattern.starts_with("^.*") {
         1
@@ -114,16 +107,13 @@ fn index_literals(matches: &[CompiledMatch], field: &str) -> Option<Vec<String>>
 }
 
 impl Engine {
-    /// Compile every rule's regexes. Fatal (returns `Err`) if any pattern
-    /// fails to compile within `REGEX_SIZE_LIMIT` — the same limit
-    /// `RuleSet::parse` validates against, reused here (not redefined) so a
-    /// ruleset that passes validation cannot then fail to build.
+    /// Compile every rule's regexes. Fatal if a pattern exceeds
+    /// `REGEX_SIZE_LIMIT` — the same limit `RuleSet::parse` validates against,
+    /// so a ruleset that passes validation cannot then fail to build.
     pub fn new(rules: RuleSet) -> Result<Engine, ConfigError> {
-        // `RuleSet::parse` already validated `version`, so this cannot fail.
-        // v1's `field_name` must lower to literal key segments, never parsed
-        // subscripts: before v2, `resolve` did literal object-key lookup
-        // only, and a deployed v1 ruleset must keep evaluating exactly as it
-        // did then (`path::literal_path`'s doc comment).
+        // `RuleSet::parse` already validated `version`. v1's `field_name` must
+        // lower to literal key segments, never parsed subscripts: a deployed v1
+        // ruleset must keep evaluating exactly as it did before v2.
         let major = semver::Version::parse(&rules.version)
             .expect("RuleSet::parse already validated version")
             .major;
@@ -147,9 +137,8 @@ impl Engine {
                     MatchOp::AnyOf(v) => Op::AnyOf(v.into_iter().collect()),
                     MatchOp::Absent(b) => Op::Absent(b),
                 };
-                // v1 paths are literal dotted keys only (`path::resolve`'s
-                // documented limitation) and never fail to build; v2 adds
-                // subscript syntax, so it goes through the fallible parser.
+                // v1 paths are literal dotted keys only and never fail to
+                // build; v2's subscript syntax needs the fallible parser.
                 let path = if major == 1 {
                     literal_path(&m.field)
                 } else {
@@ -180,15 +169,10 @@ impl Engine {
         }
 
         // One projection over every *distinct* path the ruleset names.
-        // `path_id` on each compiled match indexes into the projected slot
-        // vector.
-        //
-        // Interning matters: real rulesets name the same field over and over
-        // (the shipped example has 81 match paths but only 16 distinct ones —
-        // `eventName` alone appears 25 times). The projection trie already
-        // merges those structurally, but a per-occurrence slot would make
+        // Interning matters: the shipped example has 81 match paths but 16
+        // distinct ones, and a per-occurrence slot would make
         // `capture_terminals` clone the captured `String` once per occurrence
-        // on every record. Deduplicating here is worth ~40% of `evaluate_raw`.
+        // per record — worth ~40% of `evaluate_raw`.
         let mut paths: Vec<Path> = Vec::new();
         let intern = |paths: &mut Vec<Path>, path: &Path| -> usize {
             match paths.iter().position(|seen| seen == path) {
@@ -204,10 +188,8 @@ impl Engine {
                 m.path_id = intern(&mut paths, &m.path);
             }
         }
-        // Dedicated slots for the index keys, so `evaluate_raw` can select
-        // candidates without a second pass over the record. These intern
-        // against the rule paths too — `eventSource` and `eventName` are
-        // almost always already present.
+        // Dedicated slots for the index keys, so `evaluate_raw` selects
+        // candidates without a second pass. They intern against the rule paths.
         let event_source_slot = intern(
             &mut paths,
             &parse_path("eventSource").expect("literal path is valid"),
@@ -241,10 +223,9 @@ impl Engine {
         &self.rules[rule_idx].name
     }
 
-    /// Indices of rules the rule index could not conservatively narrow on
-    /// either `eventSource` or `eventName` — these are checked against every
-    /// record. Exposed so the CLI can warn, by name, about each one: this is
-    /// the user's lever to get the indexed evaluator's speedup.
+    /// Indices of rules the index could not narrow on `eventSource` or
+    /// `eventName` — checked against every record. Exposed so the CLI can warn
+    /// about each one by name.
     pub fn always_rules(&self) -> &[usize] {
         self.index.always()
     }
@@ -288,11 +269,9 @@ impl Engine {
         Decision::Keep
     }
 
-    /// Evaluate `record` against only the candidate rules the rule index
-    /// selects for its `eventSource` and `eventName`, still in ascending
-    /// `rule_idx` order so first-match-wins agrees with `evaluate_linear`.
-    /// Semantics are identical to `evaluate_linear`; see the equivalence test
-    /// below.
+    /// Evaluate `record` against only the candidate rules the index selects,
+    /// still in ascending `rule_idx` order so first-match-wins agrees with
+    /// `evaluate_linear`.
     pub fn evaluate(&self, record: &Value) -> Decision {
         let event_source = resolve(record, "eventSource");
         let event_name = resolve(record, "eventName");
@@ -308,8 +287,8 @@ impl Engine {
     }
 
     /// Whether one condition holds against an already-projected record.
-    fn match_fires_projected(m: &CompiledMatch, slots: &[Option<String>]) -> bool {
-        let value = slots[m.path_id].as_deref();
+    fn match_fires_projected(m: &CompiledMatch, slots: &[Option<Cow<'_, str>>]) -> bool {
+        let value: Option<&str> = slots[m.path_id].as_deref();
         let holds = match &m.op {
             Op::Regex(re) => value.is_some_and(|v| re.is_match(v)),
             Op::Equals(want) => value == Some(want.as_str()),
@@ -320,10 +299,8 @@ impl Engine {
     }
 
     /// Evaluate a record from its raw JSON bytes, parsing only the fields the
-    /// ruleset references.
-    ///
-    /// Returns `Err` exactly when `serde_json::from_str::<Value>` would, so
-    /// the caller's "unparseable record is KEPT" handling is unchanged.
+    /// ruleset references. Returns `Err` exactly when
+    /// `serde_json::from_str::<Value>` would.
     ///
     /// Falls back to a full parse when any rule uses a `[*]` path: projection
     /// captures only the first element that yields a scalar, which is not the
@@ -430,15 +407,11 @@ mod tests {
             .map(|&i| engine.rule_name(i))
             .collect();
         always_names.sort_unstable();
-        // "AWS Config Recorder": eventSource `.*\.amazonaws\.com$` is not
-        // anchored at the start, and its eventName `^(Describe|List|Get).*$`
-        // has an unreducible trailing `.*`. "Automated Tool Describe
-        // Operations" has no eventSource condition and its eventName
-        // `^Describe.*$` is likewise unreducible. Every other rule reduces to
-        // literals on eventSource, eventName, or both, and lands in one of
-        // the literal indexes instead -- including "IAM Session Renewals",
-        // whose eventName is the exact literal "AssumeRole" even though it
-        // has no eventSource condition.
+        // Only these two are unreducible: "AWS Config Recorder" (eventSource
+        // unanchored at the start, eventName with a trailing `.*`) and
+        // "Automated Tool Describe Operations" (no eventSource condition, and
+        // `^Describe.*$`). Every other rule reduces to literals on one axis or
+        // both.
         assert_eq!(
             always_names,
             vec!["AWS Config Recorder", "Automated Tool Describe Operations"]
@@ -501,10 +474,8 @@ rules:
         assert_eq!(engine.always_rules(), &[0]);
     }
 
-    /// Deterministic, realistic corpus of CloudTrail-shaped records, varying
-    /// `eventSource`, `eventName`, `sourceIPAddress`, `userIdentity`,
-    /// `userAgent`, `requestParameters` and `errorCode` enough to exercise
-    /// both drops and keeps across all 25 example rules.
+    /// Deterministic corpus of CloudTrail-shaped records, varied enough to
+    /// exercise both drops and keeps across all 25 example rules.
     fn corpus() -> Vec<Value> {
         let event_sources: [Option<&str>; 8] = [
             Some("kms.amazonaws.com"),
@@ -655,9 +626,8 @@ rules:
         records
     }
 
-    /// Spec finding F1: the shipped v1 rule "Automated Tool Describe
-    /// Operations" does the exact opposite of its name, because `errorCode`
-    /// being absent is inexpressible in v1.
+    /// The shipped v1 rule does the opposite of its name: `errorCode` being
+    /// absent is inexpressible in v1.
     #[test]
     fn absent_operator_separates_noise_from_signal() {
         let yaml = br#"
@@ -776,10 +746,6 @@ rules:
         );
     }
 
-    /// v1 `field_name` must lower to a literal dotted key path, never a
-    /// parsed subscript: `path::resolve`'s documented v1 limitation. Before
-    /// this branch, `"requestParameters.tag[0]"` could only ever match a
-    /// record with a literal `"tag[0]"` key, never index into an array.
     #[test]
     fn v1_field_name_is_a_literal_key_never_a_parsed_subscript() {
         let yaml = br#"
@@ -830,10 +796,6 @@ rules:
         );
     }
 
-    /// This closes finding T05 as a side effect: a v1 `field_name` that
-    /// `parse_path` would reject is no longer a fatal config error, because
-    /// `literal_path` has no syntax to reject — it just becomes a key that
-    /// never matches, the pre-v2 behaviour.
     #[test]
     fn v1_ruleset_with_a_malformed_field_name_builds_and_never_matches() {
         for bad in ["a[", "a..b", ".a", ""] {

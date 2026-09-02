@@ -49,7 +49,7 @@ impl EventDecoder for SnsEventDecoder {
 
         let mut items = Vec::new();
         for record in notification.records {
-            let objects = parse_s3_notification(record.sns.message.as_bytes())?;
+            let (objects, _) = parse_s3_notification(record.sns.message.as_bytes())?;
             items.extend(as_source_item(objects));
         }
         Ok(items)
@@ -78,9 +78,6 @@ mod tests {
         assert_eq!(items[0].objects[0].size, Some(1305107));
     }
 
-    /// SNS fan-out can deliver several notifications in one event, and a
-    /// single notification can name several objects. Both dimensions must
-    /// survive: one item per SNS record, every object within each.
     #[test]
     fn every_sns_record_becomes_its_own_item_with_all_its_objects() {
         let notification = |keys: &[&str]| {

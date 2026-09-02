@@ -1,11 +1,8 @@
-//! Buffer-mode processing: decompress the whole object into
-//! memory, filter record-by-record, and gzip the survivors back out as one
-//! buffer.
+//! Buffer-mode processing: decompress the whole object into memory, filter
+//! record-by-record, and gzip the survivors back out as one buffer.
 //!
-//! "Zero re-serialization" (performance design #1): the
-//! `Records` array is parsed straight into `Vec<&RawValue>`, so a surviving
-//! record's **original byte slice** is what gets written out — no
-//! `serde_json::Value` is ever re-serialized.
+//! Zero re-serialization: `Records` is parsed into `Vec<&RawValue>`, so a
+//! surviving record's original byte slice is what gets written out.
 
 use std::io::{Read, Write};
 
@@ -32,15 +29,13 @@ pub enum Outcome {
     /// nothing — "zero empty writes".
     NothingKept,
     /// Parsed as JSON but has no `Records` array: the caller applies its
-    /// `on_unrecognized_object` policy. Never DLQ'd on an unanticipated
-    /// shape.
+    /// `on_unrecognized_object` policy. Never DLQ'd on an unanticipated shape.
     Unrecognized,
 }
 
-/// The envelope shape read straight out of the decompressed bytes. Each
-/// `Records` element is captured as an unparsed JSON span (`&RawValue`)
-/// rather than deserialized into a `Value`, so it can be written back out
-/// byte-for-byte if it survives filtering.
+/// The envelope read straight out of the decompressed bytes. Each `Records`
+/// element is captured as an unparsed span (`&RawValue`) so a survivor can be
+/// written back out byte-for-byte.
 #[derive(serde::Deserialize)]
 struct Envelope<'a> {
     #[serde(rename = "Records", borrow)]
@@ -48,12 +43,9 @@ struct Envelope<'a> {
 }
 
 /// Decompress `input` with `MultiGzDecoder` (never `GzDecoder`: concatenated
-/// gzip members are otherwise silently truncated at the first member), never
-/// buffering more than `max_object_bytes.saturating_add(1)` bytes so an
-/// oversized or bomb-like object fails fast with `Err` instead of exhausting
-/// memory. Saturating (not wrapping) matters at `max_object_bytes ==
-/// u64::MAX`: that's an operator's "no cap", and it must read everything —
-/// `+ 1` would wrap to 0 and turn "no cap" into "read nothing".
+/// members would be silently truncated at the first), buffering at most
+/// `max_object_bytes.saturating_add(1)` bytes. Saturating, not wrapping: at
+/// `u64::MAX` — an operator's "no cap" — `+ 1` would `take(0)`.
 fn decompress_capped(input: &[u8], max_object_bytes: u64) -> Result<Vec<u8>, CoreError> {
     let decoder = MultiGzDecoder::new(input);
     let mut limited = decoder.take(max_object_bytes.saturating_add(1));
@@ -78,20 +70,13 @@ fn gzip_compress(body: &[u8], level: u32) -> Result<Vec<u8>, CoreError> {
     encoder.finish().map_err(|e| CoreError::Gzip(e.to_string()))
 }
 
-/// Buffer-mode entry point: `MultiGzDecoder` → `Vec<&RawValue>` → peek
-/// `eventSource` (via `Engine::evaluate`) → write surviving raw slices →
-/// gzip out as `Outcome::Written(Some(bytes))`.
+/// Buffer-mode entry point: `MultiGzDecoder` → `Vec<&RawValue>` → evaluate →
+/// write surviving raw slices → gzip out as `Outcome::Written(Some(bytes))`.
+/// `max_object_bytes` bounds the decompressed size; exceeding it is an `Err`.
 ///
-/// `max_object_bytes` (buffer mode only) bounds the decompressed
-/// size; exceeding it is an `Err`, not an out-of-memory buffer growth.
-///
-/// Publishes **no** metrics. The per-record counters come back in the
-/// [`RecordTally`], which the caller commits only once it has decided the
-/// object's fate — for buffer mode, once the `put` of the returned bytes has
-/// returned. Reporting them from in here billed records as kept to an object
-/// whose write then failed, leaving nothing at the destination and a
-/// redelivery that counts them all over again. Stream mode defers the same
-/// counters the same way; see [`crate::process::tally`].
+/// Publishes **no** metrics: the per-record counters come back in the
+/// [`RecordTally`], which the caller commits only once the `put` has returned
+/// and the object's fate is decided. See [`crate::process::tally`].
 pub fn buffer_run(
     input: &[u8],
     engine: &Engine,
@@ -104,11 +89,9 @@ pub fn buffer_run(
     let records = match serde_json::from_slice::<Envelope>(&decompressed) {
         Ok(envelope) => envelope.records,
         Err(_) => {
-            // Distinguish "not valid JSON at all" (a data error: `Err`, the
-            // Lambda retries via DLQ) from "valid JSON, just not the
-            // `{"Records": [...]}` envelope" (`Unrecognized`: the caller's
-            // `on_unrecognized_object` policy applies — never DLQ on an
-            // unanticipated shape).
+            // Distinguish "not valid JSON at all" (an `Err`, retried via DLQ)
+            // from "valid JSON, just not the envelope" (`Unrecognized`, where
+            // the caller's policy applies).
             return match serde_json::from_slice::<Value>(&decompressed) {
                 // An empty tally, not the records seen so far: there were
                 // none, and stream mode reports 0/0/0 for these same bytes.
@@ -131,12 +114,9 @@ pub fn buffer_run(
                 tally.drop_by_rule(rule_idx);
             }
             Err(_) => {
-                // Unparseable individual record: never dropped, only
-                // counted ("Unparseable individual record ⇒
-                // KEPT, never dropped"). Reachable even though the raw span
-                // was itself syntactically well-formed enough to capture —
-                // e.g. a lone UTF-16 surrogate escape parses as a span but
-                // fails full decode.
+                // Unparseable individual record: kept, only counted. Reachable
+                // even for a well-formed raw span — a lone UTF-16 surrogate
+                // escape captures as a span but fails full decode.
                 tally.parse_error();
                 tally.keep();
                 survivors.push(text);
@@ -149,8 +129,16 @@ pub fn buffer_run(
         return Ok((Outcome::NothingKept, tally));
     }
 
-    let body = format!("{{\"Records\":[{}]}}", survivors.join(","));
-    let gzipped = gzip_compress(body.as_bytes(), cfg.gzip_level)?;
+    let mut body = Vec::with_capacity(survivors.iter().map(|s| s.len() + 1).sum::<usize>() + 14);
+    body.extend_from_slice(b"{\"Records\":[");
+    for (i, s) in survivors.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(s.as_bytes());
+    }
+    body.extend_from_slice(b"]}");
+    let gzipped = gzip_compress(&body, cfg.gzip_level)?;
     Ok((Outcome::Written(Some(Bytes::from(gzipped))), tally))
 }
 
@@ -267,10 +255,8 @@ rules:
         );
     }
 
-    /// `max_object_bytes = u64::MAX` is an operator's "no cap". Before the
-    /// `saturating_add` fix, `decompress_capped` computed `max_object_bytes +
-    /// 1`, which wraps to 0 at `u64::MAX`, making `.take(0)` read nothing and
-    /// turning "no cap" into "every object fails to decompress".
+    /// Falsifiable: a plain `max_object_bytes + 1` wraps to 0 at `u64::MAX`,
+    /// making `.take(0)` read nothing and every object fail to decompress.
     #[test]
     fn max_object_bytes_at_u64_max_reads_the_full_body_not_zero() {
         let body = br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#;
@@ -342,11 +328,8 @@ rules:
 
     #[test]
     fn unparseable_individual_record_is_kept_and_counted() {
-        // A lone (unpaired) UTF-16 high-surrogate escape is syntactically
-        // well-formed enough for the raw-value scan to capture a span for
-        // it, but fails when that span is later parsed into a real `Value`
-        // — exactly the "unparseable individual record" case guards
-        // against.
+        // A lone UTF-16 high-surrogate escape captures as a raw span but fails
+        // when that span is parsed into a `Value`.
         let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"broken":"\uD800"}]}"#;
         let input = gzip_bytes(body);
         let metrics = Metrics::default();
@@ -377,10 +360,8 @@ rules:
         let mut input = gzip_bytes(first_half);
         input.extend(gzip_bytes(second_half));
 
-        // Sanity check on the test fixture itself: a single-member decoder
-        // must NOT reproduce the full body — this is exactly the silent
-        // truncation `MultiGzDecoder` exists to avoid, and why this test
-        // fails with `GzDecoder` and passes with `MultiGzDecoder`.
+        // Fixture check: a single-member decoder must NOT reproduce the full
+        // body — the silent truncation `MultiGzDecoder` exists to avoid.
         let mut single_member = flate2::read::GzDecoder::new(input.as_slice());
         let mut truncated = Vec::new();
         single_member

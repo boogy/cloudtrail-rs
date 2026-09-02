@@ -1,10 +1,8 @@
-//! Parsing and structural validation for the exclusion rules YAML document
-//! (fetched from `rules.uri`).
+//! Parsing and structural validation for the exclusion rules YAML document.
 //!
-//! This module parses and validates *shape* only. Regex *compilability* is
-//! checked here (a throwaway `Regex` build per `match`), but no compiled
-//! `Regex` or rule index is produced or stored — that is `Engine::new`
-//! (tasks 05/06).
+//! Shape only. Regex compilability is checked here with a throwaway `Regex`
+//! build, but no compiled `Regex` or rule index is produced — that is
+//! `Engine::new`.
 
 use std::collections::HashSet;
 
@@ -12,16 +10,11 @@ use regex::RegexBuilder;
 
 use crate::error::ConfigError;
 
-/// Compiled-size ceiling for a single rule pattern, 1 MiB — well below the
-/// `regex` crate's own default (10 MiB), so a pathological pattern is
-/// rejected at config load rather than left to blow up memory on the first
-/// match.
-///
-/// `RuleSet::parse` uses this to reject a pattern that cannot be compiled
-/// within budget. `Engine::new` performs the *real* compile later and MUST
-/// use this same constant — a smaller limit there would let a ruleset pass
-/// validation and then fail to build, which at runtime means falling back to
-/// `on_config_error`.
+/// Compiled-size ceiling for a single rule pattern, well below the `regex`
+/// crate's own 10 MiB default, so a pathological pattern is rejected at config
+/// load. `Engine::new` performs the real compile later and MUST use this same
+/// constant — a smaller limit there would let a ruleset pass validation and
+/// then fail to build, falling back to `on_config_error` at runtime.
 pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// One exclusion rule: fires (drops the record) only if *all* of its
@@ -221,11 +214,9 @@ impl RuleSet {
         Ok(parsed)
     }
 
-    /// `major` is the already-validated `version`'s major component: v1
-    /// `field_name` lowers to a literal dotted key path at `Engine::new`
-    /// (`filter::path::literal_path`), which has no syntax to reject, so a
-    /// malformed v1 path must not be fatal here — only v2's `field`, which
-    /// adds subscript syntax `parse_path` can fail on, is checked.
+    /// `major` is the already-validated version's major component. A malformed
+    /// v1 path is not fatal — it lowers to a literal dotted key with no syntax
+    /// to reject — so only v2's `field`, which adds subscripts, is checked.
     fn validate(&self, major: u64) -> Result<(), ConfigError> {
         let mut names = HashSet::with_capacity(self.rules.len());
         for rule in &self.rules {
@@ -270,19 +261,17 @@ impl RuleSet {
         Ok(())
     }
 
-    /// Describe the rule's `eventSource` and/or `eventName` conditions for
-    /// diagnostics, or `None` if it has neither. The CLI's `validate` uses
-    /// this so it never has to reach into `Match` internals, which differ
-    /// between schema versions.
+    /// Describe the rule's `eventSource`/`eventName` conditions for
+    /// diagnostics, or `None` if it has neither. Lets the CLI's `validate` stay
+    /// out of `Match` internals, which differ between schema versions.
     pub fn index_key_description(&self, rule_idx: usize) -> Option<String> {
         let matches = &self.rules.get(rule_idx)?.matches;
         let parts: Vec<String> = ["eventSource", "eventName"]
             .into_iter()
             .filter_map(|field| {
                 let m = matches.iter().find(|m| !m.negate && m.field == field)?;
-                // Quoted via Display, never Debug: the pattern must appear
-                // verbatim so a user can find it in their YAML, and Debug
-                // would double every backslash in a regex.
+                // Display, never Debug: the pattern must appear verbatim so a
+                // user can find it in their YAML.
                 let described = match &m.op {
                     MatchOp::Regex(p) => format!("regex \"{p}\""),
                     MatchOp::Equals(s) => format!("equals \"{s}\""),
@@ -312,9 +301,8 @@ impl RuleSet {
 mod tests {
     use super::*;
 
-    /// The user's real 25-rule example, committed verbatim to both
-    /// `examples/rules.example.yaml` and this crate's fixtures (they must
-    /// stay identical — Task 17's CLI tests read the `examples/` copy).
+    /// Committed verbatim to both `examples/rules.example.yaml` and this
+    /// crate's fixtures; the two must stay identical.
     const EXAMPLE_RULES: &[u8] = include_bytes!("../../tests/fixtures/rules.example.yaml");
 
     #[test]
@@ -360,8 +348,7 @@ mod tests {
     #[test]
     fn meta_free_form_date_field_does_not_break_parsing() {
         // `created_at: 2024-01-01` resolves to a YAML date, not a string —
-        // this is exactly why `meta` is `Option<serde_yaml_ng::Mapping>` and
-        // not a typed `HashMap<String, String>`.
+        // why `meta` is a `Mapping` and not a typed `HashMap<String, String>`.
         let rule_set = RuleSet::parse(EXAMPLE_RULES).expect("example ruleset must parse");
         let meta = rule_set.meta.expect("example ruleset has meta");
         assert!(meta.contains_key("created_at"));
@@ -614,10 +601,8 @@ rules:
         regex: "^Describe"
 "#;
         let rs = RuleSet::parse(v1).expect("must parse");
-        // Display, not Debug: `crates/cli/tests/cli.rs`'s
-        // `validate_example_ruleset_exits_zero_and_warns_about_always_rules`
-        // asserts the raw pattern text appears in the warning, and Debug
-        // would escape the backslashes into `\\.` and break it.
+        // Display, not Debug: the CLI test asserts the raw pattern text appears
+        // in the warning, and Debug would escape the backslashes.
         assert_eq!(
             rs.index_key_description(0).as_deref(),
             Some(r#"eventSource regex "^kms\.amazonaws\.com$""#)

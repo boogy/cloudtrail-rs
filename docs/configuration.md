@@ -130,6 +130,34 @@ observability:
 > an SNS envelope. Confirm subscriptions out of band, and expect DLQ traffic on
 > a queue that receives them.
 
+#### Choosing a `gzip_level`
+
+Compression is the largest single stage of per-object CPU — 13.42 ms against
+5.97 ms for filtering — so this setting is the biggest lever available.
+Measured on a 4.5 MB / 4,000-record CloudTrail object with the `rust_backend`
+(miniz_oxide) compressor:
+
+| level           | time         | output size   | vs. default           |
+| --------------- | ------------ | ------------- | --------------------- |
+| 1               | 7.09 ms      | 745,560 B     | −47% time, +276% size |
+| 2               | 7.32 ms      | 346,027 B     | −45% time, +75% size  |
+| 3               | 9.17 ms      | 224,915 B     | −32% time, +14% size  |
+| 4               | 8.63 ms      | 232,167 B     | −36% time, +17% size  |
+| **6 (default)** | **13.42 ms** | **198,063 B** | —                     |
+| 9               | 17.78 ms     | 189,557 B     | +33% time, −4% size   |
+
+This measures filter-core CPU only and excludes S3 network I/O, which likely
+dominates real wall-clock time, so the time column is an upper bound on what
+lowering the level saves end-to-end. The default of 6 optimises for storage,
+on the assumption that S3 storage and downstream read costs recur while
+compression CPU is paid once. Lower it to 4 only if Lambda duration is the
+binding cost; level 9 is not worth it.
+
+**miniz_oxide is not monotonic in level.** Level 3 produces _smaller and
+slower_ output than level 4 — neither dominates the other. Do not assume a
+lower level is always faster and larger; re-measure on your own data before
+tuning.
+
 ## Validation constraints
 
 `panic = "abort"` is set in the release profile, so a bad config value that

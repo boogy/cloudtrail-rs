@@ -196,6 +196,36 @@ flowchart TD
 - **stream** — constant memory; writes the destination with S3 multipart uploads
   of `CT_MULTIPART_PART_BYTES` (8 MiB default) each.
 
+### What an object costs
+
+One 4.5 MB / 4,000-record object, `rust_backend` (miniz_oxide) at level 6,
+`--release`:
+
+| Stage                      | Time         |
+| -------------------------- | ------------ |
+| gzip compress (whole body) | 13.42 ms     |
+| `evaluate_raw` (filtering) | 5.97 ms      |
+| gzip decompress            | 2.46 ms      |
+| e2e `buffer_run`           | **17.36 ms** |
+
+**Compression, not filtering, is the dominant stage** — it costs more than twice
+what evaluating all 4,000 records against the ruleset does. Any optimisation that
+does not touch compression is bounded by what is left.
+
+The rows were measured independently and deliberately carry no percentage column:
+they do not sum to the e2e figure, because the compress row compresses the whole
+body while the pipeline compresses only the survivors. Read them as relative
+stage costs, not as a decomposition of the 17.36 ms.
+
+Peak memory in buffer mode is about two object-sized buffers — the decompressed
+object stays resident for the whole of `buffer_run` (survivors borrow from it),
+plus the one assembled body. At the `max_object_bytes` default that is ≈256 MB.
+
+These figures come from a 4,000-record object with realistic entropy that is
+**not checked into the repo**, so unlike the [README's per-record
+benchmarks](../README.md#performance) they are not reproducible with a repo
+command. Treat them as one machine's stage profile, not as a specification.
+
 ### Parity is an invariant, not a coincidence
 
 The mode an object takes is decided by its **size**, which has nothing to do

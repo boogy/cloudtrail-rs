@@ -1,13 +1,9 @@
 //! `ConfigStore<T>`: caches a compiled config artifact behind a TTL,
-//! re-validating cheaply (`ConfigSource::version`) instead of always
-//! re-fetching and re-compiling the full document.
+//! re-validating cheaply (`ConfigSource::version`) instead of re-fetching and
+//! re-compiling the whole document.
 //!
-//! Generic over the compiled artifact `T` and an injected `compile` fn —
-//! deliberately not hardcoded to `Engine`/`RuleSet`. That keeps this task
-//! decoupled from the rules engine, lets its own tests use `T = String` with
-//! a call-counting compile closure and no ruleset at all, and makes
-//! "compiled exactly once" directly countable, which is what a later
-//! init-once test needs.
+//! Generic over `T` and an injected `compile` fn, so this module never names
+//! `RuleSet`/`Engine` and its own tests can count compiles with `T = String`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,8 +14,7 @@ use crate::model::VersionTag;
 use crate::ports::ConfigSource;
 
 /// A compile step from raw document bytes to the artifact a `ConfigStore`
-/// caches. Injected rather than hardcoded so this module never names
-/// `RuleSet`/`Engine`.
+/// caches. Injected so this module never names `RuleSet`/`Engine`.
 pub type Compile<T> = Arc<dyn Fn(&[u8]) -> Result<T, ConfigError> + Send + Sync>;
 
 struct Cached<T> {
@@ -67,11 +62,9 @@ impl<T: Clone + Send + Sync> ConfigStore<T> {
         }
     }
 
-    /// Init-phase warm-up: an unconditional fetch + compile. Never errors,
-    /// never panics — a failure here (a transient source blip at container
-    /// start) increments `ConfigLoadErrors` and leaves the store empty so
-    /// the first real invocation's `get()` retries it. On success, seeds the
-    /// TTL clock so that first `get()` makes no further source calls.
+    /// Init-phase warm-up: an unconditional fetch + compile. Never errors — a
+    /// failure counts `ConfigLoadErrors` and leaves the store empty for the
+    /// first `get()` to retry. On success it seeds the TTL clock.
     pub async fn prime(&self) {
         let now = Instant::now();
         match self.fetch_and_compile().await {

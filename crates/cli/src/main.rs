@@ -1,31 +1,10 @@
-//! `cloudtrail-rs` — local/offline CLI companion to the Lambda binaries
-//! (task 17).
+//! `cloudtrail-rs` — local/offline CLI companion to the Lambda binaries.
 //!
-//! Depends on `cloudtrail-rs-core` **and** `cloudtrail-rs-aws` so a rules
-//! `uri` may be `ssm://`, `s3://`, `file://`, or a bare local path.
-//!
-//! Four subcommands, all reusing `core`'s existing engine/process/config
-//! logic — nothing here reimplements filtering or validation:
-//! - `validate <uri>`: builds the `Engine`, prints rule/pattern counts, and
-//!   warns (non-fatally) about every rule `Engine::always_rules()` could not
-//!   index. Non-zero exit on a config/build error; `--max-unindexed` adds an
-//!   opt-in CI gate on top of that.
-//! - `test <rules> <sample.json.gz>`: per-record KEEP/DROP against the
-//!   compiled ruleset, plus a summary, so dead rules are visible.
-//! - `filter <source> <dest> --rules <uri> [--settings <path>]`:
-//!   local/backfill filtering, via `core::process::{buffer_run, stream_run}`
-//!   directly. Each of `source` and `dest` is auto-detected as a local path
-//!   or an `s3://bucket/prefix` URI; a local directory or an `s3://` prefix
-//!   triggers batch mode (every in-scope object filtered into a mirrored
-//!   destination), so filtering is visible on the local filesystem and the
-//!   same command works against S3 when AWS credentials are present.
-//!   `--settings` makes a backfill use the *deployment's* own
-//!   `processing.*`/`source.*`/`behavior.*` values instead of built-in
-//!   defaults — see [`FilterConfig`].
-//! - `validate-settings [path]`: runs a settings document through the exact
-//!   `Settings::from_parts` validation the Lambda binaries run at cold
-//!   start, so a bad value that would otherwise panic mid-invocation is
-//!   caught pre-deploy. Honours `CT_*` env overrides same as production.
+//! Depends on `cloudtrail-rs-core` **and** `cloudtrail-rs-aws` so a rules `uri`
+//! may be `ssm://`, `s3://`, `file://`, or a bare local path. Four subcommands,
+//! all reusing `core`'s engine/process/config logic — nothing here reimplements
+//! filtering or validation: `validate`, `test`, `filter`, `validate-settings`.
+//! See `docs/cli.md`.
 #![forbid(unsafe_code)]
 
 use std::io::Read;
@@ -90,19 +69,16 @@ enum Command {
         /// Local `.json.gz` sample (a gzip'd `{"Records": [...]}` envelope).
         sample: PathBuf,
     },
-    /// Filter CloudTrail gzip objects through `core::process::{buffer_run,
-    /// stream_run}` — the same two processors the Lambda runs.
+    /// Filter CloudTrail gzip objects through the same two processors the
+    /// Lambda runs.
     ///
-    /// `source` and `dest` are each a local path or an `s3://bucket/prefix`
-    /// URI. A single local **file** filters that one object to `dest`. A
-    /// local **directory** or any `s3://` prefix filters every in-scope
-    /// object under it, mirroring the relative path into `dest` (which may
-    /// itself be a local directory or an `s3://` prefix). Objects with all
-    /// records dropped are not written ("zero empty writes").
+    /// `source` and `dest` are each a local path or an `s3://bucket/prefix`.
+    /// A local directory or any `s3://` prefix filters every in-scope object
+    /// under it, mirroring the relative path into `dest`. Objects with all
+    /// records dropped are not written.
     ///
-    /// A failing object does not stop the run: the batch continues, the
-    /// summary still prints, and the failures are listed at the end with a
-    /// non-zero exit.
+    /// A failing object does not stop the run: the batch continues, the summary
+    /// still prints, and the failures are listed with a non-zero exit.
     Filter {
         /// Local file/directory, or `s3://bucket/prefix`.
         source: String,
@@ -112,20 +88,15 @@ enum Command {
         #[arg(long)]
         rules: String,
         /// The deployment's settings YAML, so a backfill uses the same
-        /// `processing.*` (mode, thresholds, gzip level), `source.*` (which
-        /// keys are in scope), and `behavior.*` (dry run, unrecognized-object
-        /// policy) values production does. Omit for built-in defaults.
+        /// `processing.*`, `source.*` and `behavior.*` values production does.
+        /// Omit for built-in defaults.
         #[arg(long)]
         settings: Option<PathBuf>,
     },
-    /// Load a settings document and run the exact validation the Lambda
-    /// binaries run at cold start (`Settings::from_parts`), so a bad value
-    /// that would otherwise panic mid-invocation — `gzip_level` out of
-    /// range, an uncompilable key regex, `max_object_bytes` smaller than
-    /// `stream_threshold_bytes`, `multipart_part_bytes` below S3's 5 MiB
-    /// minimum — is caught pre-deploy instead. Prints a summary of the
-    /// effective settings on success; exits non-zero with the error on
-    /// failure.
+    /// Load a settings document and run the exact validation the Lambda binaries
+    /// run at cold start, so a bad value that would otherwise panic mid-invocation
+    /// is caught pre-deploy. Prints the effective settings; exits non-zero with
+    /// the error on failure.
     ValidateSettings {
         /// Local settings YAML file. Omit to validate built-in defaults
         /// (plus any `CT_*` env overrides) — a valid env-only deployment.
@@ -180,38 +151,29 @@ impl Location {
     }
 }
 
-/// One source object queued for filtering: `fetch` is the store key that
-/// reads its bytes (a local path or a full S3 key); `rel` is the path used
-/// to mirror it into the destination; `size` is its *compressed* size when
-/// cheaply known, which is what picks buffer vs. stream in `auto` mode.
+/// One source object queued for filtering: `fetch` is the store key that reads
+/// its bytes, `rel` mirrors it into the destination, and `size` is its
+/// compressed size when cheaply known, which picks buffer vs. stream in `auto`.
 ///
-/// `size` is `None` for an S3 source: `ListObjectsV2` sizes are not carried
-/// through `S3ObjectStore::list_keys`, and an unknown size means buffer mode
-/// — the same conservative choice `Pipeline::select_mode` makes when an
-/// event carries no size (safety invariant 5). Nothing is lost by it: an
-/// object too large to buffer is retried through stream mode below, exactly
-/// as the pipeline retries it.
+/// `size` is `None` for an S3 source — `list_keys` does not carry
+/// `ListObjectsV2` sizes — which means buffer mode, the same conservative choice
+/// `Pipeline::select_mode` makes. An object too large to buffer is retried
+/// through stream mode below, exactly as the pipeline retries it.
 struct SrcObject {
     fetch: String,
     rel: String,
     size: Option<u64>,
 }
 
-/// The parts of a settings document `filter` honours, resolved once per run.
+/// The parts of a settings document `filter` honours, resolved once per run:
+/// `processing.*`, `source.*` (via [`KeyFilter`]), `behavior.dry_run` and
+/// `behavior.on_unrecognized_object` — the settings that change what a backfill
+/// selects and writes.
 ///
-/// Scope is deliberate — these are the settings that change *what a backfill
-/// selects and writes*:
-/// - `processing.*` — mode, `stream_threshold_bytes`, `max_object_bytes`,
-///   `multipart_part_bytes`, `gzip_level`.
-/// - `source.*` — via [`KeyFilter`], which objects are in scope at all.
-/// - `behavior.dry_run` — evaluate and report, write nothing.
-/// - `behavior.on_unrecognized_object` — copy / skip / error.
-///
-/// The rest is Lambda-only and ignored here: `destination.*` (the `dest`
-/// argument is the destination), `rules.*` (`--rules` is), `sqs.*`,
-/// `behavior.on_config_error` and `behavior.partial_batch_failures` (no
-/// event source, no batch to fail), `behavior.on_missing_object` (objects
-/// are enumerated, not named by an event), and `observability.*`.
+/// The rest is Lambda-only and ignored: `destination.*` and `rules.*` are the
+/// `dest` and `--rules` arguments, and `sqs.*`, `behavior.on_config_error`,
+/// `partial_batch_failures`, `on_missing_object` and `observability.*` have no
+/// event source or batch to apply to.
 struct FilterConfig {
     processing: Processing,
     keys: KeyFilter,
@@ -220,12 +182,10 @@ struct FilterConfig {
 }
 
 impl FilterConfig {
-    /// `Some(path)` runs the document through the exact production
-    /// `Settings::from_parts` validation (`CT_*` overrides included);
-    /// `None` is built-in defaults. Defaults are assembled from the same
-    /// `Default` impls `Settings` parses into rather than through
-    /// `from_parts`, because `from_parts` requires a `destination.bucket`
-    /// that a CLI run has no use for — `dest` is the destination.
+    /// `Some(path)` runs the document through the production
+    /// `Settings::from_parts` validation; `None` is built-in defaults. Defaults
+    /// come from the same `Default` impls rather than `from_parts`, which
+    /// requires a `destination.bucket` a CLI run has no use for.
     fn resolve(path: Option<&Path>) -> anyhow::Result<Self> {
         let (source, processing, behavior) = match path {
             Some(p) => {
@@ -268,10 +228,10 @@ enum Mode {
     Stream,
 }
 
-/// `core`'s `ObjectStore` port over the local filesystem, so the local side
-/// of a `filter` run is addressed exactly like the S3 side and `stream_run`
-/// — which writes through the port — works against a local destination too.
-/// `bucket` is meaningless locally and ignored; `key` is the path.
+/// `core`'s `ObjectStore` port over the local filesystem, so both sides of a
+/// `filter` run are addressed alike and `stream_run` — which writes through the
+/// port — works against a local destination. `bucket` is ignored; `key` is the
+/// path.
 struct LocalObjectStore;
 
 impl LocalObjectStore {
@@ -331,12 +291,10 @@ impl ObjectStore for LocalObjectStore {
             .map_err(|e| Self::io_error(key, "write", e))
     }
 
-    /// Writes through a temporary sibling and renames on success, so an
-    /// aborted stream leaves *nothing* at `key`. `stream_run` signals
-    /// "abandon this upload" by failing the reader mid-flight (all records
-    /// dropped, an unrecognized object, a parse failure); writing `key`
-    /// directly would leave a truncated or zero-record object behind, which
-    /// the whole design exists to prevent.
+    /// Writes through a temporary sibling and renames on success, so an aborted
+    /// stream leaves nothing at `key`. `stream_run` abandons an upload by failing
+    /// the reader mid-flight, and writing `key` directly would leave a truncated
+    /// or zero-record object behind.
     async fn put_stream(
         &self,
         _bucket: &str,
@@ -369,12 +327,9 @@ impl ObjectStore for LocalObjectStore {
     }
 }
 
-/// Resolves a rules `uri` to raw bytes. A bare path with no `scheme://` is
-/// read directly off disk — the ergonomic case for `validate
-/// examples/rules.example.yaml` — otherwise the URI is dispatched to the
-/// matching `ConfigSource` (`file://` locally, `s3://`/`ssm://` via the AWS
-/// SDK, credentials resolved lazily so a local/file invocation never pays
-/// for it).
+/// Resolves a rules `uri` to raw bytes. A bare path with no `scheme://` is read
+/// off disk; otherwise the URI is dispatched to the matching `ConfigSource`,
+/// with AWS credentials resolved lazily so a local invocation never pays for it.
 async fn load_rules_bytes(uri: &str) -> anyhow::Result<Vec<u8>> {
     if !uri.contains("://") {
         return std::fs::read(uri).with_context(|| format!("failed to read {uri:?}"));
@@ -398,9 +353,8 @@ async fn load_rules_bytes(uri: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Builds an `Engine` from a rules `uri`, along with the `RuleSet` it was
-/// built from (`Engine::new` consumes its `RuleSet`, but `validate` needs
-/// the original rule/match data to explain each `always_rules()` entry).
+/// Builds an `Engine` from a rules `uri`, along with the `RuleSet` it consumed —
+/// `validate` needs the original rule data to explain each `always_rules()` entry.
 async fn load_engine(uri: &str) -> anyhow::Result<(Engine, RuleSet)> {
     let bytes = load_rules_bytes(uri).await?;
     let rule_set = RuleSet::parse(&bytes)?;
@@ -408,10 +362,8 @@ async fn load_engine(uri: &str) -> anyhow::Result<(Engine, RuleSet)> {
     Ok((engine, rule_set))
 }
 
-/// Names the rule at `rule_idx` and explains, in prose, why the rule index
-/// could not narrow it on `eventSource` or `eventName` — either it has no
-/// condition on either field, or the condition(s) it has are not one of the
-/// two conservative shapes `Engine::new`'s index extraction accepts.
+/// Names the rule at `rule_idx` and explains why the index could not narrow it
+/// on `eventSource` or `eventName`.
 fn explain_always_rule(rule_set: &RuleSet, rule_idx: usize) -> String {
     let name = &rule_set.rules[rule_idx].name;
     match rule_set.index_key_description(rule_idx) {
@@ -457,11 +409,9 @@ async fn cmd_validate(uri: &str, max_unindexed: Option<u8>) -> anyhow::Result<()
     Ok(())
 }
 
-/// The envelope shape a decompressed CloudTrail sample must have: a
-/// `Records` array. Unlike `buffer_run`'s `Envelope`, this is a plain,
-/// already-parsed `Vec<Value>` — `test` reports every record individually
-/// and has no need for the raw-byte-preserving `RawValue` trick that only
-/// matters when re-emitting survivors verbatim.
+/// The envelope a decompressed CloudTrail sample must have. Plain `Vec<Value>`
+/// rather than `buffer_run`'s `RawValue`: `test` reports records individually
+/// and never re-emits them verbatim.
 #[derive(serde::Deserialize)]
 struct Sample {
     #[serde(rename = "Records")]
@@ -517,10 +467,8 @@ async fn cmd_test(rules_uri: &str, sample_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The "directory" portion of an S3 prefix — everything up to and including
-/// its last `/`. Stripping this from a listed key yields the relative key to
-/// mirror into the destination, so both a directory-style prefix
-/// (`logs/`) and an exact object key (`logs/x.json.gz`) relativize sensibly.
+/// The "directory" portion of an S3 prefix — everything up to and including its
+/// last `/` — so both `logs/` and `logs/x.json.gz` relativize sensibly.
 fn dir_prefix(prefix: &str) -> String {
     match prefix.rfind('/') {
         Some(i) => prefix[..=i].to_string(),
@@ -537,10 +485,9 @@ fn join_key(prefix: &str, rel: &str) -> String {
     }
 }
 
-/// Recursively collects in-scope objects under `dir`, recording each one's
-/// path relative to `root` (with `/` separators) as its `rel`. `rel` is what
-/// `keys` is matched against — locally there is no S3 key, and `rel` is the
-/// closest analogue of one.
+/// Recursively collects in-scope objects under `dir`, recording each one's path
+/// relative to `root` (with `/` separators) as its `rel` — the local analogue of
+/// an S3 key, and what `keys` is matched against.
 fn collect_local(
     root: &Path,
     dir: &Path,
@@ -569,11 +516,9 @@ fn collect_local(
     Ok(())
 }
 
-/// Enumerates every in-scope source object under a batch source (a local
-/// directory or an `s3://` prefix), sorted by relative key for deterministic
-/// output. In scope means exactly what it means in production: the
-/// deployment's `source.include_key_regex`/`exclude_key_regex`, compiled
-/// into the same [`KeyFilter`] the pipeline applies before any `GetObject`.
+/// Enumerates every in-scope source object under a batch source, sorted by
+/// relative key. In scope means what it means in production: the deployment's
+/// key regexes, compiled into the same [`KeyFilter`] the pipeline applies.
 async fn enumerate(
     src: &Location,
     keys: &KeyFilter,
@@ -632,26 +577,14 @@ enum ObjectOutcome {
     DryRun,
 }
 
-/// Rejects a relative key that would escape the destination root once
-/// joined to it, and returns the safe, root-relative `PathBuf` otherwise.
+/// Rejects a relative key that would escape the destination root once joined to
+/// it, and returns the safe root-relative `PathBuf` otherwise.
 ///
-/// `rel` may come from an S3 key (`enumerate`'s `Location::S3` branch: a
-/// naive `strip_prefix` of an attacker-controlled key, reachable by anyone
-/// with `s3:PutObject` on the source bucket) or a local directory walk. Two
-/// escapes matter, and only a per-component check catches both:
-/// - `..` components (`Component::ParentDir`) walk back out of the root.
-/// - A `rel` that is itself absolute (`Component::RootDir`) — e.g. an S3 key
-///   `logs//etc/cron.d/x.json.gz` strips its `logs/` prefix down to
-///   `/etc/cron.d/x.json.gz` because of the doubled slash — is worse:
-///   `Path::join` with an absolute path *discards* the base entirely, so the
-///   write lands at the absolute path with no root prefix at all. Rust's
-///   component parser collapses any run of leading slashes (one or many)
-///   into a single `RootDir`, so this same check catches the doubled-slash
-///   case without separately normalizing empty segments.
-///
-/// Requiring every component to be `Component::Normal` rejects both in one
-/// pass, plus `.` (`CurDir`) and a Windows drive prefix, rather than
-/// hand-rolling a string check for `".."` that would miss the absolute case.
+/// `rel` may come from an attacker-controlled S3 key. Two escapes matter: `..`
+/// components, and a `rel` that is itself absolute — an S3 key
+/// `logs//etc/cron.d/x.json.gz` strips down to `/etc/cron.d/x.json.gz`, and
+/// `Path::join` with an absolute path *discards* the base entirely. Requiring
+/// every component to be `Component::Normal` rejects both in one pass.
 fn contain_rel(rel: &str) -> anyhow::Result<PathBuf> {
     let mut safe = PathBuf::new();
     for component in Path::new(rel).components() {
@@ -663,11 +596,9 @@ fn contain_rel(rel: &str) -> anyhow::Result<PathBuf> {
     Ok(safe)
 }
 
-/// The batch destination key for a source object's relative key.
-///
-/// Only the local-destination case needs the [`contain_rel`] containment
-/// check: `join_key`'s `..` in an S3 key is a literal key-name character,
-/// never traversal, so the S3 branch is untouched.
+/// The batch destination key for a source object's relative key. Only the local
+/// destination needs [`contain_rel`]: `..` in an S3 key is a literal key-name
+/// character, never traversal.
 fn batch_dest_key(dst: &Location, rel: &str) -> anyhow::Result<String> {
     match dst {
         Location::Local(root) => {
@@ -692,10 +623,9 @@ fn single_dest_key(dst: &Location) -> anyhow::Result<String> {
     }
 }
 
-/// Everything a `filter` run needs to process one object, so the single-file
-/// and batch paths share one implementation — and so that implementation can
-/// mirror `Pipeline`'s per-object policy (mode selection, the auto-mode
-/// stream retry, the unrecognized-object policy) instead of approximating it.
+/// Everything a `filter` run needs to process one object, so the single-file and
+/// batch paths share one implementation that mirrors `Pipeline`'s per-object
+/// policy rather than approximating it.
 struct Filterer {
     engine: Engine,
     cfg: FilterConfig,
@@ -714,19 +644,13 @@ impl Filterer {
         }
     }
 
-    /// Refuses to filter an object over itself.
+    /// Refuses to filter an object over itself — the CLI's analogue of
+    /// `CoreError::SelfTrigger`. Without it, `filter ./logs ./logs` rewrote a
+    /// directory of CloudTrail objects in place, unrecoverably.
     ///
-    /// `Pipeline` has `CoreError::SelfTrigger` for the deployment shape this
-    /// mirrors (destination bucket == source bucket, same key), because
-    /// writing the filtered object back over its input destroys the original
-    /// and — in the Lambda's case — re-triggers itself. The CLI had no such
-    /// guard, so `filter ./logs ./logs` rewrote a directory of CloudTrail
-    /// objects in place, unrecoverably.
-    ///
-    /// Local paths are compared canonically (the destination need not exist
-    /// yet, so its parent is canonicalized and the file name re-joined) —
-    /// `./logs/x.gz` and `logs/x.gz` are the same file, and a string compare
-    /// would have missed it.
+    /// Local paths are compared canonically (the destination need not exist, so
+    /// its parent is canonicalized and the file name re-joined): `./logs/x.gz`
+    /// and `logs/x.gz` are the same file.
     fn overwrites_source(&self, src_key: &str, dst_key: &str) -> bool {
         match (&self.src, &self.dst) {
             (Location::S3 { bucket: sb, .. }, Location::S3 { bucket: db, .. }) => {
@@ -750,26 +674,22 @@ impl Filterer {
         }
     }
 
-    /// Reads the source object with `processing.max_object_bytes` applied to
-    /// the **fetch**, not merely to the decompressed body.
-    ///
-    /// `ObjectStore::get` is uncapped: it buffers whatever the object is.
-    /// Using it here meant the CLI's own comment ("applied to the fetch and
-    /// the decompressed body alike") and `docs/cli.md` described a cap that
-    /// the code did not apply, and a multi-gigabyte object OOM-killed the
-    /// process before `buffer_run` ever got the chance to reject it. This is
-    /// the read `Pipeline::fetch_with_missing_policy` performs.
+    /// Reads the source object with `processing.max_object_bytes` applied to the
+    /// **fetch**, not merely to the decompressed body — `ObjectStore::get` is
+    /// uncapped, so a multi-gigabyte object OOM-kills the process before
+    /// `buffer_run` can reject it. The read `Pipeline::fetch_with_missing_policy`
+    /// performs.
     async fn fetch_capped(&self, src_key: &str) -> Result<Bytes, CoreError> {
         use tokio::io::AsyncReadExt;
 
         let limit = self.cfg.processing.max_object_bytes;
         let bucket = self.src.bucket();
         let reader = self.store(&self.src).get_stream(bucket, src_key).await?;
-        // `limit + 1` so exceeding the cap is detectable without ever holding
-        // more than one byte past it.
+        // One byte past the cap, so exceeding it is detectable. Saturating:
+        // at `limit == u64::MAX` a wrapping `+ 1` would `take(0)`.
         let mut buf = Vec::new();
         reader
-            .take(limit + 1)
+            .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .await
             .map_err(|e| {
@@ -781,10 +701,9 @@ impl Filterer {
         Ok(Bytes::from(buf))
     }
 
-    /// The buffer-mode evaluation, up to but not including the write. Split
-    /// out so the `auto` `ObjectTooLarge` → stream retry can match on one
-    /// `CoreError` covering both the capped fetch and `buffer_run` — the two
-    /// places that cap can be hit.
+    /// The buffer-mode evaluation, up to but not including the write. Split out
+    /// so the `auto` `ObjectTooLarge` → stream retry can match one `CoreError`
+    /// covering both the capped fetch and `buffer_run`.
     async fn buffer_eval(&self, src_key: &str) -> Result<(Bytes, Outcome, RecordTally), CoreError> {
         let bytes = self.fetch_capped(src_key).await?;
         let (outcome, tally) = buffer_run(&bytes, &self.engine, &self.cfg.processing)?;
@@ -805,12 +724,9 @@ impl Filterer {
             );
         }
 
-        // `dry_run` selects the *destination*, not the mode. It used to
-        // short-circuit here into buffer-mode evaluation, which made the one
-        // setting meant for a pre-flight check the one setting whose verdict
-        // could differ from the real run's: an object `mode: auto` would have
-        // streamed failed the preview with `ObjectTooLarge`. Both dry run and
-        // the real run now take the same `select_mode` and the same retry.
+        // `dry_run` selects the destination, not the mode: both it and the real
+        // run take the same `select_mode` and the same retry, so the preview
+        // cannot reach a different verdict.
         let dry_run = self.cfg.dry_run;
 
         match self.cfg.select_mode(size) {
@@ -824,14 +740,11 @@ impl Filterer {
             Mode::Buffer => {
                 let result = self.buffer_eval(src_key).await;
                 match result {
-                    // The same retry `Pipeline::process_object` performs:
-                    // `stream_threshold_bytes` is a compressed-size estimate,
-                    // so a highly compressible object can be routed to buffer
-                    // mode and still blow `max_object_bytes` (buffer mode's
-                    // memory cap, applied to the fetch and the decompressed
-                    // body alike). Stream mode has no such cap. Only in
-                    // `auto`: an explicit `mode: buffer` means the operator
-                    // opted out of streaming, so the error must surface.
+                    // The same retry `Pipeline::process_object` performs: a
+                    // compressible object routed to buffer mode off a
+                    // compressed-size estimate can still blow `max_object_bytes`,
+                    // and stream mode has no such cap. Only in `auto` — explicit
+                    // `mode: buffer` opted out, so the error must surface.
                     Err(CoreError::ObjectTooLarge { limit })
                         if self.cfg.processing.mode == ProcessingMode::Auto =>
                     {
@@ -848,11 +761,9 @@ impl Filterer {
                     Err(e) => Err(e.into()),
                     Ok((bytes, outcome, tally)) => {
                         let object_outcome = if dry_run {
-                            // Nothing is written, so the object's fate is
-                            // decided the moment `buffer_run` returns — but
-                            // the outcome is still classified, so a preview
-                            // reports the unrecognized objects the real run
-                            // would copy or skip.
+                            // Nothing is written, but the outcome is still
+                            // classified so a preview reports the unrecognized
+                            // objects the real run would copy or skip.
                             if matches!(outcome, Outcome::Unrecognized) {
                                 self.metrics.add_unrecognized_objects(1);
                             }
@@ -873,9 +784,8 @@ impl Filterer {
                                 }
                             }
                         };
-                        // Past the `put`, exactly as `Pipeline::process_buffer`
-                        // does it: a write that failed must leave the records
-                        // uncounted rather than report them as filtered.
+                        // Past the `put`, as `Pipeline::process_buffer` does it:
+                        // a failed write must leave the records uncounted.
                         tally.commit(&self.metrics, &self.engine);
                         Ok(object_outcome)
                     }
@@ -884,13 +794,10 @@ impl Filterer {
         }
     }
 
-    /// `behavior.dry_run` in stream mode: the real `stream_run`, pointed at a
-    /// [`DiscardStore`], so the preview reaches its verdict by taking the live
-    /// run's path rather than through a second evaluator.
-    ///
-    /// `stream_run` publishes straight to the `Metrics` it is handed, so it is
-    /// handed a scratch one and everything except `BytesOut` is folded back —
-    /// those bytes went nowhere.
+    /// `behavior.dry_run` in stream mode: the real `stream_run` pointed at a
+    /// [`DiscardStore`], so the preview takes the live run's path rather than a
+    /// second evaluator. It publishes to a scratch `Metrics`; all but `BytesOut`
+    /// is folded back.
     async fn process_dry_run_stream(&self, src_key: &str) -> anyhow::Result<ObjectOutcome> {
         let reader = self
             .store(&self.src)
@@ -909,10 +816,8 @@ impl Filterer {
         )
         .await;
 
-        // Folded back before `?`: an object that failed mid-stream still read
-        // the bytes it read. The record counters cannot leak from a failure —
-        // `stream_run` commits its tally only past its own upload check, so a
-        // failed object leaves the scratch counters at zero by construction.
+        // Folded back before `?`: a failed object still read its bytes. The
+        // record counters cannot leak — `stream_run` commits past its upload check.
         let snapshot = scratch.snapshot_and_reset();
         self.metrics.add_bytes_in(snapshot.bytes_in);
         self.metrics.add_records_in(snapshot.records_in);
@@ -949,12 +854,10 @@ impl Filterer {
             Outcome::Written(None) => Ok(ObjectOutcome::Written(self.dst.display(dst_key))),
             // `stream_run` aborted the upload: nothing landed at `dst_key`.
             Outcome::NothingKept => Ok(ObjectOutcome::NothingKept),
-            // The upload is already aborted. Hand the policy no bytes: it
-            // decides *first*, exactly as `Pipeline::process_stream` does, and
-            // only `copy` re-reads the object — as a stream, straight into the
-            // destination. Buffering the whole object up front undid stream
-            // mode's entire reason for existing, on the one path reached by
-            // objects too big to buffer.
+            // The upload is already aborted. Hand the policy no bytes: it decides
+            // first, as `Pipeline::process_stream` does, and only `copy` re-reads
+            // the object — as a stream, on the one path reached by objects too
+            // big to buffer.
             Outcome::Unrecognized => self.unrecognized(src_key, dst_key, None).await,
             Outcome::Written(Some(_)) => {
                 unreachable!("stream_run never returns Written(Some(_))")
@@ -962,14 +865,11 @@ impl Filterer {
         }
     }
 
-    /// `behavior.on_unrecognized_object` for an object that parsed as JSON
-    /// but carried no `Records` array. The default is `copy` — forward
-    /// verbatim, never discard.
+    /// `behavior.on_unrecognized_object` for an object that parsed as JSON but
+    /// carried no `Records`. The default is `copy` — forward verbatim.
     ///
-    /// `bytes` is the already-buffered source object when the caller happens
-    /// to hold it (buffer mode always does); `None` makes the `copy` branch
-    /// stream source → destination instead, so the streaming caller never has
-    /// to materialize the object.
+    /// `bytes` is the already-buffered source when the caller holds it; `None`
+    /// makes `copy` stream source → destination instead.
     async fn unrecognized(
         &self,
         src_key: &str,
@@ -1067,10 +967,8 @@ async fn cmd_filter(
 
     let (mut written, mut fully_dropped, mut copied, mut skipped) =
         (0usize, 0usize, 0usize, 0usize);
-    // A failing object must not abandon the objects after it: the run
-    // continues, and every failure is reported together at the end with a
-    // non-zero exit. Aborting on the first error left an operator with a
-    // half-finished backfill and no summary saying how far it got.
+    // A failing object must not abandon the objects after it: the run continues
+    // and every failure is reported together at the end with a non-zero exit.
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for obj in &objects {
@@ -1086,9 +984,8 @@ async fn cmd_filter(
             obj.rel.as_str()
         };
 
-        // An unsafe `rel` fails this object exactly like any other error: it
-        // never stops the batch (see the module doc above `failures`), it is
-        // never a silent skip, and it still drives the non-zero exit code.
+        // An unsafe `rel` fails this object like any other error: never a silent
+        // skip, never a stop, and it still drives the non-zero exit code.
         let outcome = match dst_key {
             Ok(dst_key) => f.process(&obj.fetch, &dst_key, obj.size).await,
             Err(e) => Err(e),
@@ -1123,10 +1020,8 @@ async fn cmd_filter(
 
     let snap = f.metrics.snapshot_and_reset();
     if f.cfg.dry_run {
-        // The unrecognized count is what a preview is *for* on this axis: it
-        // is the number of objects the real run would hand to
-        // `behavior.on_unrecognized_object` — copied verbatim, skipped, or
-        // (under `error`) failed. Reporting only the record counts hid it.
+        // The unrecognized count is the number of objects the real run would
+        // hand to `behavior.on_unrecognized_object`.
         println!(
             "dry run: {} object(s) evaluated ({} unrecognized, {} failed), nothing written",
             objects.len(),
@@ -1156,11 +1051,9 @@ async fn cmd_filter(
     Ok(())
 }
 
-/// Loads `path` (or falls back to built-in defaults when `None`) and runs it
-/// through `Settings::from_parts` with `std::env::var` as the override
-/// source — the identical parse-override-validate path `Settings::load()`
-/// uses in production, so `validate-settings` is never a CLI-side
-/// reimplementation of the Lambda's validation.
+/// Loads `path` (or built-in defaults) and runs it through `Settings::from_parts`
+/// with `std::env::var` as the override source — the identical path
+/// `Settings::load()` takes in production, never a CLI-side reimplementation.
 fn load_and_validate_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
     let bytes = match path {
         Some(p) => Some(std::fs::read(p).with_context(|| format!("failed to read {p:?}"))?),
@@ -1234,9 +1127,6 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// A `..`-laden `rel` (the shape a crafted local source or a naive S3
-    /// key relativization could produce) must be rejected, not silently
-    /// escape `root` via `Path::join`.
     #[test]
     fn batch_dest_key_rejects_parent_dir_escape() {
         let root = Location::Local(PathBuf::from("./out"));
@@ -1248,13 +1138,9 @@ mod tests {
         );
     }
 
-    /// The more severe escape: no `..` at all, just a `rel` that is itself
-    /// absolute. Built through the exact derivation `enumerate`'s
-    /// `Location::S3` branch uses (`dir_prefix` then `strip_prefix` on the
-    /// listed key) rather than constructing an absolute `rel` by hand, so
-    /// this proves the real path — a doubled slash in an S3 key survives
-    /// the strip as a leading `/`, and `PathBuf::join` with an absolute
-    /// path discards `root` entirely.
+    /// Built through the exact derivation `enumerate`'s `Location::S3` branch
+    /// uses, so this proves the real path: a doubled slash survives the strip as
+    /// a leading `/`, and `PathBuf::join` with an absolute path discards `root`.
     #[test]
     fn batch_dest_key_rejects_absolute_escape_via_doubled_slash() {
         let prefix = "logs/";

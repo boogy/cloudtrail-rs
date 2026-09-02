@@ -12,14 +12,12 @@ use serde_json::{Value, json};
 use crate::model::MetricSnapshot;
 use crate::ports::MetricsSink;
 
-/// Process-lived atomic counters. Held behind an `Arc` and shared across
-/// invocations (`ConfigStore` keeps one), so every field must be safe to
-/// mutate from concurrent handler tasks without a lock — except `rule_drops`,
-/// whose key set is unbounded and dynamic, so it gets a `Mutex<HashMap<..>>`.
+/// Process-lived atomic counters, shared across invocations behind an `Arc`, so
+/// every field is safe to mutate concurrently without a lock — except
+/// `rule_drops`, whose key set is unbounded and dynamic.
 ///
-/// `snapshot_and_reset` swaps every counter back to zero as it reads it, so
-/// the `MetricSnapshot` it returns is a delta since the previous call, not a
-/// running total.
+/// `snapshot_and_reset` zeroes each counter as it reads it, so a
+/// `MetricSnapshot` is a delta, not a running total.
 #[derive(Default)]
 pub struct Metrics {
     cold_start_emitted: AtomicBool,
@@ -49,18 +47,16 @@ impl Metrics {
         self.objects_skipped.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// One per object whose processing returned an error. Critically, this is
-    /// incremented on the `partial_batch_failures` path too — where the
-    /// handler returns `Ok` and AWS's `Errors` metric therefore stays at zero,
-    /// making this the only metric that moves when objects start failing.
+    /// One per object whose processing returned an error, on the
+    /// `partial_batch_failures` path too — where the handler returns `Ok` and
+    /// AWS's `Errors` stays at zero, making this the only metric that moves.
     pub fn add_objects_failed(&self, n: u64) {
         self.objects_failed.fetch_add(n, Ordering::Relaxed);
     }
 
     /// One per object excluded by `source.include_key_regex` /
-    /// `source.exclude_key_regex` before it was ever fetched. Without this the
-    /// exclusion is invisible: a key filter that rejects 100% of deliveries
-    /// leaves every other counter at zero, exactly like an idle function.
+    /// `source.exclude_key_regex` before it was fetched. Without it, a filter
+    /// rejecting 100% of deliveries looks exactly like an idle function.
     pub fn add_objects_excluded_by_key(&self, n: u64) {
         self.objects_excluded_by_key.fetch_add(n, Ordering::Relaxed);
     }
@@ -103,33 +99,22 @@ impl Metrics {
         self.decode_errors.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// One per cleanly-decoded `SourceItem` that nonetheless carried zero
-    /// objects. This is an alarm signal, not necessarily an error: a
-    /// legitimate `s3:TestEvent` delivered via SQS trips it once (see
-    /// `MetricSnapshot::items_without_objects`); a *sustained* nonzero rate
-    /// usually means `sqs.body_format` is misconfigured against what the
-    /// queue is actually carrying, silently discarding every message.
+    /// One per cleanly-decoded `SourceItem` that carried zero objects. An alarm
+    /// signal, not an error: an `s3:TestEvent` trips it once, but a sustained
+    /// rate usually means `sqs.body_format` is misconfigured and every message
+    /// is being discarded.
     pub fn add_items_without_objects(&self, n: u64) {
         self.items_without_objects.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Attributes `n` dropped records to `rule_name` (the `RuleDrops`
-    /// metric's `Rule` dimension) under one lock acquisition.
+    /// Attributes `n` dropped records to `rule_name` under one lock acquisition.
     ///
-    /// Bulk-only, deliberately: there is no singular `record_rule_drop`,
-    /// because a caller that has one drop to report is a caller reporting
-    /// drops as they happen — which is the shape [`RecordTally`] exists to
-    /// prevent. Every drop reaches here through `RecordTally::commit`, past
-    /// the write.
+    /// Bulk-only, deliberately: a caller with a single drop to report is
+    /// reporting drops as they happen, which is what [`RecordTally`] exists to
+    /// prevent. Every drop reaches here through `RecordTally::commit`, past the
+    /// write.
     ///
     /// [`RecordTally`]: crate::process::RecordTally
-    ///
-    /// Exists for `stream_run`, which tallies drops per rule locally while it
-    /// streams and commits them here only once the object as a whole is known
-    /// to have succeeded — the same deferral `RecordsDropped` already has.
-    /// Reporting them as they happened attributed drops to a rule for records
-    /// that were never actually dropped, because the object went on to fail
-    /// and be re-driven in full.
     pub fn record_rule_drops(&self, rule_name: &str, n: u64) {
         if n == 0 {
             return;
@@ -199,15 +184,10 @@ impl EmfMetricsSink {
             .unwrap_or(0)
     }
 
-    /// Builds the JSON documents `emit` prints, one per line: one aggregate
-    /// line covering every counter except `RuleDrops`, plus one additional
-    /// line per rule that dropped records this invocation.
-    ///
-    /// A single flat EMF document can only hold one value per dimension name,
-    /// so `Rule` can't vary across entries within one line — a second rule
-    /// dropping records needs its own line to keep both counts visible. With
-    /// zero or one rule dropping records (the common case), this is exactly
-    /// the one line `emit` promises.
+    /// Builds the JSON documents `emit` prints: one aggregate line covering
+    /// every counter except `RuleDrops`, plus one line per rule that dropped
+    /// records. A flat EMF document holds one value per dimension name, so a
+    /// second rule needs its own line to stay visible.
     fn build_lines(&self, snapshot: &MetricSnapshot) -> Vec<Value> {
         let timestamp = Self::timestamp_millis();
 

@@ -1,9 +1,8 @@
 //! Composition root for the S3-notification Lambda (`decode-s3`).
 //!
-//! Following the cold-start init-once design,
-//! every port is constructed exactly once here, in `main`, before
-//! `lambda_runtime::run`; the handler closure captures only an
-//! `Arc<Pipeline>` clone and never constructs an adapter.
+//! Every port is constructed exactly once here, in `main`, before
+//! `lambda_runtime::run`; the handler closure captures only an `Arc<Pipeline>`
+//! clone and never constructs an adapter.
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
@@ -49,10 +48,9 @@ fn build_sink(observability: &Observability) -> Arc<dyn MetricsSink> {
     }
 }
 
-/// Builds the `S3ObjectStore`, carrying `processing.multipart_part_bytes`
-/// through via `S3ObjectStore::from_settings` — extracted out of `main` so a
-/// test can prove the composition root's own wiring passes the configured
-/// value through, not just that `from_settings` does so in isolation.
+/// Builds the `S3ObjectStore`, carrying `processing.multipart_part_bytes` through
+/// `S3ObjectStore::from_settings`. Extracted out of `main` so a test can prove
+/// this composition root passes the configured value through.
 fn build_store(conf: &SdkConfig, processing: &Processing) -> S3ObjectStore {
     S3ObjectStore::from_settings(conf, processing)
 }
@@ -114,9 +112,8 @@ mod tests {
             .build()
     }
 
-    // --- F6: `settings.processing.multipart_part_bytes` must reach the
-    // store `main` actually builds, not just `S3ObjectStore::from_settings`
-    // in isolation. ---------------------------------------------------
+    // `settings.processing.multipart_part_bytes` must reach the store `main`
+    // actually builds, not just `S3ObjectStore::from_settings` in isolation.
 
     #[test]
     fn build_store_wires_a_non_default_multipart_part_bytes_through() {

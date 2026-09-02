@@ -11,10 +11,8 @@ pub struct ObjectRef {
 /// One decoded unit of work: zero or more objects to process, plus the
 /// upstream ack token (if any) needed to report partial batch failures.
 ///
-/// `decode_error` is `Some(_)` when the message's own body failed to
-/// decode (e.g. a garbage SQS message body): `objects` is then always
-/// empty, and the pipeline must not silently ack the message — see
-/// `SourceItem::undecodable`.
+/// `decode_error` is `Some(_)` only for a message whose body failed to
+/// decode; `objects` is then always empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceItem {
     pub ack_id: Option<String>,
@@ -32,10 +30,8 @@ impl SourceItem {
         }
     }
 
-    /// A message whose body failed to decode: no objects were extracted,
-    /// and `error` records why — so the pipeline can fail this item's
-    /// `ack_id` instead of silently dropping it (which would ack a message
-    /// whose referenced object, if any, is never processed).
+    /// A message whose body failed to decode, so the pipeline can fail this
+    /// item's `ack_id` rather than ack it clean.
     pub fn undecodable(ack_id: Option<String>, error: String) -> Self {
         SourceItem {
             ack_id,
@@ -70,18 +66,12 @@ pub struct MetricSnapshot {
     pub objects_processed: u64,
     pub objects_skipped: u64,
     /// Objects whose processing returned an error. Under the default
-    /// `behavior.partial_batch_failures = true` a failing object does **not**
-    /// fail the invocation — the handler returns `Ok` with the message in
-    /// `batchItemFailures` — so AWS's own `Errors` metric stays at zero and
-    /// this counter is the only metric that moves. Alarm on it: a sustained
-    /// nonzero rate means messages are being redriven toward the DLQ.
+    /// `partial_batch_failures = true` AWS's own `Errors` metric stays at
+    /// zero, so this is the only counter that moves.
     pub objects_failed: u64,
-    /// Objects a decoder referenced that `source.include_key_regex` /
-    /// `source.exclude_key_regex` excluded, so they were never fetched. Zero
-    /// is normal only if the trigger is already scoped to matching keys; a
-    /// rate equal to the delivery rate (with `ObjectsProcessed` at zero) means
-    /// the key filter is rejecting everything — otherwise indistinguishable
-    /// from "no traffic".
+    /// Objects excluded by `source.include_key_regex` /
+    /// `source.exclude_key_regex`, so never fetched. A rate equal to the
+    /// delivery rate means the key filter is rejecting everything.
     pub objects_excluded_by_key: u64,
     pub unrecognized_objects: u64,
     pub records_in: u64,
@@ -92,24 +82,16 @@ pub struct MetricSnapshot {
     pub config_load_errors: u64,
     pub parse_errors: u64,
     pub decode_errors: u64,
-    /// Items that decoded cleanly but carried zero objects. Not inherently
-    /// an error: a legitimate `s3:TestEvent` delivered via SQS trips this
-    /// once when the notification config is first saved. Treat it as an
-    /// alarm signal — a *sustained* nonzero rate usually means
-    /// `sqs.body_format` is misconfigured against what the queue actually
-    /// carries, discarding every message with a clean ack and no other
-    /// evidence.
+    /// Items that decoded cleanly but carried zero objects. A sustained
+    /// nonzero rate usually means `sqs.body_format` is misconfigured against
+    /// what the queue carries, acking every message clean.
     pub items_without_objects: u64,
     pub rule_drops: Vec<(String, u64)>,
 }
 
 impl MetricSnapshot {
-    /// Whether `records_in == records_kept + records_dropped` for this
-    /// snapshot — the reconciliation invariant both processing modes uphold.
-    /// Every record read out of a `Records` array is accounted for as exactly
-    /// one of kept or dropped, and an object that never yielded a usable
-    /// `Records` array contributes zero to all three. A snapshot that fails
-    /// this has lost track of a record, which is the shape of silent loss.
+    /// Whether `records_in == records_kept + records_dropped` — the
+    /// reconciliation invariant both processing modes uphold.
     pub fn records_balance(&self) -> bool {
         self.records_in == self.records_kept + self.records_dropped
     }

@@ -1,8 +1,5 @@
-//! Dot-path field resolution against a `serde_json::Value` record.
-//!
-//! Used by the rule engine to pull the string representation of a field named
-//! in a rule's `field_name` out of a decoded CloudTrail record, without a full
-//! typed model of every possible record shape.
+//! Dot-path field resolution against a `serde_json::Value` record, so a rule's
+//! `field_name` can be read without a typed model of every record shape.
 
 use serde_json::Value;
 use std::borrow::Cow;
@@ -106,12 +103,10 @@ pub fn parse_path(s: &str) -> Result<Path, PathParseError> {
     Ok(Path { segments })
 }
 
-/// Lower a v1 `field_name` into a `Path` exactly the way `resolve` traverses
-/// it: split on `.`, every part a literal object key, no subscript syntax.
-/// Infallible — there is no syntax to reject, which is the point: a v1 path
-/// that `parse_path` would reject (`a[`, `a..b`, `.a`, `""`) instead becomes a
-/// key segment that simply never matches a real record, the same as it always
-/// has for v1.
+/// Lower a v1 `field_name` into a `Path` the way `resolve` traverses it: split
+/// on `.`, every part a literal object key, no subscript syntax. Infallible by
+/// design — a v1 path `parse_path` would reject becomes a key segment that
+/// never matches, exactly as it always has for v1.
 pub fn literal_path(s: &str) -> Path {
     Path {
         segments: s

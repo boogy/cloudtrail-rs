@@ -1,21 +1,15 @@
 //! Projected parsing: read only the fields the ruleset references, skipping
-//! every other subtree.
-//!
-//! The engine reads a handful of scalars per record, but the record carries
-//! bulky `requestParameters`/`responseElements` subtrees no rule touches.
-//! Fully materialising a `serde_json::Value` dominates per-record time (spec
-//! F4/F5). Measured on the 14-record corpus (~1.16 KB mean, ~70% of bytes
-//! skipped), this walk is ~1.3x cheaper end-to-end than parse-then-evaluate —
-//! not the ~3x the spec predicted for its 4.2 KB synthetic records, because
-//! the JSON is still scanned byte-for-byte whether a subtree is captured or
-//! skipped. `crates/core/benches/filter.rs` is the measurement.
+//! every other subtree — the bulky `requestParameters`/`responseElements` a
+//! rule never touches. ~1.3x cheaper end-to-end than parse-then-evaluate on
+//! the corpus; `crates/core/benches/filter.rs` is the measurement.
 //!
 //! Correctness rule: this must agree with `path::visit_values` on a fully
-//! parsed `Value` for every (record, path) pair. Enforced by differential
-//! test, because a divergence here silently changes which records are dropped.
+//! parsed `Value` for every (record, path) pair, enforced by differential
+//! test — a divergence silently changes which records are dropped.
 
 use crate::filter::path::{Path, Segment};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -27,10 +21,9 @@ pub(crate) struct Node {
     pub(crate) indices: Vec<(usize, Node)>,
     pub(crate) wildcard: Option<Box<Node>>,
     pub(crate) terminals: Vec<usize>,
-    /// Every path id whose terminal lives anywhere in this node's subtree
-    /// (including its own `terminals`). Lets a parent null out a whole
-    /// subtree in one flat loop before re-dispatching into a duplicate key,
-    /// instead of walking the trie at parse time.
+    /// Every path id whose terminal lives anywhere in this node's subtree.
+    /// Lets a parent null a whole subtree in one flat loop before
+    /// re-dispatching into a duplicate key, instead of walking the trie.
     pub(crate) subtree_terminals: Vec<usize>,
 }
 
@@ -84,36 +77,28 @@ impl Projection {
         self.len
     }
 
-    /// Whether any projected path contains `[*]`. A wildcard path captures only
-    /// the first element that yields a scalar, not the existential semantics
-    /// of `visit_values` — `Engine::evaluate_raw` must fall back to a full
-    /// parse whenever this is true. A wildcard sharing an array node with a
-    /// fixed subscript (see `records_index_and_wildcard_children`) can also
-    /// miss the very element that subscript claims, since `visit_seq` gives
-    /// the indexed child priority at that position — making the fallback
-    /// mandatory, not an optimization choice.
+    /// Whether any projected path contains `[*]`. A wildcard captures only the
+    /// first element that yields a scalar, not `visit_values`'s existential
+    /// semantics, and a wildcard sharing an array node with a fixed subscript
+    /// can miss the very element that subscript claims — so
+    /// `Engine::evaluate_raw`'s full-parse fallback is mandatory, not an
+    /// optimization choice.
     pub(crate) fn has_wildcard(&self) -> bool {
         self.has_wildcard
     }
 }
 
-/// Walk `json` once against `projection`, capturing only the scalars its
-/// paths name. Returns one slot per path id.
+/// Walk `json` once against `projection`, capturing only the scalars its paths
+/// name. Returns one slot per path id.
 ///
-/// Errors exactly when `serde_json::from_str::<Value>` would: a skipped
-/// subtree is still walked and discarded via [`Skip`], which drives
-/// `deserialize_any` (not `IgnoredAny`'s fast structural skip) so every
-/// string in a skipped subtree is still fully decoded -- including its
-/// `\uXXXX` escapes -- and a lone surrogate or truncated escape there is
-/// still an error and the caller still keeps the record. `IgnoredAny` does
-/// not decode string contents, only skips past them structurally, so it
-/// silently accepted malformed escapes a full parse rejects; that was the
-/// bug this type exists to fix.
-pub(crate) fn project(
-    json: &str,
+/// Errors exactly when `serde_json::from_str::<Value>` would: a skipped subtree
+/// is walked and discarded via [`Skip`], which decodes string escapes rather
+/// than skipping past them structurally the way `IgnoredAny` does.
+pub(crate) fn project<'a>(
+    json: &'a str,
     projection: &Projection,
-) -> Result<Vec<Option<String>>, serde_json::Error> {
-    let mut out = vec![None; projection.len()];
+) -> Result<Vec<Option<Cow<'a, str>>>, serde_json::Error> {
+    let mut out: Vec<Option<Cow<'a, str>>> = vec![None; projection.len()];
     let mut de = serde_json::Deserializer::from_str(json);
     LevelSeed {
         node: &projection.root,
@@ -124,9 +109,8 @@ pub(crate) fn project(
     Ok(out)
 }
 
-/// `deserialize_str` decodes escapes the same way `next_key::<String>()`
-/// does, so malformed keys still error identically -- only the `.to_owned()`
-/// is skipped.
+/// `deserialize_str` decodes escapes the same way `next_key::<String>()` does,
+/// so malformed keys still error identically — only the `.to_owned()` is skipped.
 struct KeyLookup<'a> {
     keys: &'a HashMap<String, Node>,
 }
@@ -155,20 +139,26 @@ impl<'de, 'a> Visitor<'de> for KeyLookup<'a> {
 }
 
 /// Walks one JSON value against one trie node.
-struct LevelSeed<'a> {
+struct LevelSeed<'a, 'de> {
     node: &'a Node,
-    out: &'a mut Vec<Option<String>>,
+    out: &'a mut Vec<Option<Cow<'de, str>>>,
 }
 
-impl LevelSeed<'_> {
-    fn capture_terminals(&mut self, value: Option<String>) {
-        for &id in &self.node.terminals {
-            self.out[id] = value.clone();
+impl<'de> LevelSeed<'_, 'de> {
+    fn capture_terminals(&mut self, value: Option<Cow<'de, str>>) {
+        match self.node.terminals.split_first() {
+            None => {}
+            Some((&first, rest)) => {
+                for &id in rest {
+                    self.out[id] = value.clone();
+                }
+                self.out[first] = value;
+            }
         }
     }
 }
 
-impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a> {
+impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a, 'de> {
     type Value = ();
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
@@ -176,7 +166,7 @@ impl<'de, 'a> DeserializeSeed<'de> for LevelSeed<'a> {
     }
 }
 
-impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
+impl<'de, 'a> Visitor<'de> for LevelSeed<'a, 'de> {
     type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -192,11 +182,9 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
                     m.next_value_seed(Skip)?;
                 }
                 Some(child) => {
-                    // Last-wins: a repeated key's earlier occurrence may have
-                    // descended and filled slots anywhere in `child`'s
-                    // subtree. Null the whole subtree before re-dispatching,
-                    // or a later occurrence that doesn't refill a slot leaves
-                    // the earlier occurrence's stale value behind.
+                    // Last-wins: an earlier occurrence may have filled slots
+                    // anywhere in `child`'s subtree, so null the whole subtree
+                    // before re-dispatching or its stale values survive.
                     for &id in &child.subtree_terminals {
                         self.out[id] = None;
                     }
@@ -220,10 +208,9 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
         loop {
             let indexed = node.indices.iter().find(|(i, _)| *i == position);
             let consumed = match (indexed, node.wildcard.as_deref()) {
-                // No unfilled-check here: `Projection::build` dedupes fixed
+                // No unfilled-check: `Projection::build` dedupes fixed
                 // subscripts by position, so this child is dispatched at most
-                // once per array, unlike the wildcard child below, which is a
-                // candidate at every position.
+                // once per array — unlike the wildcard child below.
                 (Some((_, child)), _) => s
                     .next_element_seed(LevelSeed {
                         node: child,
@@ -232,9 +219,7 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
                     .is_some(),
                 (None, Some(child)) => {
                     // Existential, not last-wins: `visit_values` short-circuits
-                    // on the first element that yields a scalar, so once every
-                    // terminal under this wildcard is filled, later elements
-                    // must not overwrite it.
+                    // on the first element that yields a scalar.
                     let unfilled = child.subtree_terminals.iter().any(|&id| out[id].is_none());
                     if unfilled {
                         s.next_element_seed(LevelSeed {
@@ -256,38 +241,39 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
     }
 
     fn visit_str<E>(mut self, v: &str) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
+        Ok(())
+    }
+    /// The escape-free case: the scalar is a slice of the record itself.
+    fn visit_borrowed_str<E>(mut self, v: &'de str) -> Result<(), E> {
+        self.capture_terminals(Some(Cow::Borrowed(v)));
         Ok(())
     }
     fn visit_string<E>(mut self, v: String) -> Result<(), E> {
-        self.capture_terminals(Some(v));
+        self.capture_terminals(Some(Cow::Owned(v)));
         Ok(())
     }
     fn visit_bool<E>(mut self, v: bool) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Borrowed(if v { "true" } else { "false" })));
         Ok(())
     }
     fn visit_i64<E>(mut self, v: i64) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
         Ok(())
     }
     fn visit_u64<E>(mut self, v: u64) -> Result<(), E> {
-        self.capture_terminals(Some(v.to_string()));
+        self.capture_terminals(Some(Cow::Owned(v.to_string())));
         Ok(())
     }
     fn visit_f64<E>(mut self, v: f64) -> Result<(), E> {
         // `f64::to_string()` disagrees with `Number`'s Display on float-lexed
-        // literals (`1.0` -> "1", `1.5e-7` -> decimal); match the `Value::Number`
-        // arm of `path::walk` (`resolve`'s scalar coercion) by going through
-        // `Number` itself. `from_f64` is `None` only for NaN/infinity, which
-        // JSON can't express, so `None` is correct there too.
-        self.capture_terminals(serde_json::Number::from_f64(v).map(|n| n.to_string()));
+        // literals (`1.0` -> "1"); go through `Number` to match `path::walk`.
+        // `from_f64` is `None` only for NaN/infinity, which JSON cannot express.
+        self.capture_terminals(serde_json::Number::from_f64(v).map(|n| Cow::Owned(n.to_string())));
         Ok(())
     }
-    // `null` (visit_unit) and a bare `visit_none` both yield nothing, same as
-    // the `Value::Null | Value::Object(_) | Value::Array(_)` arm of
-    // `path::walk` and visit_map/visit_seq above: the caller already nulled
-    // this node's whole subtree before dispatching here.
+    // `null` and a bare `visit_none` both yield nothing, as in `path::walk`:
+    // the caller already nulled this node's whole subtree before dispatching.
     fn visit_unit<E>(self) -> Result<(), E> {
         Ok(())
     }
@@ -297,19 +283,13 @@ impl<'de, 'a> Visitor<'de> for LevelSeed<'a> {
 }
 
 /// Consumes and discards one JSON value in a subtree the projection does not
-/// name -- but, unlike `serde::de::IgnoredAny`, still *validates* it.
+/// name — but, unlike `serde::de::IgnoredAny`, still *validates* it.
 ///
-/// `IgnoredAny` skips a value structurally without decoding string content
-/// (serde_json's `deserialize_ignored_any` fast path just scans past bytes),
-/// so a string escape serde_json's real string parser would reject -- most
-/// notably a lone UTF-16 surrogate half in a `\uXXXX` escape, which has no
-/// valid UTF-8/char encoding -- silently passes. `Skip` instead drives
-/// `deserialize_any`, the same entry point `serde_json::Value` uses: every
-/// string is routed through `visit_str`/`visit_borrowed_str`, which only run
-/// after serde_json has fully decoded the escape sequence, so a malformed one
-/// still surfaces as a deserialize error there. Maps and sequences recurse
-/// into `Skip` again so nested skipped subtrees get the same treatment; every
-/// visited value is otherwise dropped.
+/// `IgnoredAny` scans past a value without decoding string content, so a lone
+/// UTF-16 surrogate half in a `\uXXXX` escape silently passes where a full
+/// parse rejects it. `Skip` drives `deserialize_any` instead, the same entry
+/// point `serde_json::Value` uses, and recurses into itself for nested
+/// subtrees.
 struct Skip;
 
 impl<'de> DeserializeSeed<'de> for Skip {
@@ -444,8 +424,8 @@ mod tests {
             let projected = project(record, &proj).expect("must project");
             for (id, path) in p.iter().enumerate() {
                 assert_eq!(
-                    projected[id],
-                    first_value(&value, path),
+                    projected[id].as_deref(),
+                    first_value(&value, path).as_deref(),
                     "path {:?} diverged on record {record}",
                     specs[id]
                 );
@@ -453,9 +433,8 @@ mod tests {
         }
     }
 
-    /// Spec F6: a derived struct raises `duplicate field`; `Value` takes
-    /// last-wins. Projection must follow `Value`, or a record that drops today
-    /// would start being kept.
+    /// Projection must follow `Value`'s last-wins, not a derived struct's
+    /// `duplicate field` error, or a record that drops today would be kept.
     #[test]
     fn duplicate_keys_take_the_last_value() {
         let p = paths(&["eventName"]);
@@ -469,9 +448,6 @@ mod tests {
         );
     }
 
-    /// Spec F6: skipping a subtree must not skip validating it. An unparseable
-    /// record is KEPT by the pipeline, so projection must agree with a full
-    /// parse about what "unparseable" means.
     #[test]
     fn malformed_json_in_skipped_subtrees_still_errors() {
         let p = paths(&["eventName"]);
@@ -519,9 +495,8 @@ mod tests {
         assert!(res.wildcard.is_some());
     }
 
-    /// Finding 1: `f64::to_string()` and `serde_json::Number`'s Display
-    /// disagree on float-lexed literals. Regression for the specific literals
-    /// `testing::corpus` carries deliberately (see its module doc).
+    /// Regression for the specific literals `testing::corpus` carries
+    /// deliberately (see its module doc).
     #[test]
     fn numeric_agreement_with_visit_values() {
         let specs = ["value"];
@@ -540,8 +515,8 @@ mod tests {
             let value: Value = serde_json::from_str(record).expect("test record must parse");
             let projected = project(record, &proj).expect("must project");
             assert_eq!(
-                projected[0],
-                first_value(&value, &p[0]),
+                projected[0].as_deref(),
+                first_value(&value, &p[0]).as_deref(),
                 "numeric literal diverged on record {record}"
             );
         }
@@ -559,8 +534,8 @@ mod tests {
         let projected = project(json, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?} diverged",
                 specs[id]
             );
@@ -570,15 +545,9 @@ mod tests {
         assert_eq!(projected[3].as_deref(), Some("deep"));
     }
 
-    /// Finding 2's trap: a duplicate key whose first occurrence is a scalar
-    /// and whose second is a non-scalar must end `None` for its own terminal
-    /// (last-wins, and the second, object value yields nothing) while still
-    /// descending into the second occurrence's children. A plain single path
-    /// (no sibling branch) already passes against the unfixed code here,
-    /// because its `ScalarSeed` fallback happens to null out every duplicate
-    /// regardless of descent -- so this uses a terminal-and-branch key
-    /// (`eventName` / `eventName.x`) to force a real descent, which is what
-    /// actually exposes a fix that forgets to clear stale terminals.
+    /// Uses a terminal-and-branch key (`eventName` / `eventName.x`) to force a
+    /// real descent: a plain single path passes even against the unfixed code,
+    /// because its `ScalarSeed` fallback nulls every duplicate regardless.
     #[test]
     fn duplicate_key_second_occurrence_non_scalar_yields_none() {
         let p = paths(&["eventName", "eventName.x"]);
@@ -603,11 +572,8 @@ mod tests {
         assert_eq!(projected[1].as_deref(), Some("1"));
     }
 
-    /// Reverse-order variant of `duplicate_key_second_occurrence_non_scalar_yields_none`:
-    /// the branch occurrence comes *first* and the scalar occurrence *last*, so
-    /// last-wins means the final value is the scalar and the descendant slot
-    /// filled by the earlier object occurrence must be cleared, not just the
-    /// terminal at the shared node.
+    /// Reverse order: the branch occurrence first, the scalar last, so the
+    /// descendant slot the earlier object filled must be cleared too.
     #[test]
     fn duplicate_key_reverse_order_clears_stale_descendant() {
         let p = paths(&["eventName", "eventName.x"]);
@@ -617,8 +583,8 @@ mod tests {
         let projected = project(json, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?} diverged",
                 p[id]
             );
@@ -634,9 +600,6 @@ mod tests {
         );
     }
 
-    /// Object-then-object shadowing on a branch-only node (no terminal at the
-    /// shared key itself): the second `a` never mentions `b`, so `a.b` must
-    /// end `None` even though the first `a` filled it.
     #[test]
     fn duplicate_object_shadows_descendant_with_no_parent_terminal() {
         let p = paths(&["a.b"]);
@@ -696,8 +659,8 @@ mod tests {
         let projected = project(record, &proj).expect("must project");
         for (id, path) in p.iter().enumerate() {
             assert_eq!(
-                projected[id],
-                first_value(&value, path),
+                projected[id].as_deref(),
+                first_value(&value, path).as_deref(),
                 "path {:?}",
                 specs[id]
             );
@@ -737,17 +700,10 @@ mod tests {
         assert!(!Projection::build(&p).has_wildcard());
     }
 
-    /// Documents a known limitation, not a desired property: when a fixed
-    /// index and a wildcard share the same array node (see
-    /// `records_index_and_wildcard_children`), `visit_seq` gives the indexed
-    /// child priority at that position, so the wildcard child never sees that
-    /// element. Here element 0 yields a scalar (`"a"`) and is skipped by the
-    /// wildcard for a structural reason, not because it failed the module's
-    /// own stated first-scalar rule -- and `visit_values`'s existential
-    /// short-circuit lands on that same element 0, so the two disagree. This
-    /// is exactly why `has_wildcard()` forces `Engine::evaluate_raw` to fall
-    /// back to a full parse whenever a wildcard path is present: it is not an
-    /// optional optimization, it is required for correctness.
+    /// A known limitation, not a desired property: when a fixed index and a
+    /// wildcard share an array node, `visit_seq` gives the indexed child
+    /// priority at that position, so the two evaluators disagree on element 0.
+    /// This is why `has_wildcard()` forces the full-parse fallback.
     #[test]
     fn wildcard_sharing_a_node_with_a_fixed_index_skips_that_element() {
         let specs = ["resources[0].ARN", "resources[*].ARN"];
@@ -761,7 +717,8 @@ mod tests {
         assert_eq!(indexed, Some("a".to_string()));
         let projected = project(record, &proj).expect("must project");
         assert_eq!(
-            projected[0], indexed,
+            projected[0].as_deref(),
+            indexed.as_deref(),
             "fixed-index slot must agree with visit_values"
         );
 
@@ -771,9 +728,8 @@ mod tests {
             Some("a".to_string()),
             "baseline: visit_values existential wildcard takes element 0"
         );
-        // But project()'s wildcard child never gets to see element 0, because
-        // the indexed child at position 0 consumed it first -- so the
-        // wildcard slot lands on element 1 instead.
+        // The indexed child consumed element 0 first, so the wildcard slot
+        // lands on element 1 instead.
         assert_eq!(
             projected[1].as_deref(),
             Some("b"),
@@ -783,13 +739,9 @@ mod tests {
         );
     }
 
-    /// Differential test for fixed-subscript array paths, in the style of
-    /// `projection_agrees_with_visit_values`. Wildcard semantics deliberately
-    /// diverge from `visit_values` (first-scalar-wins vs. existential), so
-    /// this covers only `Segment::Index`: a class of array-projection bug
-    /// that has shipped twice, covering short array, scalar-not-object
-    /// element, `null` element, object instead of array, an empty array, and
-    /// an object element missing the queried key.
+    /// Covers only `Segment::Index` — wildcard semantics deliberately diverge
+    /// from `visit_values` — across short array, scalar element, `null`
+    /// element, object instead of array, empty array, and a missing key.
     #[test]
     fn projects_array_subscripts_agrees_with_visit_values() {
         let specs = ["resources[0].ARN", "resources[1].ARN", "resources[2].ARN"];
@@ -811,8 +763,8 @@ mod tests {
             let projected = project(record, &proj).expect("must project");
             for (id, path) in p.iter().enumerate() {
                 assert_eq!(
-                    projected[id],
-                    first_value(&value, path),
+                    projected[id].as_deref(),
+                    first_value(&value, path).as_deref(),
                     "path {:?} diverged on record {record}",
                     specs[id]
                 );
@@ -820,14 +772,9 @@ mod tests {
         }
     }
 
-    /// Spec F6 / T13: the contract `project()` documents is "errors exactly
-    /// when a full parse would," which is exactly what `IgnoredAny` breaks --
-    /// it skips a value's bytes structurally without decoding string escapes,
-    /// so a lone UTF-16 surrogate half deep in a subtree the projection never
-    /// names silently parses as OK where a full `Value` parse rejects it. Each
-    /// case here plants its malformation inside `"other"`, a key no path in
-    /// `p` names, so it only exercises the skip path (`Skip`, formerly
-    /// `IgnoredAny`) -- never the captured (`"eventName"`) path.
+    /// Each case plants its malformation inside `"other"`, a key no path in `p`
+    /// names, so it exercises only the skip path — where `IgnoredAny` used to
+    /// accept escapes a full parse rejects.
     #[test]
     fn skip_path_agrees_with_full_parse_on_malformed_escapes() {
         let p = paths(&["eventName"]);
@@ -881,14 +828,8 @@ mod tests {
         }
     }
 
-    /// Same malformation table as
-    /// `skip_path_agrees_with_full_parse_on_malformed_escapes`, but the
-    /// malformed string now lives inside a *projected* subtree
-    /// (`"eventName"` itself), exercising `LevelSeed::visit_str` /
-    /// `visit_map`'s captured-key path rather than `Skip`. This path goes
-    /// through serde_json's real string decoding regardless -- it was never
-    /// broken -- so this pins that it still isn't, now that `Skip` exists
-    /// alongside it.
+    /// The same malformations inside a *projected* subtree, exercising
+    /// `LevelSeed`'s captured-key path rather than `Skip`.
     #[test]
     fn captured_path_agrees_with_full_parse_on_malformed_escapes() {
         let p = paths(&["eventName"]);
@@ -922,15 +863,9 @@ mod tests {
         }
     }
 
-    /// serde_json enforces a 128-level nesting limit when building a `Value`
-    /// (`recursion_limit` feature default). `Skip`'s recursion goes through
-    /// `deserialize_any`/`visit_seq`/`visit_map` on the *same*
-    /// `serde_json::Deserializer`, whose depth counter is incremented by the
-    /// deserializer itself (in `parse_array`/`parse_object`), not by which
-    /// `Visitor` is driving it -- so this checks the skip path enforces the
-    /// identical limit rather than assuming it, per T13's instructions.
-    /// Measured directly: depth 128 already errors on both sides (127 nested
-    /// arrays parse fine, 128 do not), and they agree at every depth tried.
+    /// serde_json's 128-level nesting limit is enforced by the deserializer
+    /// itself, not by the driving `Visitor` — checked rather than assumed, since
+    /// `Skip` recurses through the same `Deserializer`.
     #[test]
     fn skip_path_enforces_the_same_recursion_limit_as_a_full_parse() {
         let p = paths(&["eventName"]);

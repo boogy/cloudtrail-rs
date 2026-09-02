@@ -1,13 +1,10 @@
-//! Integration tests against a real MiniStack container (`docker-compose.test.yml`,
-//! `ministackorg/ministack` on `:4566`), driving the **real** `S3ObjectStore` and
-//! `SsmConfigSource` adapters through the full `Pipeline::handle` path: real S3
-//! `GetObject`/`PutObject`/multipart, real SSM `GetParameter` for the ruleset.
+//! Integration tests against a real MiniStack container, driving the **real**
+//! `S3ObjectStore` and `SsmConfigSource` adapters through `Pipeline::handle`.
 //!
 //! Every test is `#[ignore]` so `cargo test --workspace` skips this suite (it
-//! must still *compile*); run it with the container up via
+//! must still compile). Bring the container up with
+//! `docker compose -f docker-compose.test.yml up -d`, then run
 //! `cargo test --workspace -- --ignored`.
-//!
-//! Bring the container up with `docker compose -f docker-compose.test.yml up -d`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -61,11 +58,9 @@ fn ministack_sdk_config() -> SdkConfig {
         .build()
 }
 
-/// Builds a path-style S3 client directly (bypassing `S3ObjectStore::new`,
-/// which builds a virtual-hosted-style client suited to real AWS).
-/// `S3ObjectStore::from_client` accepts an already-built client for exactly
-/// this reason — see the report for why this doesn't require touching
-/// `crates/aws/src/`.
+/// A path-style S3 client, bypassing `S3ObjectStore::new`'s virtual-hosted-style
+/// one. `from_client` exists so tests can substitute this without production
+/// code learning about test endpoints.
 fn s3_client(conf: &SdkConfig) -> aws_sdk_s3::Client {
     let s3_conf = aws_sdk_s3::config::Builder::from(conf)
         .credentials_provider(S3Credentials::new(
@@ -190,10 +185,8 @@ fn cloudtrail_body(count: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// The S3 bucket-notification JSON payload `S3EventDecoder` expects, naming
-/// exactly one object. `size` drives `Pipeline`'s auto buffer/stream
-/// decision (safety invariant 5) — it need not equal the
-/// object's real byte count (S3 always sends the true size; here we control
-/// it directly to deterministically select a processing mode).
+/// exactly one object. `size` drives the auto buffer/stream decision; real S3
+/// always sends the true size, here it is set explicitly to select a mode.
 fn s3_event_payload(bucket: &str, key: &str, size: u64) -> Vec<u8> {
     format!(
         r#"{{"Records":[{{"s3":{{"bucket":{{"name":"{bucket}"}},"object":{{"key":"{key}","size":{size}}}}}}}]}}"#
@@ -299,9 +292,8 @@ async fn large_object_stream_mode_uses_real_multipart_upload() {
     ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
 
     let key = "ministack-tests/stream/cloudtrail-large.json.gz";
-    // 20_000 distinct records defeats gzip's redundancy compression enough
-    // to comfortably clear the lowered stream_threshold_bytes below with a
-    // real object, not a fabricated size.
+    // Distinct records defeat gzip's redundancy compression enough to clear the
+    // lowered stream_threshold_bytes with a real object, not a fabricated size.
     let (body, expected_body) = cloudtrail_body(20_000);
     let gzipped = gzip_bytes(&body, 6);
 
@@ -314,12 +306,10 @@ async fn large_object_stream_mode_uses_real_multipart_upload() {
         .expect("seed source object");
 
     let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
-    // Lowered so the real (compressed) object size above deterministically
-    // selects stream mode under `auto`, and so the compressed *output*
-    // splits into several real multipart parts instead of just one.
-    // MiniStack, unlike real S3, does not enforce the 5 MiB minimum
-    // non-final part size, which is what makes a modestly-sized fixture
-    // sufficient to exercise genuine multipart upload/complete here.
+    // Lowered so the real compressed size selects stream mode under `auto` and
+    // the output splits into several real multipart parts. MiniStack does not
+    // enforce S3's 5 MiB minimum non-final part size, so a modest fixture is
+    // enough to exercise a genuine multipart upload.
     settings.processing.stream_threshold_bytes = 50_000;
     let settings = Arc::new(settings);
 
