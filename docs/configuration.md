@@ -145,9 +145,12 @@ object with the `rust_backend` (miniz_oxide) compressor:
 | **6 (default)** | **13.42 ms** | **198,063 B** | —                     |
 | 9               | 17.78 ms     | 189,557 B     | +33% time, −4% size   |
 
-The default of 6 optimises for storage, on the assumption that S3 storage and
-downstream read costs recur while compression CPU is paid once. Lower it to 4
-only if Lambda duration is the binding cost; level 9 is not worth it.
+This measures filter-core CPU only and excludes S3 network I/O, which likely
+dominates real wall-clock time, so the time column is an upper bound on what
+lowering the level saves end-to-end. The default of 6 optimises for storage,
+on the assumption that S3 storage and downstream read costs recur while
+compression CPU is paid once. Lower it to 4 only if Lambda duration is the
+binding cost; level 9 is not worth it.
 
 **miniz_oxide is not monotonic in level.** Level 3 produces _smaller and
 slower_ output than level 4 — neither dominates the other. Do not assume a
