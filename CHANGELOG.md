@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Zero-copy scalar capture in the projected parse.** Captured JSON scalars
+  are held as `Cow<'de, str>`: an escape-free scalar borrows a slice of the
+  record instead of allocating a `String` per captured field per record.
+  `evaluate_raw` improved **14.44%** (p<0.05) on `crates/core/benches/filter.rs`
+  (500 scaled records). A separate 4,000-record fixture with realistic entropy
+  measured 5.97 ms -> 4.88 ms (-19.7%); that fixture is not in the repo.
+- **Buffer-mode output body assembled in one allocation.** The previous
+  `join` + `format!` held two full copies of the body; one `Vec` pre-sized from
+  the survivors' lengths holds one. Throughput is unchanged — compression
+  dominates the per-object cost — so this is a peak-memory fix, not a speedup.
+- **Comments trimmed to the project standard across all eight crates.** 2,408
+  comment lines removed, 1,094 added, 31 non-comment lines touched.
+- `docs/configuration.md` no longer claims compression is "roughly 77% of
+  per-object CPU". That figure divided a whole-body compress by an end-to-end
+  run, and the stage shares it implied summed to 126%.
+
+### Added
+
+- **`deny.toml` pins the compressor backend.** `libz-sys`, `libz-ng-sys`,
+  `zlib-ng-sys`, `cloudflare-zlib-sys` and `zlib-rs` join the ban list. The
+  first four would put a C toolchain in the graph and break the static-musl /
+  ARM64 Lambda cross-build; `zlib-rs` is pure Rust and reaches the shipped
+  graph through flate2's own feature, but changes every output object's bytes.
+  The parity oracle cannot catch a backend swap, because it compares buffer
+  against stream and never against golden bytes.
+- **flate2 pinned to `rust_backend` in the four Lambda crates.** They declared
+  a bare `flate2 = "1"`, leaning on the default feature happening to mean
+  `rust_backend`; the other four crates already pinned it. These are
+  dev-dependencies and never reached a shipped binary — the pins are hygiene,
+  and `deny.toml` is what actually enforces the backend.
+- **A per-object cost profile in `docs/architecture.md`.** Stage timings for
+  one 4.5 MB / 4,000-record object: compression at 13.42 ms dominates filtering
+  at 5.97 ms, so any optimization that does not touch compression is bounded by
+  what is left.
+- **A measured `gzip_level` time/size frontier in `docs/configuration.md`**,
+  scoped to filter-core CPU and excluding S3 network I/O, so the time column
+  reads as an upper bound on what lowering the level saves end-to-end.
+
+### Testing
+
+- Two tests pin the `GzEncoder` byte-identity rules: `flush()` inserts a
+  DEFLATE sync-flush marker and changes the output bytes, while write
+  granularity does not. The no-flush invariant was documented but unenforced —
+  a `BufWriter` whose `flush()` forwarded to the encoder would silently break
+  buffer/stream byte parity.
+
 ## [0.5.0] - 2026-08-06
 
 Two changes to the filtering core, developed together because the second
