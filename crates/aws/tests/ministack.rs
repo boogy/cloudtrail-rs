@@ -188,10 +188,59 @@ fn cloudtrail_body(count: usize) -> (Vec<u8>, Vec<u8>) {
 /// exactly one object. `size` drives the auto buffer/stream decision; real S3
 /// always sends the true size, here it is set explicitly to select a mode.
 fn s3_event_payload(bucket: &str, key: &str, size: u64) -> Vec<u8> {
-    format!(
-        r#"{{"Records":[{{"s3":{{"bucket":{{"name":"{bucket}"}},"object":{{"key":"{key}","size":{size}}}}}}}]}}"#
+    s3_event_payload_many(bucket, &[(key, size)])
+}
+
+fn s3_event_payload_many(bucket: &str, objects: &[(&str, u64)]) -> Vec<u8> {
+    let records: Vec<String> = objects
+        .iter()
+        .map(|(key, size)| {
+            format!(
+                r#"{{"s3":{{"bucket":{{"name":"{bucket}"}},"object":{{"key":"{key}","size":{size}}}}}}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"Records":[{}]}}"#, records.join(",")).into_bytes()
+}
+
+/// Every port wired to the real MiniStack adapters, so a test only has to
+/// supply the `Settings` under examination.
+async fn ministack_pipeline(
+    s3: &aws_sdk_s3::Client,
+    ssm: &aws_sdk_ssm::Client,
+    settings: Settings,
+) -> Pipeline {
+    let metrics = Arc::new(Metrics::default());
+    let cfg_store = Arc::new(ConfigStore::new(
+        Arc::new(SsmConfigSource::from_client(ssm.clone(), RULES_PARAM)),
+        Duration::from_secs(300),
+        compile_engine(),
+        metrics.clone(),
+    ));
+    cfg_store.prime().await;
+    Pipeline::new(
+        Arc::new(settings),
+        Arc::new(S3EventDecoder::new()),
+        Arc::new(S3ObjectStore::from_client(s3.clone())),
+        cfg_store,
+        metrics,
+        Arc::new(NoopMetricsSink),
     )
-    .into_bytes()
+}
+
+async fn dest_bytes(s3: &aws_sdk_s3::Client, key: &str) -> Vec<u8> {
+    s3.get_object()
+        .bucket(DEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("destination object must exist")
+        .body
+        .collect()
+        .await
+        .expect("reading destination body")
+        .into_bytes()
+        .to_vec()
 }
 
 fn base_settings(dest_bucket: &str, rules_uri: String) -> Settings {
@@ -353,4 +402,109 @@ async fn large_object_stream_mode_uses_real_multipart_upload() {
         expected_body,
         "destination bytes must decompress to exactly the surviving Records"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn chunked_gzip_survives_a_real_s3_round_trip() {
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    // Comfortably over 4 x MIN_CHUNK_BYTES (64 KiB), so `gzip_chunks: 4`
+    // really emits four members rather than collapsing to one.
+    let (body, expected_body) = cloudtrail_body(12_000);
+    assert!(body.len() > 4 * 64 * 1024);
+    let gzipped = gzip_bytes(&body, 6);
+
+    let mut written = Vec::new();
+    for chunks in [1usize, 4] {
+        let key = format!("ministack-tests/chunks-{chunks}/cloudtrail.json.gz");
+        s3.put_object()
+            .bucket(SRC_BUCKET)
+            .key(&key)
+            .body(gzipped.clone().into())
+            .send()
+            .await
+            .expect("seed source object");
+
+        let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+        settings.processing.gzip_chunks = chunks;
+        // Force buffer mode: `gzip_chunks` is a buffer-mode setting.
+        settings.processing.mode = cloudtrail_rs_core::config::ProcessingMode::Buffer;
+        let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+        let payload = s3_event_payload(SRC_BUCKET, &key, gzipped.len() as u64);
+        let outcome = pipeline
+            .handle(&payload)
+            .await
+            .expect("pipeline.handle must succeed");
+        assert!(outcome.failed_ack_ids.is_empty());
+
+        let bytes = dest_bytes(&s3, &key).await;
+        assert_eq!(
+            gunzip(&bytes),
+            expected_body,
+            "chunks={chunks} must decompress to exactly the surviving Records"
+        );
+        written.push(bytes);
+    }
+
+    assert_ne!(
+        written[0], written[1],
+        "gzip_chunks: 4 must actually change the framing"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn concurrent_objects_all_land_correctly_in_real_s3() {
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let (body, expected_body) = cloudtrail_body(40);
+    let gzipped = gzip_bytes(&body, 6);
+    let keys: Vec<String> = (0..8)
+        .map(|i| format!("ministack-tests/concurrent/obj-{i}.json.gz"))
+        .collect();
+    for key in &keys {
+        s3.put_object()
+            .bucket(SRC_BUCKET)
+            .key(key)
+            .body(gzipped.clone().into())
+            .send()
+            .await
+            .expect("seed source object");
+    }
+
+    let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+    settings.processing.object_concurrency = 4;
+    let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+    let objects: Vec<(&str, u64)> = keys
+        .iter()
+        .map(|k| (k.as_str(), gzipped.len() as u64))
+        .collect();
+    let outcome = pipeline
+        .handle(&s3_event_payload_many(SRC_BUCKET, &objects))
+        .await
+        .expect("pipeline.handle must succeed");
+    assert!(outcome.failed_ack_ids.is_empty());
+
+    for key in &keys {
+        assert_eq!(
+            gunzip(&dest_bytes(&s3, key).await),
+            expected_body,
+            "{key} must decompress to exactly the surviving Records"
+        );
+    }
 }

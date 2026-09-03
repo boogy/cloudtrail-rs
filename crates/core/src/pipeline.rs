@@ -19,6 +19,7 @@ use crate::metrics::Metrics;
 use crate::model::{ObjectRef, PutMeta, SourceItem};
 use crate::ports::{EventDecoder, MetricsSink, ObjectStore};
 use crate::process::{DiscardStore, Outcome, buffer_run, stream_run};
+use futures_util::StreamExt;
 
 /// Metadata for every write this module performs, so the destination bucket is
 /// uniform regardless of which path wrote a given object.
@@ -26,6 +27,15 @@ const CANONICAL_META: PutMeta = PutMeta {
     content_type: "application/x-gzip",
     content_encoding: "gzip",
 };
+
+/// One object that survived every no-I/O pre-flight check, bound to the batch
+/// item that referenced it.
+struct Work<'a> {
+    item_idx: usize,
+    object: &'a ObjectRef,
+    dest_bucket: String,
+    dest_key: String,
+}
 
 /// Which `SourceItem::ack_id`s failed, for SQS `ReportBatchItemFailures`.
 /// Empty when every item succeeded, or when the topology has no ack ids.
@@ -140,9 +150,13 @@ impl Pipeline {
             )));
         }
 
-        let mut failed_ack_ids = Vec::new();
+        let mut item_failed = vec![false; items.len()];
+        let mut work: Vec<Work<'_>> = Vec::new();
 
-        for item in &items {
+        // Pass 1 — no I/O. Everything that can reject an object without
+        // touching S3 happens here, so the self-trigger guard still fires
+        // before the first `get` no matter what the concurrency is.
+        for (item_idx, item) in items.iter().enumerate() {
             if let Some(msg) = &item.decode_error {
                 self.metrics.add_decode_errors(1);
                 tracing::error!(ack_id = ?item.ack_id, error = %msg, "message body failed to decode");
@@ -150,9 +164,7 @@ impl Pipeline {
                 if self.settings.behavior.partial_batch_failures && item.ack_id.is_some() {
                     // Isolate to this message: it is redriven and retried
                     // instead of being deleted with its object unprocessed.
-                    if let Some(id) = &item.ack_id {
-                        failed_ack_ids.push(id.clone());
-                    }
+                    item_failed[item_idx] = true;
                     continue;
                 }
                 return Err(CoreError::Decode(DecodeError::InvalidPayload(msg.clone())));
@@ -161,8 +173,6 @@ impl Pipeline {
             if item.objects.is_empty() {
                 self.metrics.add_items_without_objects(1);
             }
-
-            let mut item_failed = false;
 
             for object in &item.objects {
                 if !self.key_allowed(&object.key) {
@@ -204,44 +214,72 @@ impl Pipeline {
                     });
                 }
 
-                let outcome = match &engine {
+                work.push(Work {
+                    item_idx,
+                    object,
+                    dest_bucket,
+                    dest_key,
+                });
+            }
+        }
+
+        // Pass 2 — the only pass that touches S3. `buffered` keeps results in
+        // submission order, so pass 3 below decides identically at any
+        // concurrency; at the default of 1 nothing is ever in flight when a
+        // result is inspected, making this byte-for-byte the sequential path.
+        let concurrency = self.settings.processing.object_concurrency;
+        let engine = engine.as_ref();
+        let mut in_flight = futures_util::stream::iter(work.iter())
+            .map(|w| async move {
+                match engine {
                     Some(engine) => {
-                        self.process_object(engine, object, &dest_bucket, &dest_key)
+                        self.process_object(engine, w.object, &w.dest_bucket, &w.dest_key)
                             .await
                     }
                     // on_config_error == open: raw byte copy, no decompress,
                     // parse or size check.
-                    None => self.raw_copy(object, &dest_bucket, &dest_key).await,
-                };
+                    None => self.raw_copy(w.object, &w.dest_bucket, &w.dest_key).await,
+                }
+            })
+            .buffered(concurrency);
 
-                if let Err(e) = outcome {
-                    // The only counter that moves under partial_batch_failures,
-                    // where the handler returns `Ok` and AWS `Errors` stays zero.
-                    self.metrics.add_objects_failed(1);
+        // Pass 3 — sequential adjudication in submission order.
+        let mut done = 0usize;
+        while let Some(outcome) = in_flight.next().await {
+            let w = &work[done];
+            done += 1;
 
-                    if self.settings.behavior.partial_batch_failures && item.ack_id.is_some() {
-                        // Fail the message but keep going: the poison pill
-                        // fails first on every redelivery too, so stopping here
-                        // means its siblings are never attempted once. Writes
-                        // are idempotent, so re-processing them is safe.
-                        tracing::error!(
-                            ack_id = ?item.ack_id,
-                            bucket = %object.bucket,
-                            key = %object.key,
-                            error = %e,
-                            "object failed; message will be re-driven"
-                        );
-                        item_failed = true;
-                    } else {
-                        return Err(e);
-                    }
+            if let Err(e) = outcome {
+                // The only counter that moves under partial_batch_failures,
+                // where the handler returns `Ok` and AWS `Errors` stays zero.
+                self.metrics.add_objects_failed(1);
+
+                let item = &items[w.item_idx];
+                if self.settings.behavior.partial_batch_failures && item.ack_id.is_some() {
+                    // Fail the message but keep going: the poison pill
+                    // fails first on every redelivery too, so stopping here
+                    // means its siblings are never attempted once. Writes
+                    // are idempotent, so re-processing them is safe.
+                    tracing::error!(
+                        ack_id = ?item.ack_id,
+                        bucket = %w.object.bucket,
+                        key = %w.object.key,
+                        error = %e,
+                        "object failed; message will be re-driven"
+                    );
+                    item_failed[w.item_idx] = true;
+                } else {
+                    return Err(e);
                 }
             }
-
-            if item_failed && let Some(id) = &item.ack_id {
-                failed_ack_ids.push(id.clone());
-            }
         }
+
+        let failed_ack_ids = items
+            .iter()
+            .zip(&item_failed)
+            .filter(|(_, failed)| **failed)
+            .filter_map(|(item, _)| item.ack_id.clone())
+            .collect();
 
         Ok(BatchOutcome { failed_ack_ids })
     }
@@ -677,7 +715,7 @@ mod tests {
     use crate::config::store::Compile;
     use crate::config::{Behavior, Destination, Observability, Processing, Rules, Source, Sqs};
     use crate::error::DecodeError;
-    use crate::model::VersionTag;
+    use crate::model::{MetricSnapshot, VersionTag};
     use crate::testing::{InMemoryStore, RecordingSink, StaticConfigSource};
     use async_trait::async_trait;
     use flate2::Compression;
@@ -2586,5 +2624,262 @@ rules:
             "a self-trigger must be visible as a failed object, not only as an AWS Errors data point"
         );
         assert_eq!(snapshots[0].objects_processed, 0);
+    }
+
+    /// Delays every `get` so a concurrent run has a wall-clock signature a
+    /// sequential one cannot produce.
+    struct SlowStore {
+        inner: Arc<InMemoryStore>,
+        delay: Box<dyn Fn(&str) -> std::time::Duration + Send + Sync>,
+    }
+
+    impl SlowStore {
+        fn flat(inner: Arc<InMemoryStore>, millis: u64) -> Self {
+            Self {
+                inner,
+                delay: Box::new(move |_| std::time::Duration::from_millis(millis)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for SlowStore {
+        async fn get(&self, b: &str, k: &str) -> Result<Bytes, StoreError> {
+            tokio::time::sleep((self.delay)(k)).await;
+            self.inner.get(b, k).await
+        }
+        async fn get_stream(
+            &self,
+            b: &str,
+            k: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+            tokio::time::sleep((self.delay)(k)).await;
+            self.inner.get_stream(b, k).await
+        }
+        async fn put(&self, b: &str, k: &str, body: Bytes, m: PutMeta) -> Result<(), StoreError> {
+            self.inner.put(b, k, body, m).await
+        }
+        async fn put_stream(
+            &self,
+            b: &str,
+            k: &str,
+            body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            m: PutMeta,
+        ) -> Result<(), StoreError> {
+            self.inner.put_stream(b, k, body, m).await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn object_concurrency_actually_overlaps_the_fetches() {
+        async fn elapsed_at(concurrency: usize) -> std::time::Duration {
+            let inner = Arc::new(InMemoryStore::new());
+            let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+            for n in 0..8 {
+                inner.seed("src-bucket", &format!("f{n}.json.gz"), body.clone());
+            }
+            let store = Arc::new(SlowStore::flat(inner, 25));
+
+            let metrics = Arc::new(Metrics::default());
+            let (config, _src) = config_store(no_op_rules(), metrics.clone());
+            let decoder = Arc::new(StubDecoder(vec![item(
+                None,
+                (0..8)
+                    .map(|n| object("src-bucket", &format!("f{n}.json.gz"), None))
+                    .collect(),
+            )]));
+
+            let mut settings = base_settings();
+            settings.processing.object_concurrency = concurrency;
+
+            let start = std::time::Instant::now();
+            Pipeline::new(
+                Arc::new(settings),
+                decoder,
+                store,
+                config,
+                metrics,
+                Arc::new(RecordingSink::new()),
+            )
+            .handle(b"{}")
+            .await
+            .expect("batch must succeed");
+            start.elapsed()
+        }
+
+        let sequential = elapsed_at(1).await;
+        let concurrent = elapsed_at(8).await;
+        assert!(
+            sequential.as_millis() >= 200,
+            "8 x 25ms serialized should cost ~200ms, got {sequential:?}"
+        );
+        assert!(
+            concurrent < sequential / 3,
+            "concurrency 8 must overlap the fetches: {concurrent:?} vs {sequential:?}"
+        );
+    }
+
+    async fn run_at_concurrency(
+        concurrency: usize,
+    ) -> (Arc<InMemoryStore>, BatchOutcome, MetricSnapshot) {
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin", "AssumeRole"]));
+        for n in 0..6 {
+            store.seed("src-bucket", &format!("f{n}.json.gz"), body.clone());
+        }
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![
+            item(
+                Some("ack-a"),
+                (0..3)
+                    .map(|n| object("src-bucket", &format!("f{n}.json.gz"), None))
+                    .collect(),
+            ),
+            item(
+                Some("ack-b"),
+                (3..6)
+                    .map(|n| object("src-bucket", &format!("f{n}.json.gz"), None))
+                    .collect(),
+            ),
+        ]));
+
+        let mut settings = base_settings();
+        settings.processing.object_concurrency = concurrency;
+
+        let sink = Arc::new(RecordingSink::new());
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink.clone(),
+        );
+        let outcome = pipeline.handle(b"{}").await.expect("batch must succeed");
+        let snapshot = sink
+            .snapshots()
+            .pop()
+            .expect("handle must emit exactly one snapshot");
+        (store, outcome, snapshot)
+    }
+
+    #[tokio::test]
+    async fn concurrent_objects_produce_the_same_destination_bytes_as_the_sequential_path() {
+        let (sequential, _, _) = run_at_concurrency(1).await;
+        let (concurrent, _, _) = run_at_concurrency(4).await;
+
+        for n in 0..6 {
+            let key = format!("f{n}.json.gz");
+            assert_eq!(
+                sequential.object("dest-bucket", &key),
+                concurrent.object("dest-bucket", &key),
+                "{key} must be byte-identical at any concurrency"
+            );
+            assert!(sequential.object("dest-bucket", &key).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_counter_is_identical_at_any_object_concurrency() {
+        let (_, _, sequential) = run_at_concurrency(1).await;
+        for concurrency in [2, 4, 8] {
+            let (_, _, concurrent) = run_at_concurrency(concurrency).await;
+            assert_eq!(
+                sequential, concurrent,
+                "concurrency {concurrency} moved a counter"
+            );
+        }
+        assert_eq!(sequential.objects_processed, 6);
+        assert!(sequential.records_in > 0);
+    }
+
+    async fn failure_at_concurrency(
+        concurrency: usize,
+        partial: bool,
+    ) -> Result<BatchOutcome, CoreError> {
+        let inner = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+        inner.seed("src-bucket", "good.json.gz", body);
+        // "miss-a" and "miss-b" are deliberately unseeded.
+
+        // Latency descending in submission order: whichever object was
+        // submitted first finishes last, so a result paired by completion
+        // order instead of submission order picks the wrong one.
+        let store = Arc::new(SlowStore {
+            inner,
+            delay: Box::new(|k| {
+                let millis = match k {
+                    "good.json.gz" => 60,
+                    "miss-a.json.gz" => 40,
+                    _ => 10,
+                };
+                std::time::Duration::from_millis(millis)
+            }),
+        });
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![
+            item(
+                Some("ack-first"),
+                vec![
+                    object("src-bucket", "good.json.gz", None),
+                    object("src-bucket", "miss-a.json.gz", None),
+                ],
+            ),
+            item(
+                Some("ack-second"),
+                vec![object("src-bucket", "miss-b.json.gz", None)],
+            ),
+        ]));
+
+        let mut settings = base_settings();
+        settings.behavior.on_missing_object = OnMissingObject::Error;
+        settings.behavior.partial_batch_failures = partial;
+        settings.processing.object_concurrency = concurrency;
+
+        Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store,
+            config,
+            metrics,
+            Arc::new(RecordingSink::new()),
+        )
+        .handle(b"{}")
+        .await
+    }
+
+    #[tokio::test]
+    async fn concurrent_objects_report_failed_ack_ids_in_source_item_order() {
+        for concurrency in [1, 2, 8] {
+            let outcome = failure_at_concurrency(concurrency, true)
+                .await
+                .expect("partial_batch_failures=true must not fail the whole batch");
+            assert_eq!(
+                outcome.failed_ack_ids,
+                vec!["ack-first".to_string(), "ack-second".to_string()],
+                "concurrency {concurrency} changed the ack-id set or its order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_objects_surface_the_lowest_indexed_failure_when_partial_is_off() {
+        for concurrency in [1, 2, 8] {
+            let err = failure_at_concurrency(concurrency, false)
+                .await
+                .expect_err("partial_batch_failures=false must fail the whole batch");
+            match err {
+                CoreError::Store(StoreError::NotFound { key, .. }) => assert_eq!(
+                    key, "miss-a.json.gz",
+                    "concurrency {concurrency} must still report the first failure in \
+                     submission order, not whichever finished first"
+                ),
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+        }
     }
 }

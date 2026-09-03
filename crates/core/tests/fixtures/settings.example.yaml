@@ -11,6 +11,8 @@ processing:
   max_object_bytes: 134217728     # BUFFER MODE ONLY — decompressed guard
   multipart_part_bytes: 8388608   # stream mode
   gzip_level: 6
+  object_concurrency: 1           # objects in flight per batch
+  gzip_chunks: 1                  # BUFFER MODE ONLY — parallel gzip members
 behavior:
   dry_run: false                  # evaluate + count, forward everything
   on_config_error: open           # open | closed   (DEFAULT: open)

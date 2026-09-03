@@ -1089,6 +1089,14 @@ fn cmd_validate_settings(path: Option<&Path>) -> anyhow::Result<()> {
         settings.processing.gzip_level
     );
     println!(
+        "  processing.object_concurrency:     {}",
+        settings.processing.object_concurrency
+    );
+    println!(
+        "  processing.gzip_chunks:            {}",
+        settings.processing.gzip_chunks
+    );
+    println!(
         "  destination.bucket:                {}",
         settings.destination.bucket
     );

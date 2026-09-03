@@ -25,10 +25,11 @@ serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10.0"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "rt", "sync", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "time", "test-util"] }
 criterion = { version = "0.8", default-features = false }
 proptest = "1"
 

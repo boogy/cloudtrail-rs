@@ -19,6 +19,14 @@ const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 /// is rejected at config load.
 const MAX_GZIP_LEVEL: u32 = 9;
 
+/// Upper bound on `processing.gzip_chunks`. Past this the per-member framing
+/// and ratio loss outgrow the parallelism.
+const MAX_GZIP_CHUNKS: usize = 16;
+
+/// Upper bound on `processing.object_concurrency`. Past this the memory
+/// multiplier dominates any latency win.
+const MAX_OBJECT_CONCURRENCY: usize = 64;
+
 /// How an object's size determines buffer vs. stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub enum ProcessingMode {
@@ -186,6 +194,13 @@ fn default_multipart_part_bytes() -> u64 {
 fn default_gzip_level() -> u32 {
     6
 }
+fn default_object_concurrency() -> usize {
+    1
+}
+
+fn default_gzip_chunks() -> usize {
+    1
+}
 fn default_partial_batch_failures() -> bool {
     true
 }
@@ -287,6 +302,16 @@ pub struct Processing {
     pub multipart_part_bytes: u64,
     #[serde(default = "default_gzip_level")]
     pub gzip_level: u32,
+    /// How many of a batch's objects may be in flight at once. Each one holds
+    /// its own decompressed body, so this multiplies peak memory.
+    #[serde(default = "default_object_concurrency")]
+    pub object_concurrency: usize,
+
+    /// How many independently-deflated gzip members buffer mode splits its
+    /// output into. `1` emits a single member; above that, compression runs on
+    /// that many threads and the output grows slightly.
+    #[serde(default = "default_gzip_chunks")]
+    pub gzip_chunks: usize,
 }
 
 impl Default for Processing {
@@ -297,6 +322,8 @@ impl Default for Processing {
             max_object_bytes: default_max_object_bytes(),
             multipart_part_bytes: default_multipart_part_bytes(),
             gzip_level: default_gzip_level(),
+            object_concurrency: default_object_concurrency(),
+            gzip_chunks: default_gzip_chunks(),
         }
     }
 }
@@ -476,6 +503,10 @@ impl Document {
             self.processing.multipart_part_bytes = v
         })?;
         apply(env, "CT_GZIP_LEVEL", |v| self.processing.gzip_level = v)?;
+        apply(env, "CT_OBJECT_CONCURRENCY", |v| {
+            self.processing.object_concurrency = v
+        })?;
+        apply(env, "CT_GZIP_CHUNKS", |v| self.processing.gzip_chunks = v)?;
         apply(env, "CT_DRY_RUN", |v| self.behavior.dry_run = v)?;
         apply(env, "CT_ON_CONFIG_ERROR", |v| {
             self.behavior.on_config_error = v
@@ -528,6 +559,27 @@ impl Document {
                  (9 = best compression) — flate2's rust_backend panics on higher values, on the \
                  first object processed, not at startup",
                 self.processing.gzip_level
+            )));
+        }
+
+        if self.processing.object_concurrency == 0
+            || self.processing.object_concurrency > MAX_OBJECT_CONCURRENCY
+        {
+            return Err(ConfigError::Parse(format!(
+                "processing.object_concurrency {} is out of range: must be 1..={MAX_OBJECT_CONCURRENCY}. \
+                 Each in-flight object holds its own decompressed body, so this multiplies peak \
+                 memory by up to processing.max_object_bytes per slot",
+                self.processing.object_concurrency
+            )));
+        }
+
+        if self.processing.gzip_chunks == 0 || self.processing.gzip_chunks > MAX_GZIP_CHUNKS {
+            return Err(ConfigError::Parse(format!(
+                "processing.gzip_chunks {} is out of range: must be 1..={MAX_GZIP_CHUNKS}. \
+                 Above 1, buffer mode emits a multi-member gzip and compresses on that many \
+                 threads: the payload is unchanged but the object grows and only pays on a \
+                 Lambda with more than one vCPU",
+                self.processing.gzip_chunks
             )));
         }
 
