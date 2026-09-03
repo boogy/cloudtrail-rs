@@ -86,6 +86,7 @@ cloudtrail-rs validate-settings examples/settings.example.yaml
 #   processing.object_concurrency:     1
 #   processing.gzip_chunks:            1
 #   behavior.on_parse_error:           Copy
+#   behavior.on_object_too_large:      Stream
 #   destination.bucket:                ct-siem-sync
 #   rules.uri:                         s3://sec-config/cloudtrail/rules.yaml
 echo $?   # 0
@@ -153,6 +154,7 @@ Honoured:
 | `behavior.dry_run`                  | Evaluate and count every record, write nothing. Selects the destination, not the mode: an object that would stream is still previewed through stream mode (into a discard destination), so the preview's verdict is the real run's verdict.        |
 | `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                                                       |
 | `behavior.on_parse_error`           | `copy` (default) \| `error` for an object whose bytes will not parse at all — bad gzip, truncated, or not JSON. `copy` forwards it verbatim so nothing is lost to a parse failure.                                                                  |
+| `behavior.on_object_too_large`      | `stream` (default) \| `error` for an object whose body exceeds `processing.max_object_bytes`. `stream` re-runs it through stream mode, which has no size cap and filters it normally.                                                             |
 
 Ignored, because the command line already says it or there is no Lambda around
 it: `destination.*` (`dest` is the destination), `rules.*` (`--rules` is),

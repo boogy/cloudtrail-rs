@@ -65,6 +65,7 @@ behavior:
   on_missing_object: error # error | skip
   on_unrecognized_object: copy # copy | skip | error
   on_parse_error: copy # copy | error — an object that will not parse at all
+  on_object_too_large: stream # stream | error — an object over max_object_bytes
   partial_batch_failures: true # SQS only
 sqs:
   body_format: auto # auto | s3 | sns — set explicitly to skip the sniff
@@ -103,6 +104,7 @@ observability:
 | `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                                                                                  | `error`                                 |
 | `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                                                                                      | `copy`                                  |
 | `CT_ON_PARSE_ERROR`           | `behavior.on_parse_error`           | `copy` \| `error` for an object that will not parse at all. See [Fail-open: what happens to an object that will not parse](#fail-open-what-happens-to-an-object-that-will-not-parse).                                                               | `copy`                                  |
+| `CT_ON_OBJECT_TOO_LARGE`      | `behavior.on_object_too_large`      | `stream` \| `error` for an object whose body exceeds `processing.max_object_bytes`.                                                                                                                                                                | `stream`                                |
 | `CT_PARTIAL_BATCH_FAILURES`   | `behavior.partial_batch_failures`   | SQS only — `true` returns `batchItemFailures` for just the failed items; `false` fails the whole batch. See the [SQS warning](deployment.md#sqs-reportbatchitemfailures-is-not-optional).                                                          | `true`                                  |
 | `CT_SQS_BODY_FORMAT`          | `sqs.body_format`                   | `auto` \| `s3` \| `sns` — set explicitly to skip the SQS body-shape sniff. A body that does not match the format you declared fails the message (it is redelivered, then DLQ'd) rather than acking with zero objects.                              | `auto`                                  |
 | `CT_RULES_URI`                | `rules.uri`                         | `ssm://` \| `s3://` \| `file://` location of the exclusion-rules document.                                                                                                                                                                         | `s3://sec-config/cloudtrail/rules.yaml` |
@@ -127,6 +129,9 @@ observability:
 - **`on_parse_error`** (`copy` \| `error`) — the object's bytes will not parse
   at all: bad gzip, truncated, or not JSON. `copy` forwards it verbatim, `error`
   fails the object. See below.
+- **`on_object_too_large`** (`stream` \| `error`) — the object's body exceeds
+  `processing.max_object_bytes`. `stream` re-runs it through stream mode, which
+  has no size cap and filters it normally; `error` fails the object. See below.
 - **`processing.mode`** — see
   [buffer vs stream](architecture.md#processing-modes-buffer-vs-stream).
 
@@ -170,11 +175,30 @@ you actively work the DLQ.
 Two things `on_parse_error` deliberately does not cover, because neither is a
 parse failure:
 
-- **`ObjectTooLarge`.** In `auto` mode the object is retried through stream
-  mode, which has no size cap. Under an explicit `mode: buffer` it stays an
-  error — that mode opted out of streaming.
+- **`ObjectTooLarge`** — that is `on_object_too_large`'s business, below.
+  Copying such an object verbatim would forward it *unfiltered*; streaming it
+  filters it properly, so `on_parse_error` would be the worse tool.
 - **Store failures.** A failed `GetObject` or `PutObject` must retry. Copying on
   a destination outage would report success for a write that never landed.
+
+#### An object bigger than `max_object_bytes`
+
+`processing.max_object_bytes` bounds what buffer mode holds in memory. It says
+nothing about whether an object is acceptable — an object over the cap is fine,
+the path picked for it is not. So the default, `on_object_too_large: stream`,
+re-runs that object through stream mode, which has no size cap and filters it
+exactly as buffer mode would; the output is byte-identical. The cost is a second
+`GetObject`, logged at `warn`.
+
+This applies in every `processing.mode`, including an explicit `mode: buffer`.
+That mode is a routing preference, and honouring it to the point of dropping an
+object would lose data the SIEM needs. A recurring warn is the signal to raise
+`max_object_bytes` or the function's memory, not something to leave running.
+
+Set `on_object_too_large: error` to fail the object instead. That is the right
+choice only if you want a hard size ceiling on ingest and you work the DLQ:
+the failure is deterministic, so the object fails on every redrive and its
+records never arrive.
 
 Watch `ObjectsCopiedUnparsed`: a non-zero rate means objects are arriving that
 this filter cannot read at all. It is doing the safe thing with them, but the

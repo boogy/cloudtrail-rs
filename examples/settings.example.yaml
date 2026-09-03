@@ -19,6 +19,7 @@ behavior:
   on_missing_object: error        # error | skip
   on_unrecognized_object: copy    # copy | skip | error
   on_parse_error: copy            # copy | error — unparsable object: forward it verbatim
+  on_object_too_large: stream     # stream | error — over max_object_bytes: filter it via stream mode
   partial_batch_failures: true    # SQS only
 sqs:
   body_format: auto               # auto | s3 | sns — set explicitly to skip the sniff

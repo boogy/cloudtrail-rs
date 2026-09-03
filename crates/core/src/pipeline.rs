@@ -10,7 +10,8 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::config::settings::{
-    KeyFilter, OnConfigError, OnMissingObject, OnParseError, OnUnrecognizedObject, ProcessingMode,
+    KeyFilter, OnConfigError, OnMissingObject, OnObjectTooLarge, OnParseError,
+    OnUnrecognizedObject, ProcessingMode,
 };
 use crate::config::{ConfigStore, Settings};
 use crate::error::{CoreError, DecodeError, StoreError};
@@ -457,21 +458,20 @@ impl Pipeline {
                         .await
                 };
                 match result {
-                    // Auto picked Buffer off a *compressed*-size estimate; the
-                    // decompressed body can still blow `max_object_bytes`, and
-                    // without this retry that object is a permanent poison pill.
-                    // Explicit `mode: buffer` opted out of stream mode, so
-                    // ObjectTooLarge must still surface there.
+                    // `max_object_bytes` caps buffer-mode memory, so blowing
+                    // it says the path was wrong, not the object. Without the
+                    // retry that object is a permanent poison pill.
                     Err(CoreError::ObjectTooLarge { limit })
-                        if self.settings.processing.mode == ProcessingMode::Auto =>
+                        if self.settings.behavior.on_object_too_large
+                            == OnObjectTooLarge::Stream =>
                     {
                         tracing::warn!(
                             bucket = %object.bucket,
                             key = %object.key,
                             limit,
                             dry_run,
-                            "buffer mode exceeded max_object_bytes in auto mode; retrying via \
-                             stream mode (bounded memory, no size cap)"
+                            "buffer mode exceeded max_object_bytes; retrying via stream mode \
+                             (bounded memory, no size cap)"
                         );
                         if dry_run {
                             self.process_dry_run_stream(engine, object).await
@@ -509,10 +509,10 @@ impl Pipeline {
         };
         let result = buffer_run(&bytes, engine, &self.settings.processing);
 
-        // Auto mode's `ObjectTooLarge` retry counts its own bytes; billing here
+        // The `ObjectTooLarge` stream retry counts its own bytes; billing here
         // too would report the preview ingesting the object twice.
         let retried_via_stream = matches!(result, Err(CoreError::ObjectTooLarge { .. }))
-            && self.settings.processing.mode == ProcessingMode::Auto;
+            && self.settings.behavior.on_object_too_large == OnObjectTooLarge::Stream;
         if !retried_via_stream {
             self.metrics.add_bytes_in(bytes.len() as u64);
         }
@@ -611,7 +611,7 @@ impl Pipeline {
         // Skipped for the one case `process_object` retries through
         // `process_stream`, which counts the bytes it reads itself.
         let retried_via_stream = matches!(result, Err(CoreError::ObjectTooLarge { .. }))
-            && self.settings.processing.mode == ProcessingMode::Auto;
+            && self.settings.behavior.on_object_too_large == OnObjectTooLarge::Stream;
         if !retried_via_stream {
             self.metrics.add_bytes_in(bytes.len() as u64);
         }
@@ -739,7 +739,7 @@ impl Pipeline {
     /// Whether `e` is an object whose own bytes would not parse — bad gzip,
     /// truncated, or not JSON — under `behavior.on_parse_error == copy`.
     /// Deliberately narrow: a `Store` failure must still retry, and
-    /// `ObjectTooLarge` is `auto` mode's stream retry, not a parse failure.
+    /// `ObjectTooLarge` is `on_object_too_large`'s business, not a parse failure.
     fn copies_unparsable(&self, e: &CoreError) -> bool {
         self.settings.behavior.on_parse_error == OnParseError::Copy
             && matches!(e, CoreError::Gzip(_) | CoreError::Json(_))
@@ -1332,9 +1332,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn explicit_buffer_mode_still_fails_object_too_large_without_retry() {
-        // Same setup, but `mode: buffer` is explicit — ObjectTooLarge must
-        // surface as an error rather than being retried.
+    async fn on_object_too_large_error_fails_the_object_without_retrying() {
         let store = Arc::new(InMemoryStore::new());
         let body = gzip_bytes(&cloudtrail_body(&[
             "ConsoleLogin",
@@ -1354,6 +1352,7 @@ rules:
         let mut settings = base_settings();
         settings.processing.mode = ProcessingMode::Buffer;
         settings.processing.max_object_bytes = 10;
+        settings.behavior.on_object_too_large = OnObjectTooLarge::Error;
 
         let pipeline = Pipeline::new(
             Arc::new(settings),
@@ -1367,12 +1366,61 @@ rules:
         let err = pipeline
             .handle(b"{}")
             .await
-            .expect_err("explicit buffer mode must not retry via stream");
+            .expect_err("on_object_too_large: error must not retry via stream");
         assert!(
             matches!(err, CoreError::ObjectTooLarge { .. }),
             "got {err:?}"
         );
         assert!(!store.contains("dest-bucket", "file.json.gz"));
+    }
+
+    #[tokio::test]
+    async fn explicit_buffer_mode_streams_an_object_too_large_by_default() {
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&[
+            "ConsoleLogin",
+            "AssumeRole",
+            "StopInstances",
+        ]));
+        store.seed("src-bucket", "file.json.gz", body);
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", None)],
+        )]));
+
+        let mut settings = base_settings();
+        settings.processing.mode = ProcessingMode::Buffer;
+        settings.processing.max_object_bytes = 10;
+
+        let sink = Arc::new(RecordingSink::new());
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            Arc::clone(&sink) as Arc<dyn MetricsSink>,
+        );
+
+        pipeline
+            .handle(b"{}")
+            .await
+            .expect("the object must be delivered, not lost to the memory cap");
+        assert!(
+            store.contains("dest-bucket", "file.json.gz"),
+            "an object over max_object_bytes must still reach the destination"
+        );
+
+        let snapshot = sink.snapshots().pop().expect("handle emits one snapshot");
+        assert_eq!(snapshot.objects_processed, 1);
+        assert_eq!(snapshot.objects_failed, 0);
+        assert_eq!(
+            snapshot.records_in, 3,
+            "the streamed retry must filter the object, not copy it blind"
+        );
     }
 
     /// Reads like `InMemoryStore`, but every write fails.
@@ -2483,9 +2531,10 @@ rules:
         let sink = Arc::new(RecordingSink::new());
 
         let mut settings = base_settings();
-        // Explicit buffer mode: auto would retry via stream and mask the cap.
         settings.processing.mode = ProcessingMode::Buffer;
         settings.processing.max_object_bytes = 64;
+        // Otherwise the stream retry recovers the object and masks the cap.
+        settings.behavior.on_object_too_large = OnObjectTooLarge::Error;
 
         let pipeline = Pipeline::new(
             Arc::new(settings),

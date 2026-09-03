@@ -15,10 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `error` for the previous behavior (fail the object, DLQ it, alert). Copies
   are counted by the new `ObjectsCopiedUnparsed` metric; the object arrives
   unfiltered, so a non-zero count means exclusion rules did not apply to it.
-  The policy deliberately does not cover `ObjectTooLarge` (auto mode already
-  retries those in stream mode) or destination-store failures (those must
-  retry). Individual malformed _records_ were already kept in both modes and
-  are unaffected.
+  The policy deliberately does not cover `ObjectTooLarge` (that is
+  `on_object_too_large`'s job, and copying such an object would forward it
+  unfiltered) or destination-store failures (those must retry). Individual
+  malformed _records_ were already kept in both modes and are unaffected.
+- **`behavior.on_object_too_large` (`CT_ON_OBJECT_TOO_LARGE`), default
+  `stream`.** An object whose body exceeds `processing.max_object_bytes` is now
+  retried through stream mode in **every** `processing.mode`, not only `auto`.
+  The cap bounds buffer-mode memory, so exceeding it says the path was wrong,
+  not the object; stream mode has no size cap and filters it to byte-identical
+  output. Previously an explicit `mode: buffer` turned such an object into a
+  deterministic poison pill: it failed, was re-driven, failed again, and its
+  records reached the SIEM only if someone worked the DLQ. Set it to `error`
+  to keep that hard ceiling.
+
 - **`processing.object_concurrency` (`CT_OBJECT_CONCURRENCY`), default `1`.**
   Bounds how many of a batch's objects are fetched, filtered and written at
   once. The default is fully sequential, so behavior and output bytes are

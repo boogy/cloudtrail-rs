@@ -17,8 +17,8 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{
-    Behavior, ConfigUri, KeyFilter, OnParseError, OnUnrecognizedObject, Processing, ProcessingMode,
-    RuleSet, Settings, Source,
+    Behavior, ConfigUri, KeyFilter, OnObjectTooLarge, OnParseError, OnUnrecognizedObject,
+    Processing, ProcessingMode, RuleSet, Settings, Source,
 };
 use cloudtrail_rs_core::error::{CoreError, StoreError};
 use cloudtrail_rs_core::filter::{Decision, Engine};
@@ -167,8 +167,9 @@ struct SrcObject {
 
 /// The parts of a settings document `filter` honours, resolved once per run:
 /// `processing.*`, `source.*` (via [`KeyFilter`]), `behavior.dry_run` and
-/// `behavior.on_unrecognized_object` / `behavior.on_parse_error` — the settings
-/// that change what a backfill selects and writes.
+/// `behavior.on_unrecognized_object` / `behavior.on_parse_error` /
+/// `behavior.on_object_too_large` — the settings that change what a backfill
+/// selects and writes.
 ///
 /// The rest is Lambda-only and ignored: `destination.*` and `rules.*` are the
 /// `dest` and `--rules` arguments, and `sqs.*`, `behavior.on_config_error`,
@@ -180,6 +181,7 @@ struct FilterConfig {
     dry_run: bool,
     on_unrecognized: OnUnrecognizedObject,
     on_parse_error: OnParseError,
+    on_object_too_large: OnObjectTooLarge,
 }
 
 impl FilterConfig {
@@ -205,6 +207,7 @@ impl FilterConfig {
             dry_run: behavior.dry_run,
             on_unrecognized: behavior.on_unrecognized_object,
             on_parse_error: behavior.on_parse_error,
+            on_object_too_large: behavior.on_object_too_large,
         })
     }
 
@@ -704,7 +707,7 @@ impl Filterer {
     }
 
     /// The buffer-mode evaluation, up to but not including the write. Split out
-    /// so the `auto` `ObjectTooLarge` → stream retry can match one `CoreError`
+    /// so the `ObjectTooLarge` → stream retry can match one `CoreError`
     /// covering both the capped fetch and `buffer_run`.
     /// The bytes come back even when the evaluation failed: `on_parse_error`
     /// copies them verbatim rather than re-reading the object.
@@ -753,13 +756,11 @@ impl Filterer {
                     Err(e) => (Bytes::new(), Err(e)),
                 };
                 match result {
-                    // The same retry `Pipeline::process_object` performs: a
-                    // compressible object routed to buffer mode off a
-                    // compressed-size estimate can still blow `max_object_bytes`,
-                    // and stream mode has no such cap. Only in `auto` — explicit
-                    // `mode: buffer` opted out, so the error must surface.
+                    // The same retry `Pipeline::process_object` performs:
+                    // `max_object_bytes` caps buffer-mode memory, and stream
+                    // mode has no such cap.
                     Err(CoreError::ObjectTooLarge { limit })
-                        if self.cfg.processing.mode == ProcessingMode::Auto =>
+                        if self.cfg.on_object_too_large == OnObjectTooLarge::Stream =>
                     {
                         eprintln!(
                             "  note: {src_key} exceeds max_object_bytes ({limit}); \
@@ -1166,6 +1167,10 @@ fn cmd_validate_settings(path: Option<&Path>) -> anyhow::Result<()> {
     println!(
         "  behavior.on_parse_error:           {:?}",
         settings.behavior.on_parse_error
+    );
+    println!(
+        "  behavior.on_object_too_large:      {:?}",
+        settings.behavior.on_object_too_large
     );
     println!(
         "  destination.bucket:                {}",

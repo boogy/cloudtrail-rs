@@ -151,6 +151,32 @@ impl std::str::FromStr for OnParseError {
     }
 }
 
+/// What to do with an object whose body exceeds `processing.max_object_bytes`.
+/// The cap guards buffer-mode memory, so the object is not bad — the path
+/// chosen for it is. `Stream` re-runs it through stream mode, which has no size
+/// cap and filters it normally; `Error` fails the object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub enum OnObjectTooLarge {
+    #[serde(rename = "stream")]
+    #[default]
+    Stream,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::str::FromStr for OnObjectTooLarge {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stream" => Ok(Self::Stream),
+            "error" => Ok(Self::Error),
+            other => Err(format!(
+                "invalid on_object_too_large {other:?}: expected stream or error"
+            )),
+        }
+    }
+}
+
 /// How to interpret an SQS message body: sniff it (`Auto`), or skip the
 /// sniff because it is known to be a direct S3 event or an SNS envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -370,6 +396,8 @@ pub struct Behavior {
     pub on_unrecognized_object: OnUnrecognizedObject,
     #[serde(default)]
     pub on_parse_error: OnParseError,
+    #[serde(default)]
+    pub on_object_too_large: OnObjectTooLarge,
     #[serde(default = "default_partial_batch_failures")]
     pub partial_batch_failures: bool,
 }
@@ -382,6 +410,7 @@ impl Default for Behavior {
             on_missing_object: OnMissingObject::default(),
             on_unrecognized_object: OnUnrecognizedObject::default(),
             on_parse_error: OnParseError::default(),
+            on_object_too_large: OnObjectTooLarge::default(),
             partial_batch_failures: default_partial_batch_failures(),
         }
     }
@@ -547,6 +576,9 @@ impl Document {
         })?;
         apply(env, "CT_ON_PARSE_ERROR", |v| {
             self.behavior.on_parse_error = v
+        })?;
+        apply(env, "CT_ON_OBJECT_TOO_LARGE", |v| {
+            self.behavior.on_object_too_large = v
         })?;
         apply(env, "CT_PARTIAL_BATCH_FAILURES", |v| {
             self.behavior.partial_batch_failures = v
@@ -736,12 +768,19 @@ mod tests {
         assert_eq!(settings.processing.max_object_bytes, 134_217_728);
         assert_eq!(settings.processing.multipart_part_bytes, 8_388_608);
         assert_eq!(settings.processing.gzip_level, 6);
+        assert_eq!(settings.processing.object_concurrency, 1);
+        assert_eq!(settings.processing.gzip_chunks, 1);
         assert!(!settings.behavior.dry_run);
         assert_eq!(settings.behavior.on_config_error, OnConfigError::Open);
         assert_eq!(settings.behavior.on_missing_object, OnMissingObject::Error);
         assert_eq!(
             settings.behavior.on_unrecognized_object,
             OnUnrecognizedObject::Copy
+        );
+        assert_eq!(settings.behavior.on_parse_error, OnParseError::Copy);
+        assert_eq!(
+            settings.behavior.on_object_too_large,
+            OnObjectTooLarge::Stream
         );
         assert!(settings.behavior.partial_batch_failures);
         assert_eq!(settings.sqs.body_format, SqsBodyFormat::Auto);
@@ -814,10 +853,14 @@ mod tests {
             // Must be >= S3's 5 MiB multipart-part minimum (Fix D).
             ("CT_MULTIPART_PART_BYTES", "5242880"),
             ("CT_GZIP_LEVEL", "9"),
+            ("CT_OBJECT_CONCURRENCY", "8"),
+            ("CT_GZIP_CHUNKS", "4"),
             ("CT_DRY_RUN", "true"),
             ("CT_ON_CONFIG_ERROR", "closed"),
             ("CT_ON_MISSING_OBJECT", "skip"),
             ("CT_ON_UNRECOGNIZED_OBJECT", "error"),
+            ("CT_ON_PARSE_ERROR", "error"),
+            ("CT_ON_OBJECT_TOO_LARGE", "error"),
             ("CT_PARTIAL_BATCH_FAILURES", "false"),
             ("CT_SQS_BODY_FORMAT", "sns"),
             ("CT_RULES_URI", "file:///tmp/overridden-rules.yaml"),
@@ -839,12 +882,19 @@ mod tests {
         assert_eq!(settings.processing.max_object_bytes, 2);
         assert_eq!(settings.processing.multipart_part_bytes, 5_242_880);
         assert_eq!(settings.processing.gzip_level, 9);
+        assert_eq!(settings.processing.object_concurrency, 8);
+        assert_eq!(settings.processing.gzip_chunks, 4);
         assert!(settings.behavior.dry_run);
         assert_eq!(settings.behavior.on_config_error, OnConfigError::Closed);
         assert_eq!(settings.behavior.on_missing_object, OnMissingObject::Skip);
         assert_eq!(
             settings.behavior.on_unrecognized_object,
             OnUnrecognizedObject::Error
+        );
+        assert_eq!(settings.behavior.on_parse_error, OnParseError::Error);
+        assert_eq!(
+            settings.behavior.on_object_too_large,
+            OnObjectTooLarge::Error
         );
         assert!(!settings.behavior.partial_batch_failures);
         assert_eq!(settings.sqs.body_format, SqsBodyFormat::Sns);
