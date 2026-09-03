@@ -38,9 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compress/gzip` all read it in full, but a strict single-member decoder
   (Python `zlib.decompress(data, 31)`, Rust `flate2::read::GzDecoder`) silently
   returns only the first member — check the downstream reader before enabling. Measured **1.94x** compression speed at `2`
-  for **+1.73%** object size, **3.54x** at `4` for **+5.28%**. Chunks below
-  64 KiB are collapsed, so a small object stays a single member, and the
-  setting is capped at `16`. It only pays above ~1769 MB of Lambda memory,
+  for **+1.73%** object size, **3.54x** at `4` for **+5.28%**. The chunk count
+  is capped so the split is sized around a 64 KiB floor, so a small object
+  stays a single member, and the setting is capped at `16`. It only pays above ~1769 MB of Lambda memory,
   where the function has more than one vCPU; the default emits exactly the
   bytes the unchunked encoder did.
 - **Operator guidance for both new settings** in `docs/configuration.md`:
@@ -53,6 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Two MiniStack integration tests** covering the new settings against a real
   S3: `chunked_gzip_survives_a_real_s3_round_trip` and
   `concurrent_objects_all_land_correctly_in_real_s3`.
+
+### Fixed
+
+- **A failing object no longer cancels its in-flight siblings.** Under
+  `partial_batch_failures: false` the batch's first failure is now held until
+  the objects already in flight have drained, then returned. Dropping them
+  mid-`put_stream` cancelled the future before it reached its own multipart
+  abort, leaving billable orphan parts, and made `ObjectsProcessed` depend on
+  `object_concurrency`.
+- **An undecodable message no longer withholds its siblings' data.** With
+  `partial_batch_failures: false`, one poison message used to abort the batch
+  before any object was fetched, so the other messages' objects went unwritten
+  on every redrive until the poison message was finally DLQ'd. The batch still
+  fails; the siblings' objects are written first.
 
 ### Security
 

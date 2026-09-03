@@ -152,6 +152,8 @@ impl Pipeline {
 
         let mut item_failed = vec![false; items.len()];
         let mut work: Vec<Work<'_>> = Vec::new();
+        // Returned only after pass 3 has drained: see the comment there.
+        let mut hard_error: Option<CoreError> = None;
 
         // Pass 1 — no I/O. Everything that can reject an object without
         // touching S3 happens here, so the self-trigger guard still fires
@@ -167,7 +169,12 @@ impl Pipeline {
                     item_failed[item_idx] = true;
                     continue;
                 }
-                return Err(CoreError::Decode(DecodeError::InvalidPayload(msg.clone())));
+                // The batch fails, but its other messages' objects are still
+                // written first: a poison message must not withhold their
+                // data on every redrive until it is finally DLQ'd.
+                hard_error
+                    .get_or_insert(CoreError::Decode(DecodeError::InvalidPayload(msg.clone())));
+                continue;
             }
 
             if item.objects.is_empty() {
@@ -269,9 +276,24 @@ impl Pipeline {
                     );
                     item_failed[w.item_idx] = true;
                 } else {
-                    return Err(e);
+                    tracing::error!(
+                        bucket = %w.object.bucket,
+                        key = %w.object.key,
+                        error = %e,
+                        "object failed; the batch will fail once the objects already in flight finish"
+                    );
+                    // Held, not returned: dropping `in_flight` here cancels a
+                    // sibling mid-`put_stream`, and a cancelled future never
+                    // reaches its own abort, leaving billable orphan parts.
+                    // Draining also makes every counter independent of
+                    // `object_concurrency` on this path.
+                    hard_error.get_or_insert(e);
                 }
             }
+        }
+
+        if let Some(e) = hard_error {
+            return Err(e);
         }
 
         let failed_ack_ids = items
@@ -1110,6 +1132,45 @@ rules:
             .await
             .expect_err("an undecodable item with no ack_id must be a hard error");
         assert!(matches!(err, CoreError::Decode(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_poison_message_does_not_withhold_its_siblings_data() {
+        let store = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+        store.seed("src-bucket", "before.json.gz", body.clone());
+        store.seed("src-bucket", "after.json.gz", body);
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![
+            item(None, vec![object("src-bucket", "before.json.gz", None)]),
+            undecodable_item(None, "garbage message body"),
+            item(None, vec![object("src-bucket", "after.json.gz", None)]),
+        ]));
+
+        let mut settings = base_settings();
+        settings.behavior.partial_batch_failures = false;
+
+        let err = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            Arc::new(RecordingSink::new()),
+        )
+        .handle(b"{}")
+        .await
+        .expect_err("an undecodable item with no ack_id must still fail the batch");
+        assert!(matches!(err, CoreError::Decode(_)), "got {err:?}");
+
+        for key in ["before.json.gz", "after.json.gz"] {
+            assert!(
+                store.contains("dest-bucket", key),
+                "{key} must be written even though a sibling message never decodes"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3068,6 +3129,176 @@ rules:
         )
         .handle(b"{}")
         .await
+    }
+
+    async fn hard_failure_at_concurrency(
+        concurrency: usize,
+    ) -> (Arc<InMemoryStore>, MetricSnapshot) {
+        let inner = Arc::new(InMemoryStore::new());
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+        for n in 1..8 {
+            inner.seed("src-bucket", &format!("f{n}.json.gz"), body.clone());
+        }
+        // "f0.json.gz" is deliberately unseeded and submitted first.
+
+        let store = Arc::new(SlowStore {
+            inner,
+            delay: Box::new(|k| {
+                let millis = if k == "f0.json.gz" { 5 } else { 40 };
+                std::time::Duration::from_millis(millis)
+            }),
+        });
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            (0..8)
+                .map(|n| object("src-bucket", &format!("f{n}.json.gz"), None))
+                .collect(),
+        )]));
+
+        let mut settings = base_settings();
+        settings.behavior.on_missing_object = OnMissingObject::Error;
+        settings.behavior.partial_batch_failures = false;
+        settings.processing.object_concurrency = concurrency;
+
+        let sink = Arc::new(RecordingSink::new());
+        Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink.clone(),
+        )
+        .handle(b"{}")
+        .await
+        .expect_err("the missing object must fail the batch");
+
+        let snapshot = sink
+            .snapshots()
+            .pop()
+            .expect("handle must emit a snapshot even when it fails");
+        (store.inner.clone(), snapshot)
+    }
+
+    /// Counts `put_stream` entries against exits. An upload that starts and
+    /// never returns is the shape that leaves orphan multipart parts in S3.
+    struct UploadTracker {
+        inner: Arc<InMemoryStore>,
+        started: AtomicU64,
+        finished: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ObjectStore for UploadTracker {
+        async fn get(&self, b: &str, k: &str) -> Result<Bytes, StoreError> {
+            self.inner.get(b, k).await
+        }
+        async fn get_stream(
+            &self,
+            b: &str,
+            k: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+            let delay = if k == "f0.json.gz" { 5 } else { 40 };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            self.inner.get_stream(b, k).await
+        }
+        async fn put(&self, b: &str, k: &str, body: Bytes, m: PutMeta) -> Result<(), StoreError> {
+            self.inner.put(b, k, body, m).await
+        }
+        async fn put_stream(
+            &self,
+            b: &str,
+            k: &str,
+            body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            m: PutMeta,
+        ) -> Result<(), StoreError> {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let result = self.inner.put_stream(b, k, body, m).await;
+            self.finished.fetch_add(1, Ordering::Relaxed);
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hard_error_never_cancels_an_upload_that_has_already_started() {
+        for concurrency in [1, 2, 8] {
+            let inner = Arc::new(InMemoryStore::new());
+            let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin"]));
+            for n in 1..8 {
+                inner.seed("src-bucket", &format!("f{n}.json.gz"), body.clone());
+            }
+            // "f0.json.gz" is unseeded and submitted first, so it fails while
+            // its siblings' uploads are in flight.
+            let store = Arc::new(UploadTracker {
+                inner,
+                started: AtomicU64::new(0),
+                finished: AtomicU64::new(0),
+            });
+
+            let metrics = Arc::new(Metrics::default());
+            let (config, _src) = config_store(no_op_rules(), metrics.clone());
+            let decoder = Arc::new(StubDecoder(vec![item(
+                None,
+                (0..8)
+                    .map(|n| object("src-bucket", &format!("f{n}.json.gz"), None))
+                    .collect(),
+            )]));
+
+            let mut settings = base_settings();
+            settings.processing.mode = ProcessingMode::Stream;
+            settings.behavior.on_missing_object = OnMissingObject::Error;
+            settings.behavior.partial_batch_failures = false;
+            settings.processing.object_concurrency = concurrency;
+
+            Pipeline::new(
+                Arc::new(settings),
+                decoder,
+                store.clone(),
+                config,
+                metrics,
+                Arc::new(RecordingSink::new()),
+            )
+            .handle(b"{}")
+            .await
+            .expect_err("the missing object must fail the batch");
+
+            let started = store.started.load(Ordering::Relaxed);
+            assert_eq!(
+                started,
+                store.finished.load(Ordering::Relaxed),
+                "concurrency {concurrency} abandoned an upload mid-flight"
+            );
+            assert_eq!(started, 7, "concurrency {concurrency}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_counter_is_identical_at_any_concurrency_on_the_hard_error_path() {
+        let (sequential_store, sequential) = hard_failure_at_concurrency(1).await;
+        for concurrency in [2, 4, 8] {
+            let (store, snapshot) = hard_failure_at_concurrency(concurrency).await;
+            assert_eq!(
+                sequential, snapshot,
+                "concurrency {concurrency} moved a counter on the failing path"
+            );
+            for n in 0..8 {
+                let key = format!("f{n}.json.gz");
+                assert_eq!(
+                    sequential_store.object("dest-bucket", &key),
+                    store.object("dest-bucket", &key),
+                    "concurrency {concurrency} changed what {key} left at the destination"
+                );
+            }
+        }
+        assert_eq!(
+            sequential.objects_processed, 7,
+            "the seven readable objects must be written before the batch fails"
+        );
+        assert_eq!(sequential.objects_failed, 1);
     }
 
     #[tokio::test]

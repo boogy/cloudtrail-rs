@@ -260,16 +260,12 @@ Behavior does not change with the value. Results are adjudicated in submission
 order no matter what order they complete in, so the destination bytes, the
 counters, the failed-message set and its order are identical at every setting.
 
-The one exception is the abort path — `partial_batch_failures: false` plus an
-object that fails. There the batch returns on the first failure in submission
-order, and the objects already in flight beside it have finished: they are
-written and counted, where at `object_concurrency: 1` they would never have
-started. The error returned and the object blamed are the same either way, and
-the invocation still fails and is retried into idempotent writes, so nothing is
-lost or double-counted downstream — but `ObjectsProcessed` for the failed
-invocation is higher than a sequential run would report. Under the default
-`partial_batch_failures: true` the batch runs to completion, so this does not
-arise.
+This holds on the abort path too — `partial_batch_failures: false` plus an
+object that fails. The failure is held rather than returned immediately, the
+objects already in flight beside it are drained to completion, and only then
+does the batch return that first failure in submission order. Draining is what
+keeps the counters value-independent, and it also stops a cancelled upload from
+leaving orphan multipart parts behind.
 
 #### Choosing a `gzip_chunks`
 
@@ -286,8 +282,9 @@ and the compressed size change.
 | 4               | 4.02 ms  | **3.54x** | +5.28%      |
 
 Each member after the first starts with an empty back-reference window, which is
-where the size increase comes from. Chunks below 64 KiB are collapsed, so a
-small object silently stays a single member and pays nothing.
+where the size increase comes from. The chunk count is capped so the split is
+sized around a 64 KiB floor (the trailing member can land a few bytes under it),
+so a small object silently stays a single member and pays nothing.
 
 **It needs more than one vCPU to do anything.** Lambda allocates vCPU in
 proportion to memory: below ~1769 MB the function has less than one full vCPU,
