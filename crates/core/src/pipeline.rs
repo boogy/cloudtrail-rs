@@ -285,8 +285,9 @@ impl Pipeline {
                     // Held, not returned: dropping `in_flight` here cancels a
                     // sibling mid-`put_stream`, and a cancelled future never
                     // reaches its own abort, leaving billable orphan parts.
-                    // Draining also makes every counter independent of
-                    // `object_concurrency` on this path.
+                    // The loop goes on to process the batch's remaining work,
+                    // which is what makes every counter here independent of
+                    // `object_concurrency`.
                     hard_error.get_or_insert(e);
                 }
             }

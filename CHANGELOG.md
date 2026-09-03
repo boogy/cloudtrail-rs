@@ -8,7 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
 - **`behavior.on_parse_error` (`CT_ON_PARSE_ERROR`), default `copy`.** An
   object whose bytes will not parse at all — bad gzip, truncated, or not JSON —
   is now forwarded to the destination byte-for-byte instead of failing the
@@ -18,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unfiltered, so a non-zero count means exclusion rules did not apply to it.
   The policy deliberately does not cover `ObjectTooLarge` (auto mode already
   retries those in stream mode) or destination-store failures (those must
-  retry). Individual malformed *records* were already kept in both modes and
+  retry). Individual malformed _records_ were already kept in both modes and
   are unaffected.
 - **`processing.object_concurrency` (`CT_OBJECT_CONCURRENCY`), default `1`.**
   Bounds how many of a batch's objects are fetched, filtered and written at
@@ -53,33 +52,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Two MiniStack integration tests** covering the new settings against a real
   S3: `chunked_gzip_survives_a_real_s3_round_trip` and
   `concurrent_objects_all_land_correctly_in_real_s3`.
-
-### Fixed
-
-- **A failing object no longer cancels its in-flight siblings.** Under
-  `partial_batch_failures: false` the batch's first failure is now held until
-  the objects already in flight have drained, then returned. Dropping them
-  mid-`put_stream` cancelled the future before it reached its own multipart
-  abort, leaving billable orphan parts, and made `ObjectsProcessed` depend on
-  `object_concurrency`.
-- **An undecodable message no longer withholds its siblings' data.** With
-  `partial_batch_failures: false`, one poison message used to abort the batch
-  before any object was fetched, so the other messages' objects went unwritten
-  on every redrive until the poison message was finally DLQ'd. The batch still
-  fails; the siblings' objects are written first.
-
-### Security
-
-- **`h2` bumped 0.4.15 -> 0.4.19** (RUSTSEC-2026-0258, unbounded empty DATA
-  frames). The remaining `h2 0.3.27` in the graph is reached only through
-  `aws-smithy-http-client`'s `hyper-014` / `legacy-test-util` features, which
-  `deny.toml`'s `all-features = true` forces on; `cargo tree -e normal --target
-  aarch64-unknown-linux-musl` finds zero of it in any of the four Lambdas or the
-  CLI. The advisory is ignored for that test-only edge and the ban above keeps
-  the shipped line patched.
+- **`deny.toml` pins the compressor backend.** `libz-sys`, `libz-ng-sys`,
+  `zlib-ng-sys`, `cloudflare-zlib-sys` and `zlib-rs` join the ban list. The
+  first four would put a C toolchain in the graph and break the static-musl /
+  ARM64 Lambda cross-build; `zlib-rs` is pure Rust and reaches the shipped
+  graph through flate2's own feature, but changes every output object's bytes.
+  The parity oracle cannot catch a backend swap, because it compares buffer
+  against stream and never against golden bytes.
+- **flate2 pinned to `rust_backend` in the four Lambda crates.** They declared
+  a bare `flate2 = "1"`, leaning on the default feature happening to mean
+  `rust_backend`; the other four crates already pinned it. These are
+  dev-dependencies and never reached a shipped binary — the pins are hygiene,
+  and `deny.toml` is what actually enforces the backend.
+- **A per-object cost profile in `docs/architecture.md`.** Stage timings for
+  one 4.5 MB / 4,000-record object: compression at 13.42 ms dominates filtering
+  at 5.97 ms, so any optimization that does not touch compression is bounded by
+  what is left.
+- **A measured `gzip_level` time/size frontier in `docs/configuration.md`**,
+  scoped to filter-core CPU and excluding S3 network I/O, so the time column
+  reads as an upper bound on what lowering the level saves end-to-end.
 
 ### Changed
-
 - **Zero-copy scalar capture in the projected parse.** Captured JSON scalars
   are held as `Cow<'de, str>`: an escape-free scalar borrows a slice of the
   record instead of allocating a `String` per captured field per record.
@@ -107,30 +100,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-object CPU". That figure divided a whole-body compress by an end-to-end
   run, and the stage shares it implied summed to 126%.
 
-### Added
+### Fixed
+- **A failing object no longer cancels its in-flight siblings.** Under
+  `partial_batch_failures: false` the batch's first failure is now held, the
+  batch's remaining objects are processed, and only then is it returned.
+  Dropping the in-flight futures cancelled them before they reached
+  `put_stream`'s own multipart abort, leaving billable orphan parts, and made
+  `ObjectsProcessed` depend on `object_concurrency`. The batch now does its
+  full work before failing, on the first attempt and on every retry; the writes
+  are idempotent, so that is wasted work rather than corruption.
+- **An undecodable message no longer withholds its siblings' data.** With
+  `partial_batch_failures: false`, one poison message used to abort the batch
+  before any object was fetched, so the other messages' objects went unwritten
+  on every redrive until the poison message was finally DLQ'd. The batch still
+  fails; the siblings' objects are written first.
 
-- **`deny.toml` pins the compressor backend.** `libz-sys`, `libz-ng-sys`,
-  `zlib-ng-sys`, `cloudflare-zlib-sys` and `zlib-rs` join the ban list. The
-  first four would put a C toolchain in the graph and break the static-musl /
-  ARM64 Lambda cross-build; `zlib-rs` is pure Rust and reaches the shipped
-  graph through flate2's own feature, but changes every output object's bytes.
-  The parity oracle cannot catch a backend swap, because it compares buffer
-  against stream and never against golden bytes.
-- **flate2 pinned to `rust_backend` in the four Lambda crates.** They declared
-  a bare `flate2 = "1"`, leaning on the default feature happening to mean
-  `rust_backend`; the other four crates already pinned it. These are
-  dev-dependencies and never reached a shipped binary — the pins are hygiene,
-  and `deny.toml` is what actually enforces the backend.
-- **A per-object cost profile in `docs/architecture.md`.** Stage timings for
-  one 4.5 MB / 4,000-record object: compression at 13.42 ms dominates filtering
-  at 5.97 ms, so any optimization that does not touch compression is bounded by
-  what is left.
-- **A measured `gzip_level` time/size frontier in `docs/configuration.md`**,
-  scoped to filter-core CPU and excluding S3 network I/O, so the time column
-  reads as an upper bound on what lowering the level saves end-to-end.
+### Security
+- **`h2` bumped 0.4.15 -> 0.4.19** (RUSTSEC-2026-0258, unbounded empty DATA
+  frames). The remaining `h2 0.3.27` in the graph is reached only through
+  `aws-smithy-http-client`'s `hyper-014` / `legacy-test-util` features, which
+  `deny.toml`'s `all-features = true` forces on; `cargo tree -e normal --target
+aarch64-unknown-linux-musl` finds zero of it in any of the four Lambdas or the
+  CLI. The advisory is ignored for that test-only edge and the ban above keeps
+  the shipped line patched.
 
 ### Testing
-
 - Two tests pin the `GzEncoder` byte-identity rules: `flush()` inserts a
   DEFLATE sync-flush marker and changes the output bytes, while write
   granularity does not. The no-flush invariant was documented but unenforced —
@@ -180,7 +174,7 @@ Migrating is optional.**
 - **A tuning section in `docs/rules.md`** for the configuration choices that
   decide throughput, written from the semantics they follow from: a matching
   rule DROPS, so a dropped record short-circuits at the first rule that fires
-  while a *kept* record is the expensive case — "no rule matched" can only be
+  while a _kept_ record is the expensive case — "no rule matched" can only be
   established by running every candidate rule to completion. The records
   costing the most are therefore the ones being kept, and no rule-writing makes
   them cheaper; only keeping them away from rules does, which is the index.
@@ -196,13 +190,13 @@ Migrating is optional.**
 - **Projected JSON parse (~2.16x).** A projection trie built from the ruleset's
   field paths drives a `serde` deserializer that walks and discards untouched
   subtrees instead of materialising a full `Value`. Discarded subtrees are
-  still *validated* — the skip type is a hand-written `Skip` rather than
+  still _validated_ — the skip type is a hand-written `Skip` rather than
   `serde::de::IgnoredAny`, so escapes and surrogates in a subtree no rule reads
   still fail the parse exactly as a full parse would. That is load-bearing, not
   incidental: `project()` must return `Err` in exactly the cases
   `serde_json::from_str::<Value>` does, because an `Err` makes the record
   **kept**.
-- **The rule index is now two-dimensional (~2.13x)** — `eventSource` *and*
+- **The rule index is now two-dimensional (~2.13x)** — `eventSource` _and_
   `eventName` — and takes literals from `equals` and `any_of`, not just from
   anchored regex alternations. Selection is bitset-based: one hash lookup per
   dimension per record, two bit tests per rule, no per-record allocation.
@@ -222,7 +216,7 @@ Migrating is optional.**
 ### Fixed
 
 - **v1 field paths are lowered literally, so v1 rulesets evaluate unchanged.**
-  Development had `Engine::new` compiling *every* field path through the new
+  Development had `Engine::new` compiling _every_ field path through the new
   subscript-aware parser, v1 included — but v1 resolution splits on `.` and
   does literal object-key lookup only, with no subscript syntax. An unchanged
   v1 rule therefore changed meaning: `field_name: "requestParameters.tag[0]"`
@@ -242,7 +236,7 @@ Migrating is optional.**
   index is safe; **over-exclusion is silent data loss**, which for a CloudTrail
   filter means destroyed audit evidence. Enforced in `crates/core/tests/oracle.rs`,
   including a proptest generator.
-- Two blind spots were found by *neutralisation* — removing a behaviour and
+- Two blind spots were found by _neutralisation_ — removing a behaviour and
   confirming a test fails — rather than by a green suite. The parity suites are
   differential, comparing buffer against stream, so they go quiet when both
   modes are wrong together: nothing had asserted that an unparseable record

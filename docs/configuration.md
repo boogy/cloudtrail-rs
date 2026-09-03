@@ -261,11 +261,16 @@ order no matter what order they complete in, so the destination bytes, the
 counters, the failed-message set and its order are identical at every setting.
 
 This holds on the abort path too — `partial_batch_failures: false` plus an
-object that fails. The failure is held rather than returned immediately, the
-objects already in flight beside it are drained to completion, and only then
-does the batch return that first failure in submission order. Draining is what
-keeps the counters value-independent, and it also stops a cancelled upload from
-leaving orphan multipart parts behind.
+object that fails. The failure is held rather than returned immediately: the
+batch's **remaining objects are all processed**, not merely the ones already in
+flight, and only then is that first failure in submission order returned.
+Draining everything is what keeps the counters value-independent, and it stops a
+cancelled upload from leaving orphan multipart parts behind. The cost is that a
+batch containing one doomed object still pays for the whole batch, on the first
+attempt and on every retry; the writes are idempotent, so the repetition is
+wasted work rather than corruption. Under the default
+`partial_batch_failures: true` the batch runs to completion anyway and only the
+failing messages are redriven.
 
 #### Choosing a `gzip_chunks`
 
