@@ -15,7 +15,9 @@
 mod common;
 
 use cloudtrail_rs_core::config::Processing;
-use common::{Verdict, assert_parity, drop_decrypt_engine, gzip, no_op_engine, run_buffer};
+use common::{
+    Verdict, assert_parity, drop_decrypt_engine, gzip, no_op_engine, run_buffer, run_stream,
+};
 
 // ---------------------------------------------------------------------------
 // Ordinary envelopes
@@ -432,5 +434,48 @@ async fn an_unparseable_record_survives_inside_a_written_object_and_is_counted()
     assert_eq!(
         metrics.records_kept, 3,
         "all three records survive, including the unparseable one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The one deliberate gap in byte parity
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn gzip_chunks_changes_the_framing_but_not_the_payload() {
+    let records: Vec<String> = (0..4000)
+        .map(|i| {
+            format!(
+                r#"{{"eventName":"ConsoleLogin","idx":{i},"pad":"{}"}}"#,
+                "x".repeat(64)
+            )
+        })
+        .collect();
+    let body = format!(r#"{{"Records":[{}]}}"#, records.join(","));
+    let input = gzip(body.as_bytes());
+
+    let cfg = Processing {
+        gzip_chunks: 4,
+        ..Processing::default()
+    };
+    let (buffered, buffer_bytes, buffer_metrics) = run_buffer(&input, &no_op_engine(), &cfg);
+    let (streamed, stream_bytes, stream_metrics) = run_stream(&input, &no_op_engine(), &cfg).await;
+
+    assert_eq!(
+        buffered, streamed,
+        "the decompressed payload must still match"
+    );
+    assert_eq!(buffer_metrics.records_kept, 4000);
+    assert_eq!(buffer_metrics.records_kept, stream_metrics.records_kept);
+    assert_eq!(buffer_metrics.records_in, stream_metrics.records_in);
+
+    let (b, st) = (
+        buffer_bytes.expect("buffer mode wrote"),
+        stream_bytes.expect("stream mode wrote"),
+    );
+    assert_ne!(
+        b, st,
+        "gzip_chunks above 1 must reach buffer mode; identical bytes mean the \
+         setting was silently ignored"
     );
 }

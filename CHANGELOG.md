@@ -7,26 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Zero-copy scalar capture in the projected parse.** Captured JSON scalars
-  are held as `Cow<'de, str>`: an escape-free scalar borrows a slice of the
-  record instead of allocating a `String` per captured field per record.
-  `evaluate_raw` improved **14.44%** (p<0.05) on `crates/core/benches/filter.rs`
-  (500 scaled records). A separate 4,000-record fixture with realistic entropy
-  measured 5.97 ms -> 4.88 ms (-19.7%); that fixture is not in the repo.
-- **Buffer-mode output body assembled in one allocation.** The previous
-  `join` + `format!` held two full copies of the body; one `Vec` pre-sized from
-  the survivors' lengths holds one. Throughput is unchanged — compression
-  dominates the per-object cost — so this is a peak-memory fix, not a speedup.
-- **Comments trimmed to the project standard across all eight crates.** 2,408
-  comment lines removed, 1,094 added, 31 non-comment lines touched.
-- `docs/configuration.md` no longer claims compression is "roughly 77% of
-  per-object CPU". That figure divided a whole-body compress by an end-to-end
-  run, and the stage shares it implied summed to 126%.
+## [0.6.0] - 2026-09-03
 
 ### Added
+- **`behavior.on_parse_error` (`CT_ON_PARSE_ERROR`), default `copy`.** An
+  object whose bytes will not parse at all — bad gzip, truncated, or not JSON —
+  is now forwarded to the destination byte-for-byte instead of failing the
+  object, so a downstream SIEM never loses a log to a parse failure. Set it to
+  `error` for the previous behavior (fail the object, DLQ it, alert). Copies
+  are counted by the new `ObjectsCopiedUnparsed` metric; the object arrives
+  unfiltered, so a non-zero count means exclusion rules did not apply to it.
+  The policy deliberately does not cover `ObjectTooLarge` (that is
+  `on_object_too_large`'s job, and copying such an object would forward it
+  unfiltered) or destination-store failures (those must retry). Individual
+  malformed _records_ were already kept in both modes and are unaffected.
+- **`behavior.on_object_too_large` (`CT_ON_OBJECT_TOO_LARGE`), default
+  `stream`.** An object whose body exceeds `processing.max_object_bytes` is now
+  retried through stream mode in **every** `processing.mode`, not only `auto`.
+  The cap bounds buffer-mode memory, so exceeding it says the path was wrong,
+  not the object; stream mode has no size cap and filters it to byte-identical
+  output. Previously an explicit `mode: buffer` turned such an object into a
+  deterministic poison pill: it failed, was re-driven, failed again, and its
+  records reached the SIEM only if someone worked the DLQ. Set it to `error`
+  to keep that hard ceiling.
 
+- **`processing.object_concurrency` (`CT_OBJECT_CONCURRENCY`), default `1`.**
+  Bounds how many of a batch's objects are fetched, filtered and written at
+  once. The default is fully sequential, so behavior and output bytes are
+  unchanged unless an operator opts in. Results are adjudicated in submission
+  order regardless of completion order, so the failed-ack-id set, its order and
+  the error chosen under `partial_batch_failures: false` are identical at every
+  concurrency. Each in-flight object holds its own decompressed body, so the
+  setting multiplies peak memory by up to `processing.max_object_bytes` per
+  slot and is capped at `64`.
+- **`processing.gzip_chunks` (`CT_GZIP_CHUNKS`), default `1`.** Buffer mode
+  only: splits the output into that many independently-deflated gzip members,
+  compressed on that many threads. A gzip stream decompresses to the
+  concatenation of its members, so the decompressed payload is byte-identical
+  at every chunk count and only the framing and the compressed size change.
+  `gzip`/`zcat`, Python's `gzip` module, Node's `zlib.gunzipSync` and Go's
+  `compress/gzip` all read it in full, but a strict single-member decoder
+  (Python `zlib.decompress(data, 31)`, Rust `flate2::read::GzDecoder`) silently
+  returns only the first member — check the downstream reader before enabling. Measured **1.94x** compression speed at `2`
+  for **+1.73%** object size, **3.54x** at `4` for **+5.28%**. The chunk count
+  is capped so the split is sized around a 64 KiB floor, so a small object
+  stays a single member, and the setting is capped at `16`. It only pays above ~1769 MB of Lambda memory,
+  where the function has more than one vCPU; the default emits exactly the
+  bytes the unchunked encoder did.
+- **Operator guidance for both new settings** in `docs/configuration.md`:
+  "Choosing an `object_concurrency`" (which triggers can carry more than one
+  object, a measured scaling table, and the memory arithmetic) and "Choosing a
+  `gzip_chunks`" (the time/size frontier and a verified reader-compatibility
+  matrix).
+- **`h2 >=0.4.0, <0.4.16` banned** in `deny.toml`, so the shipped HTTP/2 stack
+  can never slide back below the RUSTSEC-2026-0258 fix.
+- **Two MiniStack integration tests** covering the new settings against a real
+  S3: `chunked_gzip_survives_a_real_s3_round_trip` and
+  `concurrent_objects_all_land_correctly_in_real_s3`.
 - **`deny.toml` pins the compressor backend.** `libz-sys`, `libz-ng-sys`,
   `zlib-ng-sys`, `cloudflare-zlib-sys` and `zlib-rs` join the ban list. The
   first four would put a C toolchain in the graph and break the static-musl /
@@ -47,8 +84,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoped to filter-core CPU and excluding S3 network I/O, so the time column
   reads as an upper bound on what lowering the level saves end-to-end.
 
-### Testing
+### Changed
+- **Zero-copy scalar capture in the projected parse.** Captured JSON scalars
+  are held as `Cow<'de, str>`: an escape-free scalar borrows a slice of the
+  record instead of allocating a `String` per captured field per record.
+  `evaluate_raw` improved **14.44%** (p<0.05) on `crates/core/benches/filter.rs`
+  (500 scaled records). A separate 4,000-record fixture with realistic entropy
+  measured 5.97 ms -> 4.88 ms (-19.7%); that fixture is not in the repo.
+- **Buffer-mode decompression buffer pre-sized from gzip's ISIZE trailer.**
+  The hint is attacker-controlled, so it is clamped by both
+  `processing.max_object_bytes` and DEFLATE's 1032:1 maximum expansion ratio; a
+  wrong hint costs a realloc, never correctness, and a lying trailer is still
+  rejected by the decoder's own checksum. Decompression measured
+  2.5145 ms -> 2.1976 ms (**-12.6%**) on a 4,000-record fixture with realistic
+  entropy; output bytes are unchanged.
+- **The self-trigger guard now runs before the first `get`.** It was already a
+  hard error; it is now raised while building the work list, so a
+  misconfigured destination writes nothing at all instead of writing the
+  objects that preceded the offending one.
+- **Buffer-mode output body assembled in one allocation.** The previous
+  `join` + `format!` held two full copies of the body; one `Vec` pre-sized from
+  the survivors' lengths holds one. Throughput is unchanged — compression
+  dominates the per-object cost — so this is a peak-memory fix, not a speedup.
+- **Comments trimmed to the project standard across all eight crates.** 2,408
+  comment lines removed, 1,094 added, 31 non-comment lines touched.
+- `docs/configuration.md` no longer claims compression is "roughly 77% of
+  per-object CPU". That figure divided a whole-body compress by an end-to-end
+  run, and the stage shares it implied summed to 126%.
 
+### Fixed
+- **A failing object no longer cancels its in-flight siblings.** Under
+  `partial_batch_failures: false` the batch's first failure is now held, the
+  batch's remaining objects are processed, and only then is it returned.
+  Dropping the in-flight futures cancelled them before they reached
+  `put_stream`'s own multipart abort, leaving billable orphan parts, and made
+  `ObjectsProcessed` depend on `object_concurrency`. The batch now does its
+  full work before failing, on the first attempt and on every retry; the writes
+  are idempotent, so that is wasted work rather than corruption.
+- **An undecodable message no longer withholds its siblings' data.** With
+  `partial_batch_failures: false`, one poison message used to abort the batch
+  before any object was fetched, so the other messages' objects went unwritten
+  on every redrive until the poison message was finally DLQ'd. The batch still
+  fails; the siblings' objects are written first.
+
+### Security
+- **`h2` bumped 0.4.15 -> 0.4.19** (RUSTSEC-2026-0258, unbounded empty DATA
+  frames). The remaining `h2 0.3.27` in the graph is reached only through
+  `aws-smithy-http-client`'s `hyper-014` / `legacy-test-util` features, which
+  `deny.toml`'s `all-features = true` forces on; `cargo tree -e normal --target
+aarch64-unknown-linux-musl` finds zero of it in any of the four Lambdas or the
+  CLI. The advisory is ignored for that test-only edge and the ban above keeps
+  the shipped line patched.
+
+### Testing
 - Two tests pin the `GzEncoder` byte-identity rules: `flush()` inserts a
   DEFLATE sync-flush marker and changes the output bytes, while write
   granularity does not. The no-flush invariant was documented but unenforced —
@@ -98,7 +186,7 @@ Migrating is optional.**
 - **A tuning section in `docs/rules.md`** for the configuration choices that
   decide throughput, written from the semantics they follow from: a matching
   rule DROPS, so a dropped record short-circuits at the first rule that fires
-  while a *kept* record is the expensive case — "no rule matched" can only be
+  while a _kept_ record is the expensive case — "no rule matched" can only be
   established by running every candidate rule to completion. The records
   costing the most are therefore the ones being kept, and no rule-writing makes
   them cheaper; only keeping them away from rules does, which is the index.
@@ -114,13 +202,13 @@ Migrating is optional.**
 - **Projected JSON parse (~2.16x).** A projection trie built from the ruleset's
   field paths drives a `serde` deserializer that walks and discards untouched
   subtrees instead of materialising a full `Value`. Discarded subtrees are
-  still *validated* — the skip type is a hand-written `Skip` rather than
+  still _validated_ — the skip type is a hand-written `Skip` rather than
   `serde::de::IgnoredAny`, so escapes and surrogates in a subtree no rule reads
   still fail the parse exactly as a full parse would. That is load-bearing, not
   incidental: `project()` must return `Err` in exactly the cases
   `serde_json::from_str::<Value>` does, because an `Err` makes the record
   **kept**.
-- **The rule index is now two-dimensional (~2.13x)** — `eventSource` *and*
+- **The rule index is now two-dimensional (~2.13x)** — `eventSource` _and_
   `eventName` — and takes literals from `equals` and `any_of`, not just from
   anchored regex alternations. Selection is bitset-based: one hash lookup per
   dimension per record, two bit tests per rule, no per-record allocation.
@@ -140,7 +228,7 @@ Migrating is optional.**
 ### Fixed
 
 - **v1 field paths are lowered literally, so v1 rulesets evaluate unchanged.**
-  Development had `Engine::new` compiling *every* field path through the new
+  Development had `Engine::new` compiling _every_ field path through the new
   subscript-aware parser, v1 included — but v1 resolution splits on `.` and
   does literal object-key lookup only, with no subscript syntax. An unchanged
   v1 rule therefore changed meaning: `field_name: "requestParameters.tag[0]"`
@@ -160,7 +248,7 @@ Migrating is optional.**
   index is safe; **over-exclusion is silent data loss**, which for a CloudTrail
   filter means destroyed audit evidence. Enforced in `crates/core/tests/oracle.rs`,
   including a proptest generator.
-- Two blind spots were found by *neutralisation* — removing a behaviour and
+- Two blind spots were found by _neutralisation_ — removing a behaviour and
   confirming a test fails — rather than by a green suite. The parity suites are
   differential, comparing buffer against stream, so they go quiet when both
   modes are wrong together: nothing had asserted that an unparseable record
@@ -606,7 +694,8 @@ processing.stream_threshold_bytes`; `processing.multipart_part_bytes` must
   GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.2.0...v0.3.0

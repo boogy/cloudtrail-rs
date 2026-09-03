@@ -11,7 +11,8 @@ pub use file_source::FileConfigSource;
 pub use rules::{Match, Rule, RuleSet};
 pub use settings::{
     Behavior, Destination, KeyFilter, MetricsMode, Observability, OnConfigError, OnMissingObject,
-    OnUnrecognizedObject, Processing, ProcessingMode, Rules, Settings, Source, Sqs, SqsBodyFormat,
+    OnObjectTooLarge, OnParseError, OnUnrecognizedObject, Processing, ProcessingMode, Rules,
+    Settings, Source, Sqs, SqsBodyFormat,
 };
 pub use store::{Compile, ConfigStore};
 pub use uri::ConfigUri;

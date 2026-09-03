@@ -10,6 +10,15 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
+ignore = [
+  # Patched in h2 0.4.16; we are on 0.4.19. The remaining 0.3.27 copy is reached
+  # only through `aws-smithy-http-client`'s `hyper-014` / `legacy-test-util`
+  # features, which `all-features = true` above forces on. No shipped artifact
+  # contains it: `cargo tree -e normal --target aarch64-unknown-linux-musl` finds
+  # zero h2 0.3 in any of the four Lambdas or the CLI. Drop this the moment the
+  # 0.3 line disappears from the graph.
+  { id = "RUSTSEC-2026-0258", reason = "only h2 0.3.27 is left, and it is unreachable from every shipped artifact" },
+]
 
 [licenses]
 version = 2
@@ -55,6 +64,9 @@ deny = [
     { name = "zlib-ng-sys" },
     { name = "cloudflare-zlib-sys" },
     { name = "zlib-rs" },
+    # RUSTSEC-2026-0258 is ignored above for the test-only 0.3 copy; this keeps
+    # the shipped 0.4 line from ever sliding back below the fix.
+    { name = "h2", version = ">=0.4.0, <0.4.16" },
 ]
 
 [sources]

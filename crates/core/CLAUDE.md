@@ -42,6 +42,9 @@ Adapters live in `crates/aws`. If you reach for an AWS type here, it belongs in
 - **Buffer/stream parity.** The mode is chosen by object **size**, so the two
   must agree on survivors, output bytes, failure classification and every
   counter — otherwise an object changes meaning at `stream_threshold_bytes`.
+  `gzip_chunks > 1` is the one carved-out exception: it reaches buffer mode
+  only, so the framing bytes diverge while the decompressed payload and the
+  counters still match (`gzip_chunks_changes_the_framing_but_not_the_payload`).
   Enforced by one oracle in `tests/common/mod.rs`, driven from two files:
   `tests/mode_parity.rs` (minimal envelopes, one structural property each) and
   `tests/corpus_parity.rs` (realistic records from `testing::corpus`). A change

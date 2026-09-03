@@ -657,10 +657,10 @@ fn filter_settings_stream_mode_round_trips_and_leaves_no_partial() {
 }
 
 /// A small-but-highly-compressible object is routed to buffer mode and blows
-/// `max_object_bytes`; `auto` must retry it through stream mode as the pipeline
-/// does, while an explicit `mode: buffer` opted out and must still fail.
+/// `max_object_bytes`; the retry through stream mode must carry it in every
+/// mode, and only `on_object_too_large: error` may fail it.
 #[test]
-fn filter_auto_mode_retries_oversized_object_through_stream() {
+fn filter_retries_an_oversized_object_through_stream_in_every_mode() {
     let rules_path = drop_decrypt_rules("filter-oversize-rules");
     // Compresses to well under stream_threshold_bytes (so `auto` picks
     // buffer) but decompresses to well over max_object_bytes.
@@ -684,6 +684,13 @@ fn filter_auto_mode_retries_oversized_object_through_stream() {
         "filter-oversize-buffer.yaml",
         &format!("version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}buffer\n"),
     );
+    let error_settings = write_settings(
+        "filter-oversize-error.yaml",
+        &format!(
+            "version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}buffer\n\
+             behavior:\n  on_object_too_large: error\n"
+        ),
+    );
 
     let output_path = temp_path("filter-oversize-output.json.gz");
     let assert = Command::cargo_bin("cloudtrail-rs")
@@ -705,7 +712,7 @@ fn filter_auto_mode_retries_oversized_object_through_stream() {
     let written = std::fs::read(&output_path).expect("the retry must write the object");
     assert_eq!(kept_event_names(&written), vec!["ConsoleLogin"]);
 
-    // Explicit buffer mode: no retry, the cap is enforced.
+    // Explicit buffer mode: the default policy still streams it.
     let buffer_out = temp_path("filter-oversize-buffer-output.json.gz");
     let assert = Command::cargo_bin("cloudtrail-rs")
         .unwrap()
@@ -719,21 +726,48 @@ fn filter_auto_mode_retries_oversized_object_through_stream() {
         .assert();
     let output = assert.get_output();
     assert!(
-        !output.status.success(),
-        "an explicit mode: buffer must not silently fall back to streaming"
+        output.status.success(),
+        "mode: buffer is a routing preference, not a reason to drop the object, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!buffer_out.exists());
+    assert_eq!(
+        kept_event_names(&std::fs::read(&buffer_out).expect("the retry must write the object")),
+        vec!["ConsoleLogin"]
+    );
+
+    // Only `on_object_too_large: error` turns the cap back into a ceiling.
+    let error_out = temp_path("filter-oversize-error-output.json.gz");
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&input_path)
+        .arg(&error_out)
+        .arg("--rules")
+        .arg(&rules_path)
+        .arg("--settings")
+        .arg(&error_settings)
+        .assert();
+    assert!(!assert.get_output().status.success());
+    assert!(!error_out.exists());
 
     std::fs::remove_file(&rules_path).unwrap();
     std::fs::remove_file(&auto_settings).unwrap();
     std::fs::remove_file(&buffer_settings).unwrap();
+    std::fs::remove_file(&error_settings).unwrap();
     std::fs::remove_file(&input_path).unwrap();
+    std::fs::remove_file(&buffer_out).unwrap();
     std::fs::remove_file(&output_path).unwrap();
 }
 
 #[test]
 fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     let rules_path = drop_decrypt_rules("filter-failure-rules");
+    let settings_path = write_settings(
+        "filter-failure-settings.yaml",
+        "version: 1\n\
+         destination:\n  bucket: unused-by-the-cli\n\
+         behavior:\n  on_parse_error: error\n",
+    );
 
     let in_dir = temp_path("filter-failure-in");
     let out_dir = temp_path("filter-failure-out");
@@ -752,6 +786,8 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
         .arg(&out_dir)
         .arg("--rules")
         .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
         .assert();
     let output = assert.get_output();
 
@@ -780,6 +816,49 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     assert!(
         stderr.contains("b-corrupt.json.gz"),
         "the failed object must be named, got stderr: {stderr}"
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_dir_all(&in_dir).unwrap();
+    std::fs::remove_dir_all(&out_dir).unwrap();
+}
+
+#[test]
+fn filter_copies_an_unparsable_object_verbatim_by_default() {
+    let rules_path = drop_decrypt_rules("filter-unparsable-rules");
+
+    let in_dir = temp_path("filter-unparsable-in");
+    let out_dir = temp_path("filter-unparsable-out");
+    std::fs::create_dir_all(&in_dir).unwrap();
+    let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#;
+    let corrupt = b"this is not gzip";
+    std::fs::write(in_dir.join("a.json.gz"), gzip_bytes(body)).unwrap();
+    std::fs::write(in_dir.join("b-corrupt.json.gz"), corrupt).unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&in_dir)
+        .arg(&out_dir)
+        .arg("--rules")
+        .arg(&rules_path)
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        output.status.success(),
+        "the default on_parse_error is copy, so nothing fails; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("b-corrupt.json.gz")).expect("the object must be forwarded"),
+        corrupt,
+        "an unparsable object must reach the destination byte-for-byte"
+    );
+    assert_eq!(
+        kept_event_names(&std::fs::read(out_dir.join("a.json.gz")).expect("a.json.gz")),
+        vec!["ConsoleLogin"]
     );
 
     std::fs::remove_file(&rules_path).unwrap();
@@ -925,9 +1004,13 @@ fn filter_buffer_mode_caps_the_fetch_not_only_the_decompressed_body() {
     std::fs::write(&input_path, over_cap_on_the_wire()).unwrap();
 
     let caps = "processing:\n  stream_threshold_bytes: 1024\n  max_object_bytes: 1024\n  mode: ";
+    // Otherwise the stream retry recovers the object and masks the fetch cap.
     let buffer_settings = write_settings(
         "filter-fetchcap-buffer.yaml",
-        &format!("version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}buffer\n"),
+        &format!(
+            "version: 1\ndestination:\n  bucket: unused-by-the-cli\n{caps}buffer\n\
+             behavior:\n  on_object_too_large: error\n"
+        ),
     );
     let output_path = temp_path("filter-fetchcap-output.json.gz");
 

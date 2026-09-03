@@ -19,6 +19,14 @@ const S3_MIN_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024;
 /// is rejected at config load.
 const MAX_GZIP_LEVEL: u32 = 9;
 
+/// Upper bound on `processing.gzip_chunks`. Past this the per-member framing
+/// and ratio loss outgrow the parallelism.
+const MAX_GZIP_CHUNKS: usize = 16;
+
+/// Upper bound on `processing.object_concurrency`. Past this the memory
+/// multiplier dominates any latency win.
+const MAX_OBJECT_CONCURRENCY: usize = 64;
+
 /// How an object's size determines buffer vs. stream processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 pub enum ProcessingMode {
@@ -118,6 +126,57 @@ impl std::str::FromStr for OnUnrecognizedObject {
     }
 }
 
+/// What to do with an object whose bytes cannot be parsed at all: bad gzip,
+/// truncated, or not JSON. `Copy` forwards it verbatim so a downstream SIEM
+/// never loses a log to a parse failure; `Error` fails the object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub enum OnParseError {
+    #[serde(rename = "copy")]
+    #[default]
+    Copy,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::str::FromStr for OnParseError {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "copy" => Ok(Self::Copy),
+            "error" => Ok(Self::Error),
+            other => Err(format!(
+                "invalid on_parse_error {other:?}: expected copy or error"
+            )),
+        }
+    }
+}
+
+/// What to do with an object whose body exceeds `processing.max_object_bytes`.
+/// The cap guards buffer-mode memory, so the object is not bad — the path
+/// chosen for it is. `Stream` re-runs it through stream mode, which has no size
+/// cap and filters it normally; `Error` fails the object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub enum OnObjectTooLarge {
+    #[serde(rename = "stream")]
+    #[default]
+    Stream,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::str::FromStr for OnObjectTooLarge {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "stream" => Ok(Self::Stream),
+            "error" => Ok(Self::Error),
+            other => Err(format!(
+                "invalid on_object_too_large {other:?}: expected stream or error"
+            )),
+        }
+    }
+}
+
 /// How to interpret an SQS message body: sniff it (`Auto`), or skip the
 /// sniff because it is known to be a direct S3 event or an SNS envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -185,6 +244,13 @@ fn default_multipart_part_bytes() -> u64 {
 }
 fn default_gzip_level() -> u32 {
     6
+}
+fn default_object_concurrency() -> usize {
+    1
+}
+
+fn default_gzip_chunks() -> usize {
+    1
 }
 fn default_partial_batch_failures() -> bool {
     true
@@ -287,6 +353,16 @@ pub struct Processing {
     pub multipart_part_bytes: u64,
     #[serde(default = "default_gzip_level")]
     pub gzip_level: u32,
+    /// How many of a batch's objects may be in flight at once. Each one holds
+    /// its own decompressed body, so this multiplies peak memory.
+    #[serde(default = "default_object_concurrency")]
+    pub object_concurrency: usize,
+
+    /// How many independently-deflated gzip members buffer mode splits its
+    /// output into. `1` emits a single member; above that, compression runs on
+    /// that many threads and the output grows slightly.
+    #[serde(default = "default_gzip_chunks")]
+    pub gzip_chunks: usize,
 }
 
 impl Default for Processing {
@@ -297,6 +373,8 @@ impl Default for Processing {
             max_object_bytes: default_max_object_bytes(),
             multipart_part_bytes: default_multipart_part_bytes(),
             gzip_level: default_gzip_level(),
+            object_concurrency: default_object_concurrency(),
+            gzip_chunks: default_gzip_chunks(),
         }
     }
 }
@@ -316,6 +394,10 @@ pub struct Behavior {
     pub on_missing_object: OnMissingObject,
     #[serde(default)]
     pub on_unrecognized_object: OnUnrecognizedObject,
+    #[serde(default)]
+    pub on_parse_error: OnParseError,
+    #[serde(default)]
+    pub on_object_too_large: OnObjectTooLarge,
     #[serde(default = "default_partial_batch_failures")]
     pub partial_batch_failures: bool,
 }
@@ -327,6 +409,8 @@ impl Default for Behavior {
             on_config_error: OnConfigError::default(),
             on_missing_object: OnMissingObject::default(),
             on_unrecognized_object: OnUnrecognizedObject::default(),
+            on_parse_error: OnParseError::default(),
+            on_object_too_large: OnObjectTooLarge::default(),
             partial_batch_failures: default_partial_batch_failures(),
         }
     }
@@ -476,6 +560,10 @@ impl Document {
             self.processing.multipart_part_bytes = v
         })?;
         apply(env, "CT_GZIP_LEVEL", |v| self.processing.gzip_level = v)?;
+        apply(env, "CT_OBJECT_CONCURRENCY", |v| {
+            self.processing.object_concurrency = v
+        })?;
+        apply(env, "CT_GZIP_CHUNKS", |v| self.processing.gzip_chunks = v)?;
         apply(env, "CT_DRY_RUN", |v| self.behavior.dry_run = v)?;
         apply(env, "CT_ON_CONFIG_ERROR", |v| {
             self.behavior.on_config_error = v
@@ -485,6 +573,12 @@ impl Document {
         })?;
         apply(env, "CT_ON_UNRECOGNIZED_OBJECT", |v| {
             self.behavior.on_unrecognized_object = v
+        })?;
+        apply(env, "CT_ON_PARSE_ERROR", |v| {
+            self.behavior.on_parse_error = v
+        })?;
+        apply(env, "CT_ON_OBJECT_TOO_LARGE", |v| {
+            self.behavior.on_object_too_large = v
         })?;
         apply(env, "CT_PARTIAL_BATCH_FAILURES", |v| {
             self.behavior.partial_batch_failures = v
@@ -528,6 +622,27 @@ impl Document {
                  (9 = best compression) — flate2's rust_backend panics on higher values, on the \
                  first object processed, not at startup",
                 self.processing.gzip_level
+            )));
+        }
+
+        if self.processing.object_concurrency == 0
+            || self.processing.object_concurrency > MAX_OBJECT_CONCURRENCY
+        {
+            return Err(ConfigError::Parse(format!(
+                "processing.object_concurrency {} is out of range: must be 1..={MAX_OBJECT_CONCURRENCY}. \
+                 Each in-flight object holds its own decompressed body, so this multiplies peak \
+                 memory by up to processing.max_object_bytes per slot",
+                self.processing.object_concurrency
+            )));
+        }
+
+        if self.processing.gzip_chunks == 0 || self.processing.gzip_chunks > MAX_GZIP_CHUNKS {
+            return Err(ConfigError::Parse(format!(
+                "processing.gzip_chunks {} is out of range: must be 1..={MAX_GZIP_CHUNKS}. \
+                 Above 1, buffer mode emits a multi-member gzip and compresses on that many \
+                 threads: the payload is unchanged but the object grows and only pays on a \
+                 Lambda with more than one vCPU",
+                self.processing.gzip_chunks
             )));
         }
 
@@ -653,12 +768,19 @@ mod tests {
         assert_eq!(settings.processing.max_object_bytes, 134_217_728);
         assert_eq!(settings.processing.multipart_part_bytes, 8_388_608);
         assert_eq!(settings.processing.gzip_level, 6);
+        assert_eq!(settings.processing.object_concurrency, 1);
+        assert_eq!(settings.processing.gzip_chunks, 1);
         assert!(!settings.behavior.dry_run);
         assert_eq!(settings.behavior.on_config_error, OnConfigError::Open);
         assert_eq!(settings.behavior.on_missing_object, OnMissingObject::Error);
         assert_eq!(
             settings.behavior.on_unrecognized_object,
             OnUnrecognizedObject::Copy
+        );
+        assert_eq!(settings.behavior.on_parse_error, OnParseError::Copy);
+        assert_eq!(
+            settings.behavior.on_object_too_large,
+            OnObjectTooLarge::Stream
         );
         assert!(settings.behavior.partial_batch_failures);
         assert_eq!(settings.sqs.body_format, SqsBodyFormat::Auto);
@@ -731,10 +853,14 @@ mod tests {
             // Must be >= S3's 5 MiB multipart-part minimum (Fix D).
             ("CT_MULTIPART_PART_BYTES", "5242880"),
             ("CT_GZIP_LEVEL", "9"),
+            ("CT_OBJECT_CONCURRENCY", "8"),
+            ("CT_GZIP_CHUNKS", "4"),
             ("CT_DRY_RUN", "true"),
             ("CT_ON_CONFIG_ERROR", "closed"),
             ("CT_ON_MISSING_OBJECT", "skip"),
             ("CT_ON_UNRECOGNIZED_OBJECT", "error"),
+            ("CT_ON_PARSE_ERROR", "error"),
+            ("CT_ON_OBJECT_TOO_LARGE", "error"),
             ("CT_PARTIAL_BATCH_FAILURES", "false"),
             ("CT_SQS_BODY_FORMAT", "sns"),
             ("CT_RULES_URI", "file:///tmp/overridden-rules.yaml"),
@@ -756,12 +882,19 @@ mod tests {
         assert_eq!(settings.processing.max_object_bytes, 2);
         assert_eq!(settings.processing.multipart_part_bytes, 5_242_880);
         assert_eq!(settings.processing.gzip_level, 9);
+        assert_eq!(settings.processing.object_concurrency, 8);
+        assert_eq!(settings.processing.gzip_chunks, 4);
         assert!(settings.behavior.dry_run);
         assert_eq!(settings.behavior.on_config_error, OnConfigError::Closed);
         assert_eq!(settings.behavior.on_missing_object, OnMissingObject::Skip);
         assert_eq!(
             settings.behavior.on_unrecognized_object,
             OnUnrecognizedObject::Error
+        );
+        assert_eq!(settings.behavior.on_parse_error, OnParseError::Error);
+        assert_eq!(
+            settings.behavior.on_object_too_large,
+            OnObjectTooLarge::Error
         );
         assert!(!settings.behavior.partial_batch_failures);
         assert_eq!(settings.sqs.body_format, SqsBodyFormat::Sns);

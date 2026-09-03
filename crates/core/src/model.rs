@@ -74,6 +74,7 @@ pub struct MetricSnapshot {
     /// delivery rate means the key filter is rejecting everything.
     pub objects_excluded_by_key: u64,
     pub unrecognized_objects: u64,
+    pub objects_copied_unparsed: u64,
     pub records_in: u64,
     pub records_kept: u64,
     pub records_dropped: u64,
