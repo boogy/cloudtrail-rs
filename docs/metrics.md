@@ -45,7 +45,8 @@ the rule that caused it.
 
 `RecordsIn` is counted only once an object's `Records` array has actually been
 recognised — an object that fails to parse contributes to `ParseErrors` /
-`UnrecognizedObjects` / `ObjectsFailed`, never to a lopsided balance.
+`UnrecognizedObjects` / `ObjectsCopiedUnparsed` / `ObjectsFailed`, never to a
+lopsided balance.
 
 ## Metric reference
 
@@ -58,6 +59,7 @@ recognised — an object that fails to parse contributes to `ParseErrors` /
 | `ObjectsFailed`        | Count | An object errored. Counted **before** the `partial_batch_failures` branch, so it moves on both paths.                                                                                                                                                                                  |
 | `ObjectsExcludedByKey` | Count | Object rejected by `source.include_key_regex` / `exclude_key_regex`, before any `GetObject`.                                                                                                                                                                                           |
 | `UnrecognizedObjects`  | Count | Object was valid gzip+JSON but had no `Records` array; `behavior.on_unrecognized_object` decides what happened to it.                                                                                                                                                                  |
+| `ObjectsCopiedUnparsed` | Count | Object's bytes would not parse at all (bad gzip, truncated, not JSON) and `behavior.on_parse_error` is `copy`, so it was forwarded verbatim instead of failing. |
 
 ### Record-level
 
@@ -155,6 +157,7 @@ asymmetry is the signal, not a bug: bytes were read and none were delivered.
 | **Medium**   | `RecordsDropped / RecordsIn` deviating sharply from its baseline                               | A rule change did more or less than intended. Cross-check per-rule `RuleDrops`.                                                                                                                                                      |
 | **Medium**   | `UnrecognizedObjects > 0`                                                                      | Objects that are not CloudTrail are arriving. Confirm `on_unrecognized_object` is what you want for them.                                                                                                                            |
 | **Medium**   | `ParseErrors > 0`                                                                              | Malformed individual records. They are kept, so this is a data-quality signal, not a loss signal.                                                                                                                                    |
+| **Medium**   | `ObjectsCopiedUnparsed > 0`                                                                    | Objects are arriving that this build cannot parse. Nothing is lost — they are forwarded byte-for-byte — but they reach the destination unfiltered, so the exclusion rules did not apply to them. Investigate the producer.          |
 | **Low**      | `ObjectsSkipped > 0`                                                                           | Source objects are missing and `on_missing_object: skip` is discarding them.                                                                                                                                                         |
 | **Low**      | `ItemsWithoutObjects > 0`                                                                      | Events carrying no object references.                                                                                                                                                                                                |
 

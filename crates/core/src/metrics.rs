@@ -26,6 +26,7 @@ pub struct Metrics {
     objects_failed: AtomicU64,
     objects_excluded_by_key: AtomicU64,
     unrecognized_objects: AtomicU64,
+    objects_copied_unparsed: AtomicU64,
     records_in: AtomicU64,
     records_kept: AtomicU64,
     records_dropped: AtomicU64,
@@ -63,6 +64,10 @@ impl Metrics {
 
     pub fn add_unrecognized_objects(&self, n: u64) {
         self.unrecognized_objects.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_objects_copied_unparsed(&self, n: u64) {
+        self.objects_copied_unparsed.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_records_in(&self, n: u64) {
@@ -144,6 +149,7 @@ impl Metrics {
             objects_failed: self.objects_failed.swap(0, Ordering::Relaxed),
             objects_excluded_by_key: self.objects_excluded_by_key.swap(0, Ordering::Relaxed),
             unrecognized_objects: self.unrecognized_objects.swap(0, Ordering::Relaxed),
+            objects_copied_unparsed: self.objects_copied_unparsed.swap(0, Ordering::Relaxed),
             records_in: self.records_in.swap(0, Ordering::Relaxed),
             records_kept: self.records_kept.swap(0, Ordering::Relaxed),
             records_dropped: self.records_dropped.swap(0, Ordering::Relaxed),
@@ -203,6 +209,7 @@ impl EmfMetricsSink {
                         {"Name": "ObjectsFailed", "Unit": "Count"},
                         {"Name": "ObjectsExcludedByKey", "Unit": "Count"},
                         {"Name": "UnrecognizedObjects", "Unit": "Count"},
+                        {"Name": "ObjectsCopiedUnparsed", "Unit": "Count"},
                         {"Name": "RecordsIn", "Unit": "Count"},
                         {"Name": "RecordsKept", "Unit": "Count"},
                         {"Name": "RecordsDropped", "Unit": "Count"},
@@ -221,6 +228,7 @@ impl EmfMetricsSink {
             "ObjectsFailed": snapshot.objects_failed,
             "ObjectsExcludedByKey": snapshot.objects_excluded_by_key,
             "UnrecognizedObjects": snapshot.unrecognized_objects,
+            "ObjectsCopiedUnparsed": snapshot.objects_copied_unparsed,
             "RecordsIn": snapshot.records_in,
             "RecordsKept": snapshot.records_kept,
             "RecordsDropped": snapshot.records_dropped,
@@ -319,6 +327,7 @@ mod tests {
         metrics.add_bytes_in(7);
         metrics.add_bytes_out(8);
         metrics.add_config_load_errors(9);
+        metrics.add_objects_copied_unparsed(15);
         metrics.add_parse_errors(10);
         metrics.add_decode_errors(11);
         metrics.add_items_without_objects(12);
@@ -333,6 +342,7 @@ mod tests {
                 objects_failed: 13,
                 objects_excluded_by_key: 14,
                 unrecognized_objects: 3,
+                objects_copied_unparsed: 15,
                 records_in: 4,
                 records_kept: 5,
                 records_dropped: 6,
@@ -383,6 +393,7 @@ mod tests {
             objects_failed: 4,
             objects_excluded_by_key: 7,
             unrecognized_objects: 1,
+            objects_copied_unparsed: 3,
             records_in: 100,
             records_kept: 90,
             records_dropped: 10,
@@ -413,6 +424,7 @@ mod tests {
                             {"Name": "ObjectsFailed", "Unit": "Count"},
                             {"Name": "ObjectsExcludedByKey", "Unit": "Count"},
                             {"Name": "UnrecognizedObjects", "Unit": "Count"},
+                            {"Name": "ObjectsCopiedUnparsed", "Unit": "Count"},
                             {"Name": "RecordsIn", "Unit": "Count"},
                             {"Name": "RecordsKept", "Unit": "Count"},
                             {"Name": "RecordsDropped", "Unit": "Count"},
@@ -431,6 +443,7 @@ mod tests {
                 "ObjectsFailed": 4,
                 "ObjectsExcludedByKey": 7,
                 "UnrecognizedObjects": 1,
+                "ObjectsCopiedUnparsed": 3,
                 "RecordsIn": 100,
                 "RecordsKept": 90,
                 "RecordsDropped": 10,

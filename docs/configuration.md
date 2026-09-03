@@ -64,6 +64,7 @@ behavior:
   on_config_error: open # open | closed   (DEFAULT: open)
   on_missing_object: error # error | skip
   on_unrecognized_object: copy # copy | skip | error
+  on_parse_error: copy # copy | error — an object that will not parse at all
   partial_batch_failures: true # SQS only
 sqs:
   body_format: auto # auto | s3 | sns — set explicitly to skip the sniff
@@ -101,6 +102,7 @@ observability:
 | `CT_ON_CONFIG_ERROR`          | `behavior.on_config_error`          | `open` \| `closed` when the rules doc has never loaded successfully.                                                                                                                                                                               | `open`                                  |
 | `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                                                                                  | `error`                                 |
 | `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                                                                                      | `copy`                                  |
+| `CT_ON_PARSE_ERROR`           | `behavior.on_parse_error`           | `copy` \| `error` for an object that will not parse at all. See [Fail-open: what happens to an object that will not parse](#fail-open-what-happens-to-an-object-that-will-not-parse).                                                               | `copy`                                  |
 | `CT_PARTIAL_BATCH_FAILURES`   | `behavior.partial_batch_failures`   | SQS only — `true` returns `batchItemFailures` for just the failed items; `false` fails the whole batch. See the [SQS warning](deployment.md#sqs-reportbatchitemfailures-is-not-optional).                                                          | `true`                                  |
 | `CT_SQS_BODY_FORMAT`          | `sqs.body_format`                   | `auto` \| `s3` \| `sns` — set explicitly to skip the SQS body-shape sniff. A body that does not match the format you declared fails the message (it is redelivered, then DLQ'd) rather than acking with zero objects.                              | `auto`                                  |
 | `CT_RULES_URI`                | `rules.uri`                         | `ssm://` \| `s3://` \| `file://` location of the exclusion-rules document.                                                                                                                                                                         | `s3://sec-config/cloudtrail/rules.yaml` |
@@ -122,6 +124,9 @@ observability:
 - **`on_unrecognized_object`** (`copy` \| `skip` \| `error`) — JSON with no
   `Records` array. `copy` forwards it verbatim to the destination, `skip` drops
   it, `error` fails.
+- **`on_parse_error`** (`copy` \| `error`) — the object's bytes will not parse
+  at all: bad gzip, truncated, or not JSON. `copy` forwards it verbatim, `error`
+  fails the object. See below.
 - **`processing.mode`** — see
   [buffer vs stream](architecture.md#processing-modes-buffer-vs-stream).
 
@@ -133,6 +138,48 @@ observability:
 > delivered to the queue will DLQ**: only `Type: "Notification"` is unwrapped as
 > an SNS envelope. Confirm subscriptions out of band, and expect DLQ traffic on
 > a queue that receives them.
+
+#### Fail-open: what happens to an object that will not parse
+
+The filter is fail-open by default at every level, because a SIEM missing a log
+is worse than a SIEM holding one it cannot use.
+
+| Failure                                      | Default            | What lands at the destination                     |
+| -------------------------------------------- | ------------------ | ------------------------------------------------- |
+| A single record fails to parse                | always kept        | the record, verbatim, inside the rewritten object |
+| Object is valid JSON with no `Records` array  | `copy`             | the source object, verbatim                       |
+| Object will not parse at all (gzip or JSON)   | `copy`             | the source object, verbatim                       |
+| Rules document has never loaded               | `open`             | the source object, verbatim, unfiltered           |
+| Source object is missing (`404`)              | `error`            | nothing — the event is re-driven                  |
+| `GetObject` / `PutObject` failed              | error, always      | nothing — the event is re-driven                  |
+
+A **record** that fails to parse is never dropped, in either processing mode,
+and no setting can change that. It is copied into the output and counted in
+`ParseErrors`. This includes a record that is a well-formed JSON span but fails
+a full decode — a lone UTF-16 surrogate escape, say.
+
+An **object** that fails to parse is the case `on_parse_error` governs. Under
+the `copy` default the source bytes are written to the destination key
+unchanged, `ObjectsCopiedUnparsed` is incremented, and the object is not failed;
+under `error` the object fails, and on SQS the message is re-driven and
+eventually DLQ'd. `copy` means a corrupt or non-CloudTrail object reaches the
+SIEM as-is rather than being held in a DLQ nobody reads; `error` means it never
+reaches the SIEM but is never silently accepted either. Choose `error` only if
+you actively work the DLQ.
+
+Two things `on_parse_error` deliberately does not cover, because neither is a
+parse failure:
+
+- **`ObjectTooLarge`.** In `auto` mode the object is retried through stream
+  mode, which has no size cap. Under an explicit `mode: buffer` it stays an
+  error — that mode opted out of streaming.
+- **Store failures.** A failed `GetObject` or `PutObject` must retry. Copying on
+  a destination outage would report success for a write that never landed.
+
+Watch `ObjectsCopiedUnparsed`: a non-zero rate means objects are arriving that
+this filter cannot read at all. It is doing the safe thing with them, but the
+cause — a truncated upload, a non-CloudTrail file matching the key filter — is
+worth finding.
 
 #### Choosing a `gzip_level`
 
@@ -212,6 +259,17 @@ function OOMs on a batch of large objects — a failure the default never has.
 Behavior does not change with the value. Results are adjudicated in submission
 order no matter what order they complete in, so the destination bytes, the
 counters, the failed-message set and its order are identical at every setting.
+
+The one exception is the abort path — `partial_batch_failures: false` plus an
+object that fails. There the batch returns on the first failure in submission
+order, and the objects already in flight beside it have finished: they are
+written and counted, where at `object_concurrency: 1` they would never have
+started. The error returned and the object blamed are the same either way, and
+the invocation still fails and is retried into idempotent writes, so nothing is
+lost or double-counted downstream — but `ObjectsProcessed` for the failed
+invocation is higher than a sequential run would report. Under the default
+`partial_batch_failures: true` the batch runs to completion, so this does not
+arise.
 
 #### Choosing a `gzip_chunks`
 

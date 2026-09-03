@@ -17,8 +17,8 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use cloudtrail_rs_aws::{S3ConfigSource, S3ObjectStore, SsmConfigSource, load_aws_config};
 use cloudtrail_rs_core::config::{
-    Behavior, ConfigUri, KeyFilter, OnUnrecognizedObject, Processing, ProcessingMode, RuleSet,
-    Settings, Source,
+    Behavior, ConfigUri, KeyFilter, OnParseError, OnUnrecognizedObject, Processing, ProcessingMode,
+    RuleSet, Settings, Source,
 };
 use cloudtrail_rs_core::error::{CoreError, StoreError};
 use cloudtrail_rs_core::filter::{Decision, Engine};
@@ -167,8 +167,8 @@ struct SrcObject {
 
 /// The parts of a settings document `filter` honours, resolved once per run:
 /// `processing.*`, `source.*` (via [`KeyFilter`]), `behavior.dry_run` and
-/// `behavior.on_unrecognized_object` — the settings that change what a backfill
-/// selects and writes.
+/// `behavior.on_unrecognized_object` / `behavior.on_parse_error` — the settings
+/// that change what a backfill selects and writes.
 ///
 /// The rest is Lambda-only and ignored: `destination.*` and `rules.*` are the
 /// `dest` and `--rules` arguments, and `sqs.*`, `behavior.on_config_error`,
@@ -179,6 +179,7 @@ struct FilterConfig {
     keys: KeyFilter,
     dry_run: bool,
     on_unrecognized: OnUnrecognizedObject,
+    on_parse_error: OnParseError,
 }
 
 impl FilterConfig {
@@ -203,6 +204,7 @@ impl FilterConfig {
             processing,
             dry_run: behavior.dry_run,
             on_unrecognized: behavior.on_unrecognized_object,
+            on_parse_error: behavior.on_parse_error,
         })
     }
 
@@ -704,10 +706,16 @@ impl Filterer {
     /// The buffer-mode evaluation, up to but not including the write. Split out
     /// so the `auto` `ObjectTooLarge` → stream retry can match one `CoreError`
     /// covering both the capped fetch and `buffer_run`.
-    async fn buffer_eval(&self, src_key: &str) -> Result<(Bytes, Outcome, RecordTally), CoreError> {
+    /// The bytes come back even when the evaluation failed: `on_parse_error`
+    /// copies them verbatim rather than re-reading the object.
+    #[allow(clippy::type_complexity)]
+    async fn buffer_eval(
+        &self,
+        src_key: &str,
+    ) -> Result<(Bytes, Result<(Outcome, RecordTally), CoreError>), CoreError> {
         let bytes = self.fetch_capped(src_key).await?;
-        let (outcome, tally) = buffer_run(&bytes, &self.engine, &self.cfg.processing)?;
-        Ok((bytes, outcome, tally))
+        let evaluated = buffer_run(&bytes, &self.engine, &self.cfg.processing);
+        Ok((bytes, evaluated))
     }
 
     async fn process(
@@ -738,7 +746,12 @@ impl Filterer {
                 }
             }
             Mode::Buffer => {
-                let result = self.buffer_eval(src_key).await;
+                let (bytes, result) = match self.buffer_eval(src_key).await {
+                    Ok(pair) => pair,
+                    // `fetch_capped` never fails to parse anything, so the copy
+                    // policy below cannot apply here.
+                    Err(e) => (Bytes::new(), Err(e)),
+                };
                 match result {
                     // The same retry `Pipeline::process_object` performs: a
                     // compressible object routed to buffer mode off a
@@ -758,8 +771,12 @@ impl Filterer {
                             self.process_stream(src_key, dst_key).await
                         }
                     }
+                    Err(e) if self.copies_unparsable(&e) => {
+                        self.copy_unparsable(src_key, dst_key, Some(bytes), &e, dry_run)
+                            .await
+                    }
                     Err(e) => Err(e.into()),
-                    Ok((bytes, outcome, tally)) => {
+                    Ok((outcome, tally)) => {
                         let object_outcome = if dry_run {
                             // Nothing is written, but the outcome is still
                             // classified so a preview reports the unrecognized
@@ -828,7 +845,14 @@ impl Filterer {
             self.metrics.record_rule_drops(rule, *n);
         }
 
-        if matches!(outcome?, Outcome::Unrecognized) {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) if self.copies_unparsable(&e) => {
+                return self.copy_unparsable(src_key, "", None, &e, true).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if matches!(outcome, Outcome::Unrecognized) {
             self.metrics.add_unrecognized_objects(1);
         }
         Ok(ObjectOutcome::DryRun)
@@ -839,7 +863,7 @@ impl Filterer {
             .store(&self.src)
             .get_stream(self.src.bucket(), src_key)
             .await?;
-        let outcome = stream_run(
+        let outcome = match stream_run(
             reader,
             &self.engine,
             &self.cfg.processing,
@@ -848,7 +872,17 @@ impl Filterer {
             self.dst.bucket(),
             dst_key,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            // The upload is already aborted, so this copy is the only writer.
+            Err(e) if self.copies_unparsable(&e) => {
+                return self
+                    .copy_unparsable(src_key, dst_key, None, &e, false)
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         match outcome {
             Outcome::Written(None) => Ok(ObjectOutcome::Written(self.dst.display(dst_key))),
@@ -863,6 +897,39 @@ impl Filterer {
                 unreachable!("stream_run never returns Written(Some(_))")
             }
         }
+    }
+
+    /// Whether `e` is an object whose own bytes would not parse, under
+    /// `behavior.on_parse_error == copy`. `Pipeline::copies_unparsable`'s
+    /// counterpart.
+    fn copies_unparsable(&self, e: &CoreError) -> bool {
+        self.cfg.on_parse_error == OnParseError::Copy
+            && matches!(e, CoreError::Gzip(_) | CoreError::Json(_))
+    }
+
+    /// Fail-open copy of an object that could not be parsed. `bytes` is the
+    /// already-buffered source; `None` streams it instead.
+    async fn copy_unparsable(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+        bytes: Option<Bytes>,
+        error: &CoreError,
+        dry_run: bool,
+    ) -> anyhow::Result<ObjectOutcome> {
+        eprintln!(
+            "  note: {src_key} did not parse ({error}); copying it verbatim \
+             (behavior.on_parse_error is \"copy\")"
+        );
+        self.metrics.add_objects_copied_unparsed(1);
+        if dry_run {
+            return Ok(ObjectOutcome::DryRun);
+        }
+        let at = match bytes {
+            Some(b) => self.put(dst_key, b).await?,
+            None => self.stream_copy(src_key, dst_key).await?,
+        };
+        Ok(ObjectOutcome::Copied(at))
     }
 
     /// `behavior.on_unrecognized_object` for an object that parsed as JSON but
@@ -1095,6 +1162,10 @@ fn cmd_validate_settings(path: Option<&Path>) -> anyhow::Result<()> {
     println!(
         "  processing.gzip_chunks:            {}",
         settings.processing.gzip_chunks
+    );
+    println!(
+        "  behavior.on_parse_error:           {:?}",
+        settings.behavior.on_parse_error
     );
     println!(
         "  destination.bucket:                {}",

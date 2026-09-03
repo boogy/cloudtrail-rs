@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::config::settings::{
-    KeyFilter, OnConfigError, OnMissingObject, OnUnrecognizedObject, ProcessingMode,
+    KeyFilter, OnConfigError, OnMissingObject, OnParseError, OnUnrecognizedObject, ProcessingMode,
 };
 use crate::config::{ConfigStore, Settings};
 use crate::error::{CoreError, DecodeError, StoreError};
@@ -496,7 +496,13 @@ impl Pipeline {
 
         // Evaluation only, but the `Outcome` is still classified: previewing
         // `UnrecognizedObjects` is what dry run is for.
-        let (outcome, tally) = result?;
+        let (outcome, tally) = match result {
+            Ok(pair) => pair,
+            Err(e) if self.copies_unparsable(&e) => {
+                return self.copy_unparsable(object, "", "", None, &e).await;
+            }
+            Err(e) => return Err(e),
+        };
         if matches!(outcome, Outcome::Unrecognized) {
             self.metrics.add_unrecognized_objects(1);
         }
@@ -549,7 +555,14 @@ impl Pipeline {
         // Those bytes went into `DiscardStore`; `BytesOut` means bytes that
         // reached a real destination.
 
-        if matches!(outcome?, Outcome::Unrecognized) {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) if self.copies_unparsable(&e) => {
+                return self.copy_unparsable(object, "", "", None, &e).await;
+            }
+            Err(e) => return Err(e),
+        };
+        if matches!(outcome, Outcome::Unrecognized) {
             self.metrics.add_unrecognized_objects(1);
         }
 
@@ -579,7 +592,15 @@ impl Pipeline {
         if !retried_via_stream {
             self.metrics.add_bytes_in(bytes.len() as u64);
         }
-        let (outcome, tally) = result?;
+        let (outcome, tally) = match result {
+            Ok(pair) => pair,
+            Err(e) if self.copies_unparsable(&e) => {
+                return self
+                    .copy_unparsable(object, dest_bucket, dest_key, Some(bytes), &e)
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Outcome::Written(Some(out_bytes)) => {
@@ -623,7 +644,7 @@ impl Pipeline {
             return Ok(());
         };
 
-        let outcome = stream_run(
+        let outcome = match stream_run(
             reader,
             engine,
             &self.settings.processing,
@@ -632,7 +653,18 @@ impl Pipeline {
             dest_bucket,
             dest_key,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            // `stream_run` aborted the in-flight upload before returning, so
+            // `dest_key` is untouched and the copy below is the only writer.
+            Err(e) if self.copies_unparsable(&e) => {
+                return self
+                    .copy_unparsable(object, dest_bucket, dest_key, None, &e)
+                    .await;
+            }
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Outcome::Written(None) => {
@@ -674,6 +706,66 @@ impl Pipeline {
             }
             Outcome::Written(Some(_)) => {
                 unreachable!("stream_run never returns Written(Some(_))")
+            }
+        }
+
+        self.metrics.add_objects_processed(1);
+        Ok(())
+    }
+
+    /// Whether `e` is an object whose own bytes would not parse — bad gzip,
+    /// truncated, or not JSON — under `behavior.on_parse_error == copy`.
+    /// Deliberately narrow: a `Store` failure must still retry, and
+    /// `ObjectTooLarge` is `auto` mode's stream retry, not a parse failure.
+    fn copies_unparsable(&self, e: &CoreError) -> bool {
+        self.settings.behavior.on_parse_error == OnParseError::Copy
+            && matches!(e, CoreError::Gzip(_) | CoreError::Json(_))
+    }
+
+    /// Fail-open copy of an object that could not be parsed: forward the source
+    /// bytes verbatim so a downstream SIEM never loses a log to a parse failure.
+    /// `bytes` is the already-buffered source; `None` streams it instead.
+    ///
+    /// No `RecordTally` is committed — no record was ever classified.
+    async fn copy_unparsable(
+        &self,
+        object: &ObjectRef,
+        dest_bucket: &str,
+        dest_key: &str,
+        bytes: Option<Bytes>,
+        error: &CoreError,
+    ) -> Result<(), CoreError> {
+        tracing::warn!(
+            bucket = %object.bucket,
+            key = %object.key,
+            error = %error,
+            "object did not parse; copying it verbatim (behavior.on_parse_error is 'copy')"
+        );
+        self.metrics.add_objects_copied_unparsed(1);
+
+        if self.settings.behavior.dry_run {
+            // Classified and counted, but a dry run writes nothing.
+            self.metrics.add_objects_processed(1);
+            return Ok(());
+        }
+
+        match bytes {
+            Some(bytes) => {
+                let out_len = bytes.len() as u64;
+                self.store
+                    .put(dest_bucket, dest_key, bytes, CANONICAL_META)
+                    .await?;
+                self.metrics.add_bytes_out(out_len);
+            }
+            // `stream_run` already billed what it managed to read to `BytesIn`;
+            // this is a second `GetObject` of the same object.
+            None => {
+                if !self
+                    .stream_copy(object, dest_bucket, dest_key, BytesInPolicy::AlreadyCounted)
+                    .await?
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -1565,6 +1657,132 @@ rules:
             matches!(err, CoreError::UnrecognizedObject { .. }),
             "got {err:?}"
         );
+    }
+
+    async fn unparsable_pipeline(
+        body: Vec<u8>,
+        size: Option<u64>,
+        policy: OnParseError,
+        dry_run: bool,
+    ) -> (
+        Arc<InMemoryStore>,
+        Arc<RecordingSink>,
+        Result<BatchOutcome, CoreError>,
+    ) {
+        let store = Arc::new(InMemoryStore::new());
+        store.seed("src-bucket", "file.json.gz", body);
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", size)],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.behavior.on_parse_error = policy;
+        settings.behavior.dry_run = dry_run;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics,
+            sink.clone(),
+        );
+
+        let result = pipeline.handle(b"{}").await;
+        (store, sink, result)
+    }
+
+    #[tokio::test]
+    async fn corrupt_gzip_is_copied_verbatim_in_buffer_mode() {
+        let body = b"\x1f\x8b not actually gzip at all".to_vec();
+        let (store, sink, result) =
+            unparsable_pipeline(body.clone(), None, OnParseError::Copy, false).await;
+        result.expect("on_parse_error=copy must not fail the object");
+
+        let written = store
+            .object("dest-bucket", "file.json.gz")
+            .expect("an unparsable object must still reach the destination");
+        assert_eq!(written.as_ref(), body.as_slice());
+
+        let snap = &sink.snapshots()[0];
+        assert_eq!(snap.objects_copied_unparsed, 1);
+        assert_eq!(snap.objects_processed, 1);
+        assert_eq!(snap.objects_failed, 0);
+        assert_eq!(snap.records_in, 0);
+        assert_eq!(snap.bytes_out, body.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn valid_gzip_that_is_not_json_is_copied_verbatim_in_buffer_mode() {
+        let body = gzip_bytes(b"this is not JSON");
+        let (store, _sink, result) =
+            unparsable_pipeline(body.clone(), None, OnParseError::Copy, false).await;
+        result.expect("on_parse_error=copy must not fail the object");
+        assert_eq!(
+            store
+                .object("dest-bucket", "file.json.gz")
+                .expect("must be copied")
+                .as_ref(),
+            body.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_records_array_is_copied_rather_than_lost() {
+        let body = gzip_bytes(br#"{"Records":[{"eventName":"Decrypt"},{"eventNa"#);
+        let (store, _sink, result) =
+            unparsable_pipeline(body.clone(), None, OnParseError::Copy, false).await;
+        result.expect("a truncated envelope must not be dropped");
+        assert_eq!(
+            store
+                .object("dest-bucket", "file.json.gz")
+                .expect("must be copied")
+                .as_ref(),
+            body.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_parse_error_error_still_fails_the_object() {
+        let body = gzip_bytes(b"this is not JSON");
+        let (store, sink, result) =
+            unparsable_pipeline(body, None, OnParseError::Error, false).await;
+        let err = result.expect_err("on_parse_error=error must fail the object");
+        assert!(matches!(err, CoreError::Json(_)), "got {err:?}");
+        assert!(!store.contains("dest-bucket", "file.json.gz"));
+        assert_eq!(sink.snapshots()[0].objects_copied_unparsed, 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_gzip_is_copied_verbatim_in_stream_mode() {
+        let body = b"\x1f\x8b not actually gzip at all".to_vec();
+        let (store, sink, result) =
+            unparsable_pipeline(body.clone(), Some(9_000_000), OnParseError::Copy, false).await;
+        result.expect("on_parse_error=copy must not fail the object");
+        assert_eq!(
+            store
+                .object("dest-bucket", "file.json.gz")
+                .expect("must be copied")
+                .as_ref(),
+            body.as_slice()
+        );
+        assert_eq!(sink.snapshots()[0].objects_copied_unparsed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_counts_an_unparsable_object_without_writing_it() {
+        let body = gzip_bytes(b"this is not JSON");
+        let (store, sink, result) = unparsable_pipeline(body, None, OnParseError::Copy, true).await;
+        result.expect("dry run must not fail the object");
+        assert!(!store.contains("dest-bucket", "file.json.gz"));
+        let snap = &sink.snapshots()[0];
+        assert_eq!(snap.objects_copied_unparsed, 1);
+        assert_eq!(snap.bytes_out, 0);
     }
 
     #[tokio::test]

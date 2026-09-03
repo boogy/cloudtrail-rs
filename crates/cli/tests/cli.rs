@@ -734,6 +734,12 @@ fn filter_auto_mode_retries_oversized_object_through_stream() {
 #[test]
 fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     let rules_path = drop_decrypt_rules("filter-failure-rules");
+    let settings_path = write_settings(
+        "filter-failure-settings.yaml",
+        "version: 1\n\
+         destination:\n  bucket: unused-by-the-cli\n\
+         behavior:\n  on_parse_error: error\n",
+    );
 
     let in_dir = temp_path("filter-failure-in");
     let out_dir = temp_path("filter-failure-out");
@@ -752,6 +758,8 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
         .arg(&out_dir)
         .arg("--rules")
         .arg(&rules_path)
+        .arg("--settings")
+        .arg(&settings_path)
         .assert();
     let output = assert.get_output();
 
@@ -780,6 +788,49 @@ fn filter_batch_continues_past_a_failure_and_exits_nonzero() {
     assert!(
         stderr.contains("b-corrupt.json.gz"),
         "the failed object must be named, got stderr: {stderr}"
+    );
+
+    std::fs::remove_file(&rules_path).unwrap();
+    std::fs::remove_file(&settings_path).unwrap();
+    std::fs::remove_dir_all(&in_dir).unwrap();
+    std::fs::remove_dir_all(&out_dir).unwrap();
+}
+
+#[test]
+fn filter_copies_an_unparsable_object_verbatim_by_default() {
+    let rules_path = drop_decrypt_rules("filter-unparsable-rules");
+
+    let in_dir = temp_path("filter-unparsable-in");
+    let out_dir = temp_path("filter-unparsable-out");
+    std::fs::create_dir_all(&in_dir).unwrap();
+    let body = br#"{"Records":[{"eventName":"ConsoleLogin"},{"eventName":"Decrypt"}]}"#;
+    let corrupt = b"this is not gzip";
+    std::fs::write(in_dir.join("a.json.gz"), gzip_bytes(body)).unwrap();
+    std::fs::write(in_dir.join("b-corrupt.json.gz"), corrupt).unwrap();
+
+    let assert = Command::cargo_bin("cloudtrail-rs")
+        .unwrap()
+        .arg("filter")
+        .arg(&in_dir)
+        .arg(&out_dir)
+        .arg("--rules")
+        .arg(&rules_path)
+        .assert();
+    let output = assert.get_output();
+
+    assert!(
+        output.status.success(),
+        "the default on_parse_error is copy, so nothing fails; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("b-corrupt.json.gz")).expect("the object must be forwarded"),
+        corrupt,
+        "an unparsable object must reach the destination byte-for-byte"
+    );
+    assert_eq!(
+        kept_event_names(&std::fs::read(out_dir.join("a.json.gz")).expect("a.json.gz")),
+        vec!["ConsoleLogin"]
     );
 
     std::fs::remove_file(&rules_path).unwrap();

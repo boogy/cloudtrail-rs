@@ -126,6 +126,31 @@ impl std::str::FromStr for OnUnrecognizedObject {
     }
 }
 
+/// What to do with an object whose bytes cannot be parsed at all: bad gzip,
+/// truncated, or not JSON. `Copy` forwards it verbatim so a downstream SIEM
+/// never loses a log to a parse failure; `Error` fails the object instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub enum OnParseError {
+    #[serde(rename = "copy")]
+    #[default]
+    Copy,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::str::FromStr for OnParseError {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "copy" => Ok(Self::Copy),
+            "error" => Ok(Self::Error),
+            other => Err(format!(
+                "invalid on_parse_error {other:?}: expected copy or error"
+            )),
+        }
+    }
+}
+
 /// How to interpret an SQS message body: sniff it (`Auto`), or skip the
 /// sniff because it is known to be a direct S3 event or an SNS envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
@@ -343,6 +368,8 @@ pub struct Behavior {
     pub on_missing_object: OnMissingObject,
     #[serde(default)]
     pub on_unrecognized_object: OnUnrecognizedObject,
+    #[serde(default)]
+    pub on_parse_error: OnParseError,
     #[serde(default = "default_partial_batch_failures")]
     pub partial_batch_failures: bool,
 }
@@ -354,6 +381,7 @@ impl Default for Behavior {
             on_config_error: OnConfigError::default(),
             on_missing_object: OnMissingObject::default(),
             on_unrecognized_object: OnUnrecognizedObject::default(),
+            on_parse_error: OnParseError::default(),
             partial_batch_failures: default_partial_batch_failures(),
         }
     }
@@ -516,6 +544,9 @@ impl Document {
         })?;
         apply(env, "CT_ON_UNRECOGNIZED_OBJECT", |v| {
             self.behavior.on_unrecognized_object = v
+        })?;
+        apply(env, "CT_ON_PARSE_ERROR", |v| {
+            self.behavior.on_parse_error = v
         })?;
         apply(env, "CT_PARTIAL_BATCH_FAILURES", |v| {
             self.behavior.partial_batch_failures = v

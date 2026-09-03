@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`behavior.on_parse_error` (`CT_ON_PARSE_ERROR`), default `copy`.** An
+  object whose bytes will not parse at all — bad gzip, truncated, or not JSON —
+  is now forwarded to the destination byte-for-byte instead of failing the
+  object, so a downstream SIEM never loses a log to a parse failure. Set it to
+  `error` for the previous behavior (fail the object, DLQ it, alert). Copies
+  are counted by the new `ObjectsCopiedUnparsed` metric; the object arrives
+  unfiltered, so a non-zero count means exclusion rules did not apply to it.
+  The policy deliberately does not cover `ObjectTooLarge` (auto mode already
+  retries those in stream mode) or destination-store failures (those must
+  retry). Individual malformed *records* were already kept in both modes and
+  are unaffected.
 - **`processing.object_concurrency` (`CT_OBJECT_CONCURRENCY`), default `1`.**
   Bounds how many of a batch's objects are fetched, filtered and written at
   once. The default is fully sequential, so behavior and output bytes are
