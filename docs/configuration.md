@@ -57,6 +57,8 @@ processing:
   max_object_bytes: 134217728 # BUFFER MODE ONLY — memory guard
   multipart_part_bytes: 8388608 # stream mode
   gzip_level: 6
+  object_concurrency: 1 # objects in flight per batch — multiplies peak memory
+  gzip_chunks: 1 # BUFFER MODE ONLY — parallel gzip members; 1 = single member
 behavior:
   dry_run: false # evaluate + count, write nothing to the destination
   on_config_error: open # open | closed   (DEFAULT: open)
@@ -81,29 +83,31 @@ observability:
 
 ## Environment variable reference
 
-| Variable                      | Settings path                       | Meaning                                                                                                                                                                                                               | Default                                 |
-| ----------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| `SETTINGS_URI`                | — (bootstrap only)                  | `file://`, `s3://`, or `ssm://` location of the optional settings YAML document.                                                                                                                                      | none (env-only deployment)              |
-| `CT_DEST_BUCKET`              | `destination.bucket`                | Destination bucket for filtered output. **Required** (here or in the file).                                                                                                                                           | —                                       |
-| `CT_KEY_PREFIX`               | `destination.key_prefix`            | Prefix prepended to the source key for the destination key. `""` = identical key.                                                                                                                                     | `""`                                    |
-| `CT_SOURCE_INCLUDE_KEY_REGEX` | `source.include_key_regex`          | Source key must match this to be processed.                                                                                                                                                                           | `\.json\.gz$`                           |
-| `CT_SOURCE_EXCLUDE_KEY_REGEX` | `source.exclude_key_regex`          | Source key matching this is skipped (digests, Insights, folder markers).                                                                                                                                              | `(/CloudTrail-Digest/                   | /CloudTrail-Insight/ | /$)` |
-| `CT_PROCESSING_MODE`          | `processing.mode`                   | `auto` \| `buffer` \| `stream`.                                                                                                                                                                                       | `auto`                                  |
-| `CT_STREAM_THRESHOLD_BYTES`   | `processing.stream_threshold_bytes` | `auto` mode switches to streaming above this object size.                                                                                                                                                             | `8388608`                               |
-| `CT_MAX_OBJECT_BYTES`         | `processing.max_object_bytes`       | Buffer-mode-only memory guard: caps the fetch and the decompressed body.                                                                                                                                              | `134217728`                             |
-| `CT_MULTIPART_PART_BYTES`     | `processing.multipart_part_bytes`   | Stream-mode S3 multipart part size.                                                                                                                                                                                   | `8388608`                               |
-| `CT_GZIP_LEVEL`               | `processing.gzip_level`             | Output gzip compression level.                                                                                                                                                                                        | `6`                                     |
-| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count what would be dropped, but write nothing to the destination.                                                                                                                                       | `false`                                 |
-| `CT_ON_CONFIG_ERROR`          | `behavior.on_config_error`          | `open` \| `closed` when the rules doc has never loaded successfully.                                                                                                                                                  | `open`                                  |
-| `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                                                     | `error`                                 |
-| `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                                                         | `copy`                                  |
-| `CT_PARTIAL_BATCH_FAILURES`   | `behavior.partial_batch_failures`   | SQS only — `true` returns `batchItemFailures` for just the failed items; `false` fails the whole batch. See the [SQS warning](deployment.md#sqs-reportbatchitemfailures-is-not-optional).                             | `true`                                  |
-| `CT_SQS_BODY_FORMAT`          | `sqs.body_format`                   | `auto` \| `s3` \| `sns` — set explicitly to skip the SQS body-shape sniff. A body that does not match the format you declared fails the message (it is redelivered, then DLQ'd) rather than acking with zero objects. | `auto`                                  |
-| `CT_RULES_URI`                | `rules.uri`                         | `ssm://` \| `s3://` \| `file://` location of the exclusion-rules document.                                                                                                                                            | `s3://sec-config/cloudtrail/rules.yaml` |
-| `CT_RULES_TTL_SECONDS`        | `rules.ttl_seconds`                 | Cache TTL before revalidating the rules document.                                                                                                                                                                     | `300`                                   |
-| `CT_METRICS`                  | `observability.metrics`             | `emf` \| `none`.                                                                                                                                                                                                      | `emf`                                   |
-| `CT_METRICS_NAMESPACE`        | `observability.namespace`           | CloudWatch EMF namespace.                                                                                                                                                                                             | `cloudtrail-rs`                         |
-| `CT_LOG_LEVEL`                | `observability.log_level`           | Log verbosity.                                                                                                                                                                                                        | `info`                                  |
+| Variable                      | Settings path                       | Meaning                                                                                                                                                                                                                                            | Default                                 |
+| ----------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `SETTINGS_URI`                | — (bootstrap only)                  | `file://`, `s3://`, or `ssm://` location of the optional settings YAML document.                                                                                                                                                                   | none (env-only deployment)              |
+| `CT_DEST_BUCKET`              | `destination.bucket`                | Destination bucket for filtered output. **Required** (here or in the file).                                                                                                                                                                        | —                                       |
+| `CT_KEY_PREFIX`               | `destination.key_prefix`            | Prefix prepended to the source key for the destination key. `""` = identical key.                                                                                                                                                                  | `""`                                    |
+| `CT_SOURCE_INCLUDE_KEY_REGEX` | `source.include_key_regex`          | Source key must match this to be processed.                                                                                                                                                                                                        | `\.json\.gz$`                           |
+| `CT_SOURCE_EXCLUDE_KEY_REGEX` | `source.exclude_key_regex`          | Source key matching this is skipped (digests, Insights, folder markers).                                                                                                                                                                           | `(/CloudTrail-Digest/                   | /CloudTrail-Insight/ | /$)` |
+| `CT_PROCESSING_MODE`          | `processing.mode`                   | `auto` \| `buffer` \| `stream`.                                                                                                                                                                                                                    | `auto`                                  |
+| `CT_STREAM_THRESHOLD_BYTES`   | `processing.stream_threshold_bytes` | `auto` mode switches to streaming above this object size.                                                                                                                                                                                          | `8388608`                               |
+| `CT_MAX_OBJECT_BYTES`         | `processing.max_object_bytes`       | Buffer-mode-only memory guard: caps the fetch and the decompressed body.                                                                                                                                                                           | `134217728`                             |
+| `CT_MULTIPART_PART_BYTES`     | `processing.multipart_part_bytes`   | Stream-mode S3 multipart part size.                                                                                                                                                                                                                | `8388608`                               |
+| `CT_GZIP_LEVEL`               | `processing.gzip_level`             | Output gzip compression level.                                                                                                                                                                                                                     | `6`                                     |
+| `CT_OBJECT_CONCURRENCY`       | `processing.object_concurrency`     | How many of a batch's objects are fetched, filtered and written concurrently. `1` is fully sequential. Does nothing unless one invocation carries several objects — see [Choosing an `object_concurrency`](#choosing-an-object_concurrency).       | `1`                                     |
+| `CT_GZIP_CHUNKS`              | `processing.gzip_chunks`            | Buffer mode only: how many independently-deflated gzip members the output is split into, compressed on that many threads. `1` emits a single member. See [Choosing a `gzip_chunks`](#choosing-a-gzip_chunks) — check your downstream reader first. | `1`                                     |
+| `CT_DRY_RUN`                  | `behavior.dry_run`                  | Evaluate and count what would be dropped, but write nothing to the destination.                                                                                                                                                                    | `false`                                 |
+| `CT_ON_CONFIG_ERROR`          | `behavior.on_config_error`          | `open` \| `closed` when the rules doc has never loaded successfully.                                                                                                                                                                               | `open`                                  |
+| `CT_ON_MISSING_OBJECT`        | `behavior.on_missing_object`        | `error` \| `skip` when the source object is gone.                                                                                                                                                                                                  | `error`                                 |
+| `CT_ON_UNRECOGNIZED_OBJECT`   | `behavior.on_unrecognized_object`   | `copy` \| `skip` \| `error` for JSON with no `Records` array.                                                                                                                                                                                      | `copy`                                  |
+| `CT_PARTIAL_BATCH_FAILURES`   | `behavior.partial_batch_failures`   | SQS only — `true` returns `batchItemFailures` for just the failed items; `false` fails the whole batch. See the [SQS warning](deployment.md#sqs-reportbatchitemfailures-is-not-optional).                                                          | `true`                                  |
+| `CT_SQS_BODY_FORMAT`          | `sqs.body_format`                   | `auto` \| `s3` \| `sns` — set explicitly to skip the SQS body-shape sniff. A body that does not match the format you declared fails the message (it is redelivered, then DLQ'd) rather than acking with zero objects.                              | `auto`                                  |
+| `CT_RULES_URI`                | `rules.uri`                         | `ssm://` \| `s3://` \| `file://` location of the exclusion-rules document.                                                                                                                                                                         | `s3://sec-config/cloudtrail/rules.yaml` |
+| `CT_RULES_TTL_SECONDS`        | `rules.ttl_seconds`                 | Cache TTL before revalidating the rules document.                                                                                                                                                                                                  | `300`                                   |
+| `CT_METRICS`                  | `observability.metrics`             | `emf` \| `none`.                                                                                                                                                                                                                                   | `emf`                                   |
+| `CT_METRICS_NAMESPACE`        | `observability.namespace`           | CloudWatch EMF namespace.                                                                                                                                                                                                                          | `cloudtrail-rs`                         |
+| `CT_LOG_LEVEL`                | `observability.log_level`           | Log verbosity.                                                                                                                                                                                                                                     | `info`                                  |
 
 ### Behavior knobs worth understanding
 
@@ -158,6 +162,99 @@ slower_ output than level 4 — neither dominates the other. Do not assume a
 lower level is always faster and larger; re-measure on your own data before
 tuning.
 
+#### Choosing an `object_concurrency`
+
+**It only does something when one invocation carries more than one object.**
+Objects come from the decoder, so the trigger decides the ceiling:
+
+| Trigger       | Objects per invocation                    | Useful range           |
+| ------------- | ----------------------------------------- | ---------------------- |
+| `eventbridge` | always exactly 1                          | none — leave it at `1` |
+| `s3`          | the notification's `Records` (usually 1)  | rarely worth raising   |
+| `sns`         | one item per SNS record                   | up to the fan-out      |
+| `sqs`         | one item per message = **the batch size** | up to the batch size   |
+
+Anything above the object count is dead configuration: the extra slots never
+fill. **If you run the `eventbridge` binary, this setting can do nothing at
+all.** The setting that governs how many objects arrive together is the SQS
+event source's batch size, not this one.
+
+Where it does apply, it overlaps S3 round-trips — it does **not** add CPU
+parallelism, because every binary runs a `current_thread` Tokio runtime. So the
+win is bounded by the share of wall clock spent waiting on S3, and the floor is
+the serialized CPU cost of the whole batch. Measured on 16 objects of 4,000
+records each, with a 30 ms simulated latency on every `get`:
+
+| `object_concurrency` | wall clock | vs. `1` |
+| -------------------- | ---------- | ------- |
+| **1 (default)**      | 846.8 ms   | —       |
+| 2                    | 521.0 ms   | 1.65x   |
+| 4                    | 375.4 ms   | 2.28x   |
+| 8                    | 303.8 ms   | 2.82x   |
+| 16                   | 264.9 ms   | 3.24x   |
+| 32                   | 270.1 ms   | 3.17x   |
+
+Two things to read off it. Returns fall away well before the cap: `4` captures
+70% of the win that `16` does. And `32` is no faster than `16` — there were only
+16 objects, so the extra slots did nothing. The 265 ms plateau is the CPU floor:
+re-run with zero latency and every concurrency lands within noise of 234 ms,
+because there is no I/O left to hide.
+
+**Practical guidance.** Leave it at `1` unless you are on the SQS binary with a
+batch size above 1. There, start at `4`, and never set it above your batch size.
+Then check `max_object_bytes`: each in-flight object holds its own compressed
+fetch _and_ its own decompressed body, so peak memory scales with the setting.
+Buffer mode already peaks at roughly two object-sized buffers, so at the 128 MiB
+`max_object_bytes` default, `object_concurrency: 4` can put ~1 GB in flight in
+the worst case. Raise Lambda memory or lower `max_object_bytes` to match, or the
+function OOMs on a batch of large objects — a failure the default never has.
+
+Behavior does not change with the value. Results are adjudicated in submission
+order no matter what order they complete in, so the destination bytes, the
+counters, the failed-message set and its order are identical at every setting.
+
+#### Choosing a `gzip_chunks`
+
+**Buffer mode only** — stream mode ignores it. Above `1`, the survivors are
+split at byte offsets, each part is deflated on its own thread, and the members
+are concatenated. A gzip stream decompresses to the concatenation of its
+members, so the payload is byte-identical at every chunk count; only the framing
+and the compressed size change.
+
+| `gzip_chunks`   | time     | vs. `1`   | output size |
+| --------------- | -------- | --------- | ----------- |
+| **1 (default)** | 14.25 ms | —         | —           |
+| 2               | 7.34 ms  | **1.94x** | +1.73%      |
+| 4               | 4.02 ms  | **3.54x** | +5.28%      |
+
+Each member after the first starts with an empty back-reference window, which is
+where the size increase comes from. Chunks below 64 KiB are collapsed, so a
+small object silently stays a single member and pays nothing.
+
+**It needs more than one vCPU to do anything.** Lambda allocates vCPU in
+proportion to memory: below ~1769 MB the function has less than one full vCPU,
+the threads contend for it, and you pay the size increase for no speedup. Leave
+it at `1` on a small function.
+
+> **Check your downstream reader before enabling this.** Multi-member gzip is
+> valid per RFC 1952 and every mainstream reader handles it — verified on an
+> 8-member object from this tool:
+>
+> | Reader                             | Reads all 8 members        |
+> | ---------------------------------- | -------------------------- |
+> | `gzip -dc` / `zcat` / `gzip -t`    | yes                        |
+> | Python `gzip` module               | yes                        |
+> | Node `zlib.gunzipSync`             | yes                        |
+> | Go `compress/gzip`                 | yes                        |
+> | Python `zlib.decompress(data, 31)` | **no — first member only** |
+> | Rust `flate2::read::GzDecoder`     | **no — first member only** |
+>
+> The two that fail do so **silently**: no error, just a short read. On that
+> 8-member object `zlib.decompress(data, 31)` returned 370,002 of 2,960,013
+> bytes and reported success. If anything downstream uses a single-member
+> decoder, leave `gzip_chunks` at `1`; the default emits exactly the bytes the
+> unchunked encoder always did.
+
 ## Validation constraints
 
 `panic = "abort"` is set in the release profile, so a bad config value that
@@ -172,6 +269,8 @@ bad value is a clear load-time error instead:
 | `source.exclude_key_regex`        | must compile                           | Same as above.                                                                                                                                                                                                                                                         |
 | `processing.max_object_bytes`     | `>= processing.stream_threshold_bytes` | `stream_threshold_bytes` is a **compressed**-size estimate that picks buffer vs. stream mode; `max_object_bytes` is buffer mode's memory cap, applied to the compressed fetch **and** the decompressed body. If it's smaller, buffer-mode objects always blow the cap. |
 | `processing.multipart_part_bytes` | `>= 5 * 1024 * 1024` (S3's minimum)    | A smaller part size fails `CompleteMultipartUpload` with `EntityTooSmall` mid-object, after bytes are already uploaded.                                                                                                                                                |
+| `processing.object_concurrency`   | `1`–`64`                               | Each in-flight object holds its own decompressed body, so this multiplies peak memory by up to `max_object_bytes` per slot. `0` would process nothing; past `64` the memory multiplier dominates any latency win.                                                      |
+| `processing.gzip_chunks`          | `1`–`16`                               | Each member above the first loses the previous chunk's back-reference window, so the object grows. `0` would emit nothing; past `16` the per-member framing and ratio loss outgrow the parallelism.                                                                    |
 
 ## Pre-deploy validation: `validate-settings`
 

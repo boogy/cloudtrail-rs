@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`processing.object_concurrency` (`CT_OBJECT_CONCURRENCY`), default `1`.**
+  Bounds how many of a batch's objects are fetched, filtered and written at
+  once. The default is fully sequential, so behavior and output bytes are
+  unchanged unless an operator opts in. Results are adjudicated in submission
+  order regardless of completion order, so the failed-ack-id set, its order and
+  the error chosen under `partial_batch_failures: false` are identical at every
+  concurrency. Each in-flight object holds its own decompressed body, so the
+  setting multiplies peak memory by up to `processing.max_object_bytes` per
+  slot and is capped at `64`.
+- **`processing.gzip_chunks` (`CT_GZIP_CHUNKS`), default `1`.** Buffer mode
+  only: splits the output into that many independently-deflated gzip members,
+  compressed on that many threads. A gzip stream decompresses to the
+  concatenation of its members, so the decompressed payload is byte-identical
+  at every chunk count and only the framing and the compressed size change.
+  `gzip`/`zcat`, Python's `gzip` module, Node's `zlib.gunzipSync` and Go's
+  `compress/gzip` all read it in full, but a strict single-member decoder
+  (Python `zlib.decompress(data, 31)`, Rust `flate2::read::GzDecoder`) silently
+  returns only the first member — check the downstream reader before enabling. Measured **1.94x** compression speed at `2`
+  for **+1.73%** object size, **3.54x** at `4` for **+5.28%**. Chunks below
+  64 KiB are collapsed, so a small object stays a single member, and the
+  setting is capped at `16`. It only pays above ~1769 MB of Lambda memory,
+  where the function has more than one vCPU; the default emits exactly the
+  bytes the unchunked encoder did.
+- **Operator guidance for both new settings** in `docs/configuration.md`:
+  "Choosing an `object_concurrency`" (which triggers can carry more than one
+  object, a measured scaling table, and the memory arithmetic) and "Choosing a
+  `gzip_chunks`" (the time/size frontier and a verified reader-compatibility
+  matrix).
+- **`h2 >=0.4.0, <0.4.16` banned** in `deny.toml`, so the shipped HTTP/2 stack
+  can never slide back below the RUSTSEC-2026-0258 fix.
+- **Two MiniStack integration tests** covering the new settings against a real
+  S3: `chunked_gzip_survives_a_real_s3_round_trip` and
+  `concurrent_objects_all_land_correctly_in_real_s3`.
+
+### Security
+
+- **`h2` bumped 0.4.15 -> 0.4.19** (RUSTSEC-2026-0258, unbounded empty DATA
+  frames). The remaining `h2 0.3.27` in the graph is reached only through
+  `aws-smithy-http-client`'s `hyper-014` / `legacy-test-util` features, which
+  `deny.toml`'s `all-features = true` forces on; `cargo tree -e normal --target
+  aarch64-unknown-linux-musl` finds zero of it in any of the four Lambdas or the
+  CLI. The advisory is ignored for that test-only edge and the ban above keeps
+  the shipped line patched.
+
 ### Changed
 
 - **Zero-copy scalar capture in the projected parse.** Captured JSON scalars
@@ -15,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `evaluate_raw` improved **14.44%** (p<0.05) on `crates/core/benches/filter.rs`
   (500 scaled records). A separate 4,000-record fixture with realistic entropy
   measured 5.97 ms -> 4.88 ms (-19.7%); that fixture is not in the repo.
+- **Buffer-mode decompression buffer pre-sized from gzip's ISIZE trailer.**
+  The hint is attacker-controlled, so it is clamped by both
+  `processing.max_object_bytes` and DEFLATE's 1032:1 maximum expansion ratio; a
+  wrong hint costs a realloc, never correctness, and a lying trailer is still
+  rejected by the decoder's own checksum. Decompression measured
+  2.5145 ms -> 2.1976 ms (**-12.6%**) on a 4,000-record fixture with realistic
+  entropy; output bytes are unchanged.
+- **The self-trigger guard now runs before the first `get`.** It was already a
+  hard error; it is now raised while building the work list, so a
+  misconfigured destination writes nothing at all instead of writing the
+  objects that preceded the offending one.
 - **Buffer-mode output body assembled in one allocation.** The previous
   `join` + `format!` held two full copies of the body; one `Vec` pre-sized from
   the survivors' lengths holds one. Throughput is unchanged — compression

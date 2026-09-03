@@ -83,6 +83,8 @@ cloudtrail-rs validate-settings examples/settings.example.yaml
 #   processing.max_object_bytes:       134217728
 #   processing.multipart_part_bytes:   8388608
 #   processing.gzip_level:             6
+#   processing.object_concurrency:     1
+#   processing.gzip_chunks:            1
 #   destination.bucket:                ct-siem-sync
 #   rules.uri:                         s3://sec-config/cloudtrail/rules.yaml
 echo $?   # 0
@@ -145,6 +147,8 @@ Honoured:
 | `processing.max_object_bytes`       | Buffer mode's memory cap (compressed fetch and decompressed body). In `auto`, an object over it is **retried through stream mode** — the same retry the Lambda performs — so nothing the Lambda handles fails a backfill. `mode: buffer` opts out. |
 | `processing.gzip_level`             | Output compression level.                                                                                                                                                                                                                          |
 | `processing.multipart_part_bytes`   | Part size for a streamed S3 write.                                                                                                                                                                                                                 |
+| `processing.object_concurrency`     | Objects processed concurrently per batch; `1` is sequential.                                                                                                                                                                                       |
+| `processing.gzip_chunks`            | **Buffer mode only.** Gzip members the output is split into, compressed in parallel; `1` is a single member.                                                                                                                                       |
 | `behavior.dry_run`                  | Evaluate and count every record, write nothing. Selects the destination, not the mode: an object that would stream is still previewed through stream mode (into a discard destination), so the preview's verdict is the real run's verdict.        |
 | `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                                                       |
 
