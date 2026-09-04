@@ -1,0 +1,10 @@
+# Mirrors the `[advisories] ignore` list in `deny.toml`. cargo-audit does not
+# read deny.toml, so an ignore recorded only there leaves `make ci` red while
+# `make deny` is green. Every entry here must have a matching, reasoned entry
+# in deny.toml — that file is the decision record.
+[advisories]
+ignore = [
+    # h2 0.3.27, reachable only from dev-dependencies; deny.toml additionally
+    # bans a shipped h2 in >=0.4.0, <0.4.16 so the 0.4 line cannot regress.
+    "RUSTSEC-2026-0258",
+]

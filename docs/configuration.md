@@ -180,6 +180,9 @@ parse failure:
   filters it properly, so `on_parse_error` would be the worse tool.
 - **Store failures.** A failed `GetObject` or `PutObject` must retry. Copying on
   a destination outage would report success for a write that never landed.
+- **Internal failures** — a compression or worker-task failure (`CoreError::Internal`).
+  The object may already have been decompressed, parsed and filtered, so copying
+  its source verbatim would forward every record the rules dropped.
 
 #### An object bigger than `max_object_bytes`
 

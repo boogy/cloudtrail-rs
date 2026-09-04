@@ -81,13 +81,16 @@ fn decompress_capped(input: &[u8], max_object_bytes: u64) -> Result<Vec<u8>, Cor
     Ok(buf)
 }
 
-/// Gzip-compress `body` at `level`.
+/// Gzip-compress `body` at `level`. Output side, so a failure is `Internal`,
+/// never `Gzip`: `on_parse_error: copy` must not treat it as unreadable source.
 fn gzip_compress(body: &[u8], level: u32) -> Result<Vec<u8>, CoreError> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
     encoder
         .write_all(body)
-        .map_err(|e| CoreError::Gzip(e.to_string()))?;
-    encoder.finish().map_err(|e| CoreError::Gzip(e.to_string()))
+        .map_err(|e| CoreError::Internal(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| CoreError::Internal(e.to_string()))
 }
 
 /// Below this, a member's framing and its lost back-reference window cost more
@@ -118,7 +121,7 @@ fn gzip_compress_chunked(body: &[u8], level: u32, chunks: usize) -> Result<Vec<u
         members.push(gzip_compress(parts[0], level));
         members.extend(workers.into_iter().map(|w| {
             w.join()
-                .unwrap_or_else(|_| Err(CoreError::Gzip("compression worker panicked".into())))
+                .unwrap_or_else(|_| Err(CoreError::Internal("compression worker panicked".into())))
         }));
         members
     });
