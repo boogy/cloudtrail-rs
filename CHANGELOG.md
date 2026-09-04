@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`on_parse_error: copy` no longer fails open on failures that are not the
+  source object's fault.** It keyed off `CoreError::Gzip`/`Json`, but the
+  output-side gzip encoder and the worker-task panics were tagged with those
+  too. An object that had already been decompressed, parsed and filtered could
+  therefore be copied to the destination verbatim — forwarding every record the
+  exclusion rules dropped, counted as an `ObjectsCopiedUnparsed` success rather
+  than surfacing as a failure. Such failures are now `CoreError::Internal` and
+  fail the object so it is re-driven. Objects that genuinely will not parse are
+  unaffected.
+- **A batch failure now reports the lowest-indexed item's error.** An
+  undecodable message is classified before any object I/O runs, so its error
+  outranked an earlier item's object failure and `partial_batch_failures: false`
+  batches attributed the failure to the wrong message.
+
 ## [0.6.0] - 2026-09-03
 
 ### Added

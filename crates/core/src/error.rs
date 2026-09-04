@@ -36,10 +36,19 @@ pub enum CoreError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The *source* object's own bytes would not inflate. Only this and
+    /// [`CoreError::Json`] are what `on_parse_error: copy` fails open on.
     #[error("failed to decompress gzip: {0}")]
     Gzip(String),
+    /// The *source* object's own bytes are not JSON.
     #[error("failed to parse JSON: {0}")]
     Json(String),
+    /// Producing the output failed, or a worker task panicked. Never a verdict
+    /// on the source bytes, so `on_parse_error: copy` must not fail open on it:
+    /// the object may already have been filtered, and copying it verbatim would
+    /// forward the dropped records.
+    #[error("internal processing failure: {0}")]
+    Internal(String),
     #[error(
         "object exceeds max_object_bytes ({limit} bytes), compressed or decompressed: buffer \
          mode refuses to keep reading rather than risk OOM on an oversized or bomb-like object"
@@ -61,4 +70,41 @@ pub enum CoreError {
     /// `behavior.on_unrecognized_object = error`.
     #[error("unrecognized object shape ({bucket}/{key}): on_unrecognized_object is 'error'")]
     UnrecognizedObject { bucket: String, key: String },
+}
+
+impl CoreError {
+    /// Whether this is the *source* object's own bytes failing to parse — the
+    /// only class `behavior.on_parse_error: copy` may fail open on.
+    ///
+    /// `Internal` is excluded deliberately: the object may already have been
+    /// decompressed, parsed and filtered, so copying its source verbatim would
+    /// forward every record the rules dropped. `Store` must retry and
+    /// `ObjectTooLarge` is `on_object_too_large`'s business.
+    pub fn is_unparsable_source(&self) -> bool {
+        matches!(self, CoreError::Gzip(_) | CoreError::Json(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Falsifiable: admit `Internal` here and a compression or worker-task
+    /// failure on a filtered object makes `on_parse_error: copy` write the
+    /// unfiltered source to the destination.
+    #[test]
+    fn only_source_side_parse_failures_are_unparsable_sources() {
+        assert!(CoreError::Gzip("bad source".into()).is_unparsable_source());
+        assert!(CoreError::Json("bad source".into()).is_unparsable_source());
+
+        assert!(!CoreError::Internal("worker panicked".into()).is_unparsable_source());
+        assert!(!CoreError::ObjectTooLarge { limit: 1 }.is_unparsable_source());
+        assert!(
+            !CoreError::Store(StoreError::NotFound {
+                bucket: "b".into(),
+                key: "k".into(),
+            })
+            .is_unparsable_source()
+        );
+    }
 }

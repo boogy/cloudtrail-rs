@@ -900,12 +900,10 @@ impl Filterer {
         }
     }
 
-    /// Whether `e` is an object whose own bytes would not parse, under
-    /// `behavior.on_parse_error == copy`. `Pipeline::copies_unparsable`'s
-    /// counterpart.
+    /// `Pipeline::copies_unparsable`'s counterpart, sharing the same
+    /// [`CoreError::is_unparsable_source`] classification.
     fn copies_unparsable(&self, e: &CoreError) -> bool {
-        self.cfg.on_parse_error == OnParseError::Copy
-            && matches!(e, CoreError::Gzip(_) | CoreError::Json(_))
+        self.cfg.on_parse_error == OnParseError::Copy && e.is_unparsable_source()
     }
 
     /// Fail-open copy of an object that could not be parsed. `bytes` is the

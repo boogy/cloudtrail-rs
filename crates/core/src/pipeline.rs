@@ -93,6 +93,17 @@ impl AsyncRead for CountingReader {
     }
 }
 
+/// Records `e` as the batch's failure, keeping the lowest `item_idx` seen.
+///
+/// Not `get_or_insert`: pass 1 classifies every item before pass 3 sees a
+/// single object result, so first-write-wins would let item 5's decode error
+/// outrank item 0's object failure.
+fn note_hard_error(slot: &mut Option<(usize, CoreError)>, item_idx: usize, e: CoreError) {
+    if slot.as_ref().is_none_or(|(idx, _)| item_idx < *idx) {
+        *slot = Some((item_idx, e));
+    }
+}
+
 /// Composition root wiring: the four ports plus the resolved `Settings`,
 /// process-lived `Metrics`, and the compiled-rules `ConfigStore`.
 pub struct Pipeline {
@@ -154,7 +165,7 @@ impl Pipeline {
         let mut item_failed = vec![false; items.len()];
         let mut work: Vec<Work<'_>> = Vec::new();
         // Returned only after pass 3 has drained: see the comment there.
-        let mut hard_error: Option<CoreError> = None;
+        let mut hard_error: Option<(usize, CoreError)> = None;
 
         // Pass 1 — no I/O. Everything that can reject an object without
         // touching S3 happens here, so the self-trigger guard still fires
@@ -173,8 +184,11 @@ impl Pipeline {
                 // The batch fails, but its other messages' objects are still
                 // written first: a poison message must not withhold their
                 // data on every redrive until it is finally DLQ'd.
-                hard_error
-                    .get_or_insert(CoreError::Decode(DecodeError::InvalidPayload(msg.clone())));
+                note_hard_error(
+                    &mut hard_error,
+                    item_idx,
+                    CoreError::Decode(DecodeError::InvalidPayload(msg.clone())),
+                );
                 continue;
             }
 
@@ -289,12 +303,12 @@ impl Pipeline {
                     // The loop goes on to process the batch's remaining work,
                     // which is what makes every counter here independent of
                     // `object_concurrency`.
-                    hard_error.get_or_insert(e);
+                    note_hard_error(&mut hard_error, w.item_idx, e);
                 }
             }
         }
 
-        if let Some(e) = hard_error {
+        if let Some((_, e)) = hard_error {
             return Err(e);
         }
 
@@ -736,13 +750,11 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Whether `e` is an object whose own bytes would not parse — bad gzip,
-    /// truncated, or not JSON — under `behavior.on_parse_error == copy`.
-    /// Deliberately narrow: a `Store` failure must still retry, and
-    /// `ObjectTooLarge` is `on_object_too_large`'s business, not a parse failure.
+    /// `behavior.on_parse_error == copy` applied to
+    /// [`CoreError::is_unparsable_source`], which defines the narrow class of
+    /// errors that may fail open.
     fn copies_unparsable(&self, e: &CoreError) -> bool {
-        self.settings.behavior.on_parse_error == OnParseError::Copy
-            && matches!(e, CoreError::Gzip(_) | CoreError::Json(_))
+        self.settings.behavior.on_parse_error == OnParseError::Copy && e.is_unparsable_source()
     }
 
     /// Fail-open copy of an object that could not be parsed: forward the source
@@ -3363,6 +3375,42 @@ rules:
                 "concurrency {concurrency} changed the ack-id set or its order"
             );
         }
+    }
+
+    /// Falsifiable: with `hard_error.get_or_insert`, pass 1 files item 1's
+    /// decode error before pass 3 ever sees item 0's, and this reports
+    /// `Decode` instead.
+    #[tokio::test]
+    async fn an_earlier_objects_failure_outranks_a_later_items_decode_error() {
+        let store = Arc::new(InMemoryStore::new());
+        // "gone.json.gz" is deliberately unseeded.
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(no_op_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![
+            item(None, vec![object("src-bucket", "gone.json.gz", None)]),
+            undecodable_item(None, "garbage message body"),
+        ]));
+
+        let mut settings = base_settings();
+        settings.behavior.on_missing_object = OnMissingObject::Error;
+        settings.behavior.partial_batch_failures = false;
+
+        let err = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store,
+            config,
+            metrics,
+            Arc::new(RecordingSink::new()),
+        )
+        .handle(b"{}")
+        .await
+        .expect_err("both items fail, so the batch must fail");
+        assert!(
+            matches!(err, CoreError::Store(StoreError::NotFound { .. })),
+            "item 0's failure must be the one reported, got {err:?}"
+        );
     }
 
     #[tokio::test]

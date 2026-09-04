@@ -405,7 +405,7 @@ pub async fn stream_run(
     let processing = async move {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::new(cfg.gzip_level));
         if let Err(e) = encoder.write_all(b"{\"Records\":[") {
-            return Err(CoreError::Gzip(e.to_string()));
+            return Err(CoreError::Internal(e.to_string()));
         }
 
         let mut first = true;
@@ -453,7 +453,7 @@ pub async fn stream_run(
                             let _ = out_tx
                                 .send(Err(io::Error::other("aborting: gzip write failed")))
                                 .await;
-                            return Err(CoreError::Gzip(e.to_string()));
+                            return Err(CoreError::Internal(e.to_string()));
                         }
                         first = false;
                         tally.keep();
@@ -475,7 +475,7 @@ pub async fn stream_run(
                     let _ = out_tx
                         .send(Err(io::Error::other("aborting: record producer vanished")))
                         .await;
-                    return Err(CoreError::Json(
+                    return Err(CoreError::Internal(
                         "stream_run: record producer ended without a Finished message".to_string(),
                     ));
                 }
@@ -495,7 +495,7 @@ pub async fn stream_run(
                     let _ = out_tx
                         .send(Err(io::Error::other("aborting: gzip write failed")))
                         .await;
-                    return Err(CoreError::Gzip(e.to_string()));
+                    return Err(CoreError::Internal(e.to_string()));
                 }
                 match encoder.finish() {
                     Ok(tail) => {
@@ -509,7 +509,7 @@ pub async fn stream_run(
                         let _ = out_tx
                             .send(Err(io::Error::other("aborting: gzip finish failed")))
                             .await;
-                        Err(CoreError::Gzip(e.to_string()))
+                        Err(CoreError::Internal(e.to_string()))
                     }
                 }
             }
@@ -550,7 +550,7 @@ pub async fn stream_run(
         tokio::join!(pump, blocking, processing, upload);
 
     blocking_result.map_err(|e| {
-        CoreError::Json(format!("stream_run: record extraction task panicked: {e}"))
+        CoreError::Internal(format!("stream_run: record extraction task panicked: {e}"))
     })?;
 
     let (outcome, bytes_out, tally) = processing_result?;
