@@ -1475,6 +1475,121 @@ rules:
         }
     }
 
+    /// An `ObjectStore` whose first `get_stream` delivers a prefix and then
+    /// resets, standing in for a throttle or connection reset part-way through
+    /// `GetObject`. Later calls — the fail-open re-fetch — succeed in full, so
+    /// a pipeline that treats the reset as a parse failure really does land the
+    /// unfiltered source at the destination.
+    struct ResetOnceStore {
+        inner: InMemoryStore,
+        resets_left: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObjectStore for ResetOnceStore {
+        async fn get(&self, b: &str, k: &str) -> Result<Bytes, StoreError> {
+            self.inner.get(b, k).await
+        }
+
+        async fn get_stream(
+            &self,
+            b: &str,
+            k: &str,
+        ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+            let reader = self.inner.get_stream(b, k).await?;
+            if self.resets_left.fetch_sub(1, Ordering::SeqCst) == 0 {
+                self.resets_left.fetch_add(1, Ordering::SeqCst);
+                return Ok(reader);
+            }
+            let full = self.inner.get(b, k).await?;
+            Ok(Box::new(ResettingReader {
+                prefix: std::io::Cursor::new(full[..full.len() / 2].to_vec()),
+            }))
+        }
+
+        async fn put(&self, b: &str, k: &str, body: Bytes, m: PutMeta) -> Result<(), StoreError> {
+            self.inner.put(b, k, body, m).await
+        }
+
+        async fn put_stream(
+            &self,
+            b: &str,
+            k: &str,
+            body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            m: PutMeta,
+        ) -> Result<(), StoreError> {
+            self.inner.put_stream(b, k, body, m).await
+        }
+    }
+
+    struct ResettingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ResettingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.prefix.position() as usize == this.prefix.get_ref().len() {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                )));
+            }
+            std::pin::Pin::new(&mut this.prefix).poll_read(cx, buf)
+        }
+    }
+
+    /// Falsifiable: classify the reset as `CoreError::Gzip` and this test finds
+    /// the full unfiltered source — `Decrypt` included — at the destination.
+    #[tokio::test]
+    async fn a_reset_mid_body_never_fails_open_under_on_parse_error_copy() {
+        let body = gzip_bytes(&cloudtrail_body(&["ConsoleLogin", "Decrypt"]));
+        let inner = InMemoryStore::new();
+        inner.seed("src-bucket", "file.json.gz", body);
+        let store = Arc::new(ResetOnceStore {
+            inner,
+            resets_left: std::sync::atomic::AtomicUsize::new(1),
+        });
+
+        let metrics = Arc::new(Metrics::default());
+        let (config, _src) = config_store(drop_decrypt_rules(), metrics.clone());
+        let decoder = Arc::new(StubDecoder(vec![item(
+            None,
+            vec![object("src-bucket", "file.json.gz", Some(9_000_000))],
+        )]));
+        let sink = Arc::new(RecordingSink::new());
+
+        let mut settings = base_settings();
+        settings.behavior.on_parse_error = OnParseError::Copy;
+
+        let pipeline = Pipeline::new(
+            Arc::new(settings),
+            decoder,
+            store.clone(),
+            config,
+            metrics.clone(),
+            sink,
+        );
+
+        let err = pipeline
+            .handle(b"{}")
+            .await
+            .expect_err("a reset mid-body must fail the object so SQS re-drives it");
+        assert!(
+            matches!(err, CoreError::Store(StoreError::Backend(_))),
+            "got {err:?}"
+        );
+        assert!(
+            !store.inner.contains("dest-bucket", "file.json.gz"),
+            "a transport failure must not put the unfiltered source at the destination"
+        );
+        assert_eq!(metrics.snapshot_and_reset().objects_copied_unparsed, 0);
+    }
+
     fn put_rejecting_store(key: &str, body: Vec<u8>) -> Arc<PutRejectingStore> {
         let inner = InMemoryStore::new();
         inner.seed("src-bucket", key, body);

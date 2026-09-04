@@ -1,7 +1,6 @@
 # Deployment
 
-How to build the artifacts, pick a trigger topology, grant IAM, and roll out
-safely.
+How to build the artifacts, pick a trigger topology, grant IAM, and roll out safely.
 
 - [The four trigger topologies](#the-four-trigger-topologies)
 - [Build: Lambda zip](#build-lambda-zip)
@@ -14,9 +13,7 @@ safely.
 
 ## The four trigger topologies
 
-Each topology is a **separate binary** compiling in exactly one `EventDecoder`
-via a Cargo feature — no runtime source sniffing, no decoder registry, no dead
-decoder code in the artifact.
+Each topology is a **separate binary** compiling in exactly one `EventDecoder` via a Cargo feature — no runtime source sniffing, no decoder registry, no dead decoder code in the artifact.
 
 ```mermaid
 flowchart LR
@@ -37,14 +34,9 @@ flowchart LR
 | S3 → SQS → Lambda                 | `lambda-sqs`         | `decode-sqs`         | Buffering/backpressure; returns `batchItemFailures` — see the [warning below](#sqs-reportbatchitemfailures-is-not-optional).                  |
 | S3 → EventBridge → Lambda         | `lambda-eventbridge` | `decode-eventbridge` | Rule-based routing; EventBridge object keys are **not** URL-encoded (S3/SNS/SQS-embedded S3 keys are form-urlencoded — `+` decodes to space). |
 
-Build one binary at a time; the feature is additive but only one decoder is ever
-wired into a given binary's `main`.
+Build one binary at a time; the feature is additive but only one decoder is ever wired into a given binary's `main`.
 
-The S3/SNS/SQS decoders skip any notification record whose `eventName` is not
-an `ObjectCreated:*` event (e.g. `ObjectRemoved:*`, `LifecycleExpiration:*`),
-so a notification configuration is not required to be scoped to
-`s3:ObjectCreated:*` — but scoping it that way still avoids invoking the
-Lambda at all for events it will only decode and discard.
+The S3/SNS/SQS decoders skip any notification record whose `eventName` is not an `ObjectCreated:*` event (e.g. `ObjectRemoved:*`, `LifecycleExpiration:*`), so a notification configuration is not required to be scoped to `s3:ObjectCreated:*` — but scoping it that way still avoids invoking the Lambda at all for events it will only decode and discard.
 
 ## Build: Lambda zip
 
@@ -56,15 +48,9 @@ cargo lambda build --release --arm64 -p cloudtrail-rs-lambda-s3
 
 Target: `aarch64-unknown-linux-musl`. Runtime: `provided.al2023`.
 
-> **The `aws-lc-rs` vs `ring` gotcha.** The AWS SDK connector uses rustls with
-> the **`ring`** crypto provider (see `crates/aws/src/http_client.rs`), _not_ the
-> default `aws-lc-rs`. `aws-lc-rs` needs a working C toolchain for the musl
-> cross-build and is the usual cause of a build that succeeds locally and fails
-> only in CI. Keep `ring`.
+> **The `aws-lc-rs` vs `ring` gotcha.** The AWS SDK connector uses rustls with the **`ring`** crypto provider (see `crates/aws/src/http_client.rs`), _not_ the default `aws-lc-rs`. `aws-lc-rs` needs a working C toolchain for the musl cross-build and is the usual cause of a build that succeeds locally and fails only in CI. Keep `ring`.
 
-The workspace's release profile (`lto = "fat"`, `codegen-units = 1`,
-`panic = "abort"`, `strip = "symbols"`) is set in the root `Cargo.toml` and trims
-cold-start binary size.
+The workspace's release profile (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`) is set in the root `Cargo.toml` and trims cold-start binary size.
 
 The CLI is a normal host binary, no `cargo lambda` needed:
 
@@ -72,29 +58,18 @@ The CLI is a normal host binary, no `cargo lambda` needed:
 cargo build --release -p cloudtrail-rs
 ```
 
-The release pipeline builds both musl arches (`aarch64` and `x86_64`) for all
-four lambdas and the CLI on native-arch CI runners — see
-[development.md](development.md#release-process).
+The release pipeline builds both musl arches (`aarch64` and `x86_64`) for all four lambdas and the CLI on native-arch CI runners — see [development.md](development.md#release-process).
 
 ## Build: container images
 
-The release pipeline also publishes minimal container images (one per module) to
-GHCR and Docker Hub. Because Rust's `lambda_runtime` crate speaks the Lambda
-Runtime API directly, the images use `gcr.io/distroless/static-debian13` (~2 MB)
-rather than the ~40 MB `public.ecr.aws/lambda/provided:al2023` base — a static
-musl `bootstrap` runs on distroless/static (which ships CA certs for S3/SSM TLS;
-the Runtime API endpoint is localhost HTTP). Final images are typically <10 MB:
-base + one stripped static binary.
+The release pipeline also publishes minimal container images (one per module) to GHCR and Docker Hub. Because Rust's `lambda_runtime` crate speaks the Lambda Runtime API directly, the images use `gcr.io/distroless/static-debian13` (~2 MB) rather than the ~40 MB `public.ecr.aws/lambda/provided:al2023` base — a static musl `bootstrap` runs on distroless/static (which ships CA certs for S3/SSM TLS; the Runtime API endpoint is localhost HTTP). Final images are typically <10 MB: base + one stripped static binary.
 
 ```sh
 # multi-arch manifest; Lambda pulls the arch matching the function
 docker pull ghcr.io/boogy/cloudtrail-rs:lambda-s3-latest
 ```
 
-Images are published for `lambda-s3`, `lambda-sns`, `lambda-sqs`, and
-`lambda-eventbridge`. Tags: `<module>-<version>` (immutable) and
-`<module>-latest` (moved only on non-prerelease tags). The CLI ships as a
-`tar.gz` archive on the GitHub Release and via the Homebrew cask, not as an image.
+Images are published for `lambda-s3`, `lambda-sns`, `lambda-sqs`, and `lambda-eventbridge`. Tags: `<module>-<version>` (immutable) and `<module>-latest` (moved only on non-prerelease tags). The CLI ships as a `tar.gz` archive on the GitHub Release and via the Homebrew cask, not as an image.
 
 ## Deploying a container image to Lambda
 
@@ -106,16 +81,11 @@ flowchart LR
     FN -.pulls matching arch.-> IMG
 ```
 
-Create the function with `--package-type Image` and point `--code
-ImageUri=…@<digest>` at the module image; the multi-arch manifest lets Lambda
-pull the arch matching the function's `--architectures`. Set the `CT_*` env vars
-(at minimum `CT_DEST_BUCKET`) on the function. Zip deploys use the `bootstrap`
-zip artifact from the GitHub Release instead.
+Create the function with `--package-type Image` and point `--code ImageUri=…@<digest>` at the module image; the multi-arch manifest lets Lambda pull the arch matching the function's `--architectures`. Set the `CT_*` env vars (at minimum `CT_DEST_BUCKET`) on the function. Zip deploys use the `bootstrap` zip artifact from the GitHub Release instead.
 
 ## Required IAM actions
 
-Every binary needs these three, regardless of topology (confirmed against the SDK
-calls the adapters actually make in `crates/aws/src/*.rs`):
+Every binary needs these three, regardless of topology (confirmed against the SDK calls the adapters actually make in `crates/aws/src/*.rs`):
 
 **Source bucket (read):**
 
@@ -132,13 +102,7 @@ calls the adapters actually make in `crates/aws/src/*.rs`):
 ```json
 {
   "Effect": "Allow",
-  "Action": [
-    "s3:PutObject",
-    "s3:CreateMultipartUpload",
-    "s3:UploadPart",
-    "s3:CompleteMultipartUpload",
-    "s3:AbortMultipartUpload"
-  ],
+  "Action": ["s3:PutObject", "s3:CreateMultipartUpload", "s3:UploadPart", "s3:CompleteMultipartUpload", "s3:AbortMultipartUpload"],
   "Resource": "arn:aws:s3:::DEST_BUCKET/*"
 }
 ```
@@ -163,36 +127,25 @@ calls the adapters actually make in `crates/aws/src/*.rs`):
 }
 ```
 
-`file://` needs no IAM grant — it is a local path, used by the CLI and tests,
-never by a deployed Lambda.
+`file://` needs no IAM grant — it is a local path, used by the CLI and tests, never by a deployed Lambda.
 
-**SQS-triggered binary only** — the event source mapping polls the queue under
-the execution role, so the role also needs:
+**SQS-triggered binary only** — the event source mapping polls the queue under the execution role, so the role also needs:
 
 ```json
 {
   "Effect": "Allow",
-  "Action": [
-    "sqs:ReceiveMessage",
-    "sqs:DeleteMessage",
-    "sqs:GetQueueAttributes"
-  ],
+  "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
   "Resource": "arn:aws:sqs:REGION:ACCOUNT:QUEUE_NAME"
 }
 ```
 
-Standard Lambda basic-execution logging (`logs:CreateLogGroup`,
-`logs:CreateLogStream`, `logs:PutLogEvents`) is also required for EMF metrics to
-reach CloudWatch, as with any Lambda function.
+Standard Lambda basic-execution logging (`logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`) is also required for EMF metrics to reach CloudWatch, as with any Lambda function.
 
-The CLI's `filter`/`validate` S3 and SSM paths need the same read/write actions
-above, scoped to whatever bucket/prefix or parameter you point it at, under
-whatever credentials are active in your environment.
+The CLI's `filter`/`validate` S3 and SSM paths need the same read/write actions above, scoped to whatever bucket/prefix or parameter you point it at, under whatever credentials are active in your environment.
 
 ## Which build is running
 
-Every Lambda logs its version and commit SHA once at cold start, as the first
-structured line of each new container's log stream:
+Every Lambda logs its version and commit SHA once at cold start, as the first structured line of each new container's log stream:
 
 ```json
 {
@@ -205,84 +158,35 @@ structured line of each new container's log stream:
 }
 ```
 
-`version` is the release tag and `git_sha` the commit it was built from — both
-baked in at build time (`crates/core/build.rs`; release.yml injects the tag +
-`github.sha`). Filter for `"cloudtrail-rs starting"` in CloudWatch Logs Insights
-to see which build each function is on. The CLI reports the same via
-`cloudtrail-rs --version`.
+`version` is the release tag and `git_sha` the commit it was built from — both baked in at build time (`crates/core/build.rs`; release.yml injects the tag + `github.sha`). Filter for `"cloudtrail-rs starting"` in CloudWatch Logs Insights to see which build each function is on. The CLI reports the same via `cloudtrail-rs --version`.
 
 ## SQS: `ReportBatchItemFailures` is not optional
 
 > ⚠️ **This is silent, unrecoverable data loss if misconfigured.**
 
-`lambda-sqs` returns `{"batchItemFailures":[...]}` built from the pipeline's
-per-object failures, so the event source mapping re-drives only the messages that
-actually failed. **If `ReportBatchItemFailures` is not enabled on the event
-source mapping, this response is silently ignored** and Lambda deletes the
-_entire_ batch on any `Ok` return — including the messages whose objects failed
-to process. That is silent, unrecoverable data loss: the source object is never
-retried and nothing shows up as an error.
+`lambda-sqs` returns `{"batchItemFailures":[...]}` built from the pipeline's per-object failures, so the event source mapping re-drives only the messages that actually failed. **If `ReportBatchItemFailures` is not enabled on the event source mapping, this response is silently ignored** and Lambda deletes the _entire_ batch on any `Ok` return — including the messages whose objects failed to process. That is silent, unrecoverable data loss: the source object is never retried and nothing shows up as an error.
 
-If you cannot enable `ReportBatchItemFailures` on the mapping for some reason, set
-`CT_PARTIAL_BATCH_FAILURES=false` (`behavior.partial_batch_failures: false`).
-This fails the **whole batch** on any single-item failure instead of silently
-discarding a partial one — worse throughput under errors, but no silent loss.
-`partial_batch_failures: true` (the default) is only safe when
-`ReportBatchItemFailures` is actually enabled on the mapping.
+If you cannot enable `ReportBatchItemFailures` on the mapping for some reason, set `CT_PARTIAL_BATCH_FAILURES=false` (`behavior.partial_batch_failures: false`). This fails the **whole batch** on any single-item failure instead of silently discarding a partial one — worse throughput under errors, but no silent loss. `partial_batch_failures: true` (the default) is only safe when `ReportBatchItemFailures` is actually enabled on the mapping.
 
 ## `max_object_bytes` is a buffer-mode cap, not a size limit
 
-`processing.max_object_bytes` bounds what **buffer mode** will hold in memory —
-both halves of it. The source object is read through a cap, so the fetch itself
-stops one byte past the limit instead of materializing an arbitrarily large
-object, and the decompressed body is capped again on the way out of the
-decoder. Whichever side reaches the limit first fails with `ObjectTooLarge`.
-(Capping the compressed read rejects nothing that would otherwise have
-survived: gzip output is never meaningfully larger than its input, so an object
-whose compressed size already exceeds the cap cannot decompress to under it.)
+`processing.max_object_bytes` bounds what **buffer mode** will hold in memory — both halves of it. The source object is read through a cap, so the fetch itself stops one byte past the limit instead of materializing an arbitrarily large object, and the decompressed body is capped again on the way out of the decoder. Whichever side reaches the limit first fails with `ObjectTooLarge`. (Capping the compressed read rejects nothing that would otherwise have survived: gzip output is never meaningfully larger than its input, so an object whose compressed size already exceeds the cap cannot decompress to under it.)
 
-Stream mode has no equivalent cap, and that is deliberate: it decompresses,
-filters and uploads in bounded-memory chunks, so there is no size at which it
-needs to refuse. The fail-open passthrough (`on_config_error: open` with no
-cached ruleset) and the unrecognized-object copy stream source to destination
-for the same reason — neither ever holds a whole object. The consequence is
-that `max_object_bytes` does not put a ceiling on what the pipeline will
-attempt:
+Stream mode has no equivalent cap, and that is deliberate: it decompresses, filters and uploads in bounded-memory chunks, so there is no size at which it needs to refuse. The fail-open passthrough (`on_config_error: open` with no cached ruleset) and the unrecognized-object copy stream source to destination for the same reason — neither ever holds a whole object. The consequence is that `max_object_bytes` does not put a ceiling on what the pipeline will attempt:
 
-- **`mode: auto`** (the default) — an object that blows the cap in buffer mode is
-  **retried through stream mode**, which succeeds. The cap is a mode-selection
-  backstop, not a rejection: it catches the highly-compressible object whose
-  compressed size sat below `stream_threshold_bytes` and routed it to buffer mode
-  by mistake — or the object that arrived with no size at all, which `auto`
-  routes to buffer mode on purpose (a missing size must never pick the
-  unbounded path). Nothing is rejected for being large.
-- **`mode: buffer`** — the cap is a real rejection. An object over it fails with
-  `ObjectTooLarge` on every redelivery: a poison pill, not a skip.
+- **`mode: auto`** (the default) — an object that blows the cap in buffer mode is **retried through stream mode**, which succeeds. The cap is a mode-selection backstop, not a rejection: it catches the highly-compressible object whose compressed size sat below `stream_threshold_bytes` and routed it to buffer mode by mistake — or the object that arrived with no size at all, which `auto` routes to buffer mode on purpose (a missing size must never pick the unbounded path). Nothing is rejected for being large.
+- **`mode: buffer`** — the cap is a real rejection. An object over it fails with `ObjectTooLarge` on every redelivery: a poison pill, not a skip.
 - **`mode: stream`** — the cap is not consulted at all.
 
-So the operational limit on object size is not this setting, it is the
-**function timeout**: an object too large to finish within it times out, and
-times out again on every retry. Memory is not the binding constraint in stream
-mode; wall-clock is.
+So the operational limit on object size is not this setting, it is the **function timeout**: an object too large to finish within it times out, and times out again on every retry. Memory is not the binding constraint in stream mode; wall-clock is.
 
-Where that residual risk concentrates is the **S3 → Lambda direct** topology.
-The other three have durable redelivery in front of them (SQS keeps the message
-and its redrive policy moves it to a DLQ; SNS and EventBridge each have their own
-failure destinations). A direct S3 notification is an **asynchronous invocation**:
-Lambda retries it twice and then **discards the event** unless the function has an
-on-failure destination or a dead-letter queue configured. A timing-out object on
-that topology is therefore dropped with nothing left naming it.
+Where that residual risk concentrates is the **S3 → Lambda direct** topology. The other three have durable redelivery in front of them (SQS keeps the message and its redrive policy moves it to a DLQ; SNS and EventBridge each have their own failure destinations). A direct S3 notification is an **asynchronous invocation**: Lambda retries it twice and then **discards the event** unless the function has an on-failure destination or a dead-letter queue configured. A timing-out object on that topology is therefore dropped with nothing left naming it.
 
 If you run `lambda-s3`:
 
-1. Configure an **on-failure destination** (or DLQ) on the function's async
-   invocation config. This is the piece that makes a repeated failure
-   recoverable instead of silent — it matters for every hard failure, not just
-   oversized objects.
-2. Size the **timeout** against your largest expected object, not your median
-   one, and alarm on Lambda `Duration` approaching it.
-3. Leave `mode: auto`. Explicit `mode: buffer` converts "large object" from a
-   mode switch into a permanent failure.
+1. Configure an **on-failure destination** (or DLQ) on the function's async invocation config. This is the piece that makes a repeated failure recoverable instead of silent — it matters for every hard failure, not just oversized objects.
+2. Size the **timeout** against your largest expected object, not your median one, and alarm on Lambda `Duration` approaching it.
+3. Leave `mode: auto`. Explicit `mode: buffer` converts "large object" from a mode switch into a permanent failure.
 
 ## Rollout guidance
 
@@ -294,33 +198,17 @@ flowchart LR
     C -->|yes| E["Flip CT_DRY_RUN=false<br/>(start excluding)"]
 ```
 
-1. Deploy with `CT_DRY_RUN=true`. Every record is still evaluated and counted,
-   but nothing is written — the pipeline touches the destination bucket not at
-   all, so you can preview a ruleset against live traffic with zero side effects.
-2. Watch the `RecordsDropped` EMF metric (namespace `CT_METRICS_NAMESPACE`,
-   default `cloudtrail-rs`) against `RecordsIn` for a representative window.
-   Cross-check against per-rule `RuleDrops` (dimension `Rule`) to confirm the
-   rules that are supposed to be firing are the ones actually firing.
-3. Once the drop rate and the rules responsible for it look correct, flip
-   `CT_DRY_RUN=false` (or remove the override) to start actually excluding
-   records.
+1. Deploy with `CT_DRY_RUN=true`. Every record is still evaluated and counted, but nothing is written — the pipeline touches the destination bucket not at all, so you can preview a ruleset against live traffic with zero side effects.
+2. Watch the `RecordsDropped` EMF metric (namespace `CT_METRICS_NAMESPACE`, default `cloudtrail-rs`) against `RecordsIn` for a representative window. Cross-check against per-rule `RuleDrops` (dimension `Rule`) to confirm the rules that are supposed to be firing are the ones actually firing.
+3. Once the drop rate and the rules responsible for it look correct, flip `CT_DRY_RUN=false` (or remove the override) to start actually excluding records.
 
-Other metrics worth alarming on: `ParseErrors` and `ConfigLoadErrors` (both
-should normally be 0 or near-0), `ColdStart` (expected non-zero rate, not a
-problem by itself), `ObjectsSkipped`/`UnrecognizedObjects` (sanity-check against
-expected traffic shape).
+Other metrics worth alarming on: `ParseErrors` and `ConfigLoadErrors` (both should normally be 0 or near-0), `ColdStart` (expected non-zero rate, not a problem by itself), `ObjectsSkipped`/`UnrecognizedObjects` (sanity-check against expected traffic shape).
 
-The full metric reference — every counter, the two reconciliation invariants,
-and a prioritised alarm table — is in [Metrics](metrics.md). Three alarms there
-matter more than the rest:
+The full metric reference — every counter, the two reconciliation invariants, and a prioritised alarm table — is in [Metrics](metrics.md). Three alarms there matter more than the rest:
 
-- `RecordsIn != RecordsKept + RecordsDropped` — records entered the pipeline and
-  were neither written nor accounted for as filtered.
-- `sum(RuleDrops) != RecordsDropped` — the per-rule breakdown no longer accounts
-  for the drops, so a rule's apparent effect cannot be trusted.
-- `ObjectsFailed > 0` — under the default `partial_batch_failures: true` the
-  handler returns `Ok`, so AWS's own `Errors` metric stays at zero while
-  messages head for the DLQ.
+- `RecordsIn != RecordsKept + RecordsDropped` — records entered the pipeline and were neither written nor accounted for as filtered.
+- `sum(RuleDrops) != RecordsDropped` — the per-rule breakdown no longer accounts for the drops, so a rule's apparent effect cannot be trusted.
+- `ObjectsFailed > 0` — under the default `partial_batch_failures: true` the handler returns `Ok`, so AWS's own `Errors` metric stays at zero while messages head for the DLQ.
 
 ---
 

@@ -1,8 +1,6 @@
 # CLI (`cloudtrail-rs`)
 
-Local/offline companion to the Lambda binaries — the same `Engine` and
-`core::process::buffer_run`, no Lambda runtime involved. Lives in `crates/cli`,
-package name `cloudtrail-rs`.
+Local/offline companion to the Lambda binaries — the same `Engine` and `core::process::buffer_run`, no Lambda runtime involved. Lives in `crates/cli`, package name `cloudtrail-rs`.
 
 - [Building](#building)
 - [URIs](#uris)
@@ -26,18 +24,11 @@ docker run --rm ghcr.io/boogy/cloudtrail-rs:cli-latest --help
 
 ## URIs
 
-A rules/config `uri` accepts `ssm://`, `s3://`, `file://`, or a **bare local
-path** (no `scheme://` at all — read straight off disk, the ergonomic case for
-`examples/rules.example.yaml`). Any S3/SSM path needs AWS credentials resolved the
-normal SDK way (env, profile, instance role, …).
+A rules/config `uri` accepts `ssm://`, `s3://`, `file://`, or a **bare local path** (no `scheme://` at all — read straight off disk, the ergonomic case for `examples/rules.example.yaml`). Any S3/SSM path needs AWS credentials resolved the normal SDK way (env, profile, instance role, …).
 
 ## `validate <uri>`
 
-Builds the `Engine` from the rules document, prints rule/pattern counts, and
-warns (to stderr, non-fatally) about every rule the index could not anchor by
-`eventSource` or `eventName` (see [the `always` bucket](rules.md#the-rule-index-and-the-always-bucket)).
-Exit code is non-zero on an actual config/build error (bad YAML, invalid
-semver, unresolvable regex, duplicate rule name, empty `matches`, etc.).
+Builds the `Engine` from the rules document, prints rule/pattern counts, and warns (to stderr, non-fatally) about every rule the index could not anchor by `eventSource` or `eventName` (see [the `always` bucket](rules.md#the-rule-index-and-the-always-bucket)). Exit code is non-zero on an actual config/build error (bad YAML, invalid semver, unresolvable regex, duplicate rule name, empty `matches`, etc.).
 
 ```sh
 cloudtrail-rs validate examples/rules.example.yaml
@@ -47,11 +38,7 @@ cloudtrail-rs validate examples/rules.example.yaml
 echo $?   # 0
 ```
 
-`--max-unindexed <PERCENT>` is an opt-in CI gate: if more than `PERCENT`
-percent of rules land in the `always` bucket, `validate` exits 1 instead of 0.
-Omit it and behaviour is unchanged — the warnings still print, the exit code
-is still 0. Useful in CI to catch a ruleset that has silently lost its index
-(e.g. a regex edit that broke the anchored-literal shape the index extracts).
+`--max-unindexed <PERCENT>` is an opt-in CI gate: if more than `PERCENT` percent of rules land in the `always` bucket, `validate` exits 1 instead of 0. Omit it and behaviour is unchanged — the warnings still print, the exit code is still 0. Useful in CI to catch a ruleset that has silently lost its index (e.g. a regex edit that broke the anchored-literal shape the index extracts).
 
 ```sh
 cloudtrail-rs validate examples/rules.example.yaml --max-unindexed 5
@@ -62,18 +49,9 @@ echo $?   # 1
 
 ## `validate-settings [path]`
 
-`validate` covers the _rules_ document; this covers the _settings_ document.
-It runs the file through the exact same `Settings::from_parts` the four Lambda
-binaries run at cold start — including every
-[validation constraint](configuration.md#validation-constraints) — so a value
-that would otherwise panic mid-invocation is caught before it ships. Because
-the release profile sets `panic = "abort"`, such a value is not a bad object,
-it is a poison pill: the process dies on every invocation until the DLQ or the
-retention window absorbs the backlog.
+`validate` covers the _rules_ document; this covers the _settings_ document. It runs the file through the exact same `Settings::from_parts` the four Lambda binaries run at cold start — including every [validation constraint](configuration.md#validation-constraints) — so a value that would otherwise panic mid-invocation is caught before it ships. Because the release profile sets `panic = "abort"`, such a value is not a bad object, it is a poison pill: the process dies on every invocation until the DLQ or the retention window absorbs the backlog.
 
-`path` is optional. Omit it to validate the built-in defaults plus whatever
-`CT_*` overrides are in the environment — the env-only deployment case, and a
-way to sanity-check a deployment's real environment before it goes live.
+`path` is optional. Omit it to validate the built-in defaults plus whatever `CT_*` overrides are in the environment — the env-only deployment case, and a way to sanity-check a deployment's real environment before it goes live.
 
 ```sh
 cloudtrail-rs validate-settings examples/settings.example.yaml
@@ -92,15 +70,11 @@ cloudtrail-rs validate-settings examples/settings.example.yaml
 echo $?   # 0
 ```
 
-Exit code is non-zero on any validation failure, with the offending key named
-in the error — the second thing CI should gate on, alongside `validate`.
+Exit code is non-zero on any validation failure, with the offending key named in the error — the second thing CI should gate on, alongside `validate`.
 
 ## `test <rules> <sample.json.gz>`
 
-Evaluates every record in a decompressed CloudTrail sample against the compiled
-ruleset and reports KEEP/DROP (with the dropping rule's name) per record, plus a
-kept/dropped summary — useful for spotting a rule that never fires (a YAML-quoting
-bug, a typo'd `field_name`, etc.) before it ships.
+Evaluates every record in a decompressed CloudTrail sample against the compiled ruleset and reports KEEP/DROP (with the dropping rule's name) per record, plus a kept/dropped summary — useful for spotting a rule that never fires (a YAML-quoting bug, a typo'd `field_name`, etc.) before it ships.
 
 ```sh
 cloudtrail-rs test examples/rules.example.yaml sample-cloudtrail-log.json.gz
@@ -112,33 +86,19 @@ cloudtrail-rs test examples/rules.example.yaml sample-cloudtrail-log.json.gz
 
 ## `filter <source> <dest> --rules <uri> [--settings <path>]`
 
-Filters CloudTrail gzip objects through the exact same `buffer_run` /
-`stream_run` the Lambda binaries use. `source` and `dest` are each
-independently auto-detected:
+Filters CloudTrail gzip objects through the exact same `buffer_run` / `stream_run` the Lambda binaries use. `source` and `dest` are each independently auto-detected:
 
 - a **local file** — `source` filters that one object to `dest` (a file path);
-- a **local directory** — every in-scope object under it is filtered, mirroring
-  each object's relative path into `dest` (a directory, created as needed);
-- an **`s3://bucket/prefix`** — every in-scope object under that prefix is
-  filtered, batch-style, same as a local directory.
+- a **local directory** — every in-scope object under it is filtered, mirroring each object's relative path into `dest` (a directory, created as needed);
+- an **`s3://bucket/prefix`** — every in-scope object under that prefix is filtered, batch-style, same as a local directory.
 
-Output is always gzip-faithful `.json.gz` with the canonical
-`application/x-gzip` / `gzip` content-type and content-encoding. Objects where
-every record is dropped are **not written** ("zero empty writes") — neither
-locally nor to S3. Any S3-side `source`/`dest` needs AWS credentials resolved the
-normal SDK way (env, profile, instance role, …).
+Output is always gzip-faithful `.json.gz` with the canonical `application/x-gzip` / `gzip` content-type and content-encoding. Objects where every record is dropped are **not written** ("zero empty writes") — neither locally nor to S3. Any S3-side `source`/`dest` needs AWS credentials resolved the normal SDK way (env, profile, instance role, …).
 
-`filter` **refuses to write an object over its own source** (`filter ./logs
-./logs`, or an S3 source and destination that resolve to the same key) — the
-CLI's equivalent of the pipeline's self-trigger guard. Filtering in place
-destroys the original, and there is no undo for it. `behavior.dry_run` writes
-nothing, so it is exempt.
+`filter` **refuses to write an object over its own source** (`filter ./logs ./logs`, or an S3 source and destination that resolve to the same key) — the CLI's equivalent of the pipeline's self-trigger guard. Filtering in place destroys the original, and there is no undo for it. `behavior.dry_run` writes nothing, so it is exempt.
 
 ### `--settings`: filter the way the deployment filters
 
-Pass the deployment's settings document and a backfill selects and processes
-exactly the objects production would. Without it, built-in defaults apply.
-Honoured:
+Pass the deployment's settings document and a backfill selects and processes exactly the objects production would. Without it, built-in defaults apply. Honoured:
 
 | Setting                             | Effect on `filter`                                                                                                                                                                                                                                 |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -153,23 +113,16 @@ Honoured:
 | `processing.gzip_chunks`            | **Buffer mode only.** Gzip members the output is split into, compressed in parallel; `1` is a single member.                                                                                                                                       |
 | `behavior.dry_run`                  | Evaluate and count every record, write nothing. Selects the destination, not the mode: an object that would stream is still previewed through stream mode (into a discard destination), so the preview's verdict is the real run's verdict.        |
 | `behavior.on_unrecognized_object`   | `copy` (default) \| `skip` \| `error` for an object with no `Records` array.                                                                                                                                                                       |
-| `behavior.on_parse_error`           | `copy` (default) \| `error` for an object whose bytes will not parse at all — bad gzip, truncated, or not JSON. `copy` forwards it verbatim so nothing is lost to a parse failure.                                                                  |
-| `behavior.on_object_too_large`      | `stream` (default) \| `error` for an object whose body exceeds `processing.max_object_bytes`. `stream` re-runs it through stream mode, which has no size cap and filters it normally.                                                             |
+| `behavior.on_parse_error`           | `copy` (default) \| `error` for an object whose bytes will not parse at all — bad gzip, truncated, or not JSON. `copy` forwards it verbatim so nothing is lost to a parse failure.                                                                 |
+| `behavior.on_object_too_large`      | `stream` (default) \| `error` for an object whose body exceeds `processing.max_object_bytes`. `stream` re-runs it through stream mode, which has no size cap and filters it normally.                                                              |
 
-Ignored, because the command line already says it or there is no Lambda around
-it: `destination.*` (`dest` is the destination), `rules.*` (`--rules` is),
-`sqs.*`, `behavior.on_config_error`, `behavior.partial_batch_failures`,
-`behavior.on_missing_object`, `observability.*`.
+Ignored, because the command line already says it or there is no Lambda around it: `destination.*` (`dest` is the destination), `rules.*` (`--rules` is), `sqs.*`, `behavior.on_config_error`, `behavior.partial_batch_failures`, `behavior.on_missing_object`, `observability.*`.
 
-The document goes through the same `Settings::from_parts` validation
-`validate-settings` and the Lambdas run, `CT_*` overrides included.
+The document goes through the same `Settings::from_parts` validation `validate-settings` and the Lambdas run, `CT_*` overrides included.
 
 ### Failures
 
-A batch does **not** stop at the first bad object. Every object is attempted,
-the summary still prints, and the failures are listed afterwards on stderr with
-a non-zero exit — so a large backfill tells you exactly which objects need a
-second pass instead of dying halfway with no report.
+A batch does **not** stop at the first bad object. Every object is attempted, the summary still prints, and the failures are listed afterwards on stderr with a non-zero exit — so a large backfill tells you exactly which objects need a second pass instead of dying halfway with no report.
 
 **Local → local (see filtering happen with plain folders, no AWS needed):**
 

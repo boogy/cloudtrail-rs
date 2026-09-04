@@ -78,6 +78,7 @@ pub enum Verdict {
     JsonError,
     GzipError,
     ObjectTooLarge,
+    InternalError,
     OtherError(String),
 }
 
@@ -97,6 +98,7 @@ impl std::fmt::Debug for Verdict {
             Verdict::JsonError => f.write_str("JsonError"),
             Verdict::GzipError => f.write_str("GzipError"),
             Verdict::ObjectTooLarge => f.write_str("ObjectTooLarge"),
+            Verdict::InternalError => f.write_str("InternalError"),
             Verdict::OtherError(msg) => write!(f, "OtherError({msg:?})"),
         }
     }
@@ -107,6 +109,7 @@ pub fn classify(err: &CoreError) -> Verdict {
         CoreError::Json(_) => Verdict::JsonError,
         CoreError::Gzip(_) => Verdict::GzipError,
         CoreError::ObjectTooLarge { .. } => Verdict::ObjectTooLarge,
+        CoreError::Internal(_) => Verdict::InternalError,
         other => Verdict::OtherError(format!("{other:?}")),
     }
 }

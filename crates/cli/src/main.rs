@@ -577,9 +577,26 @@ async fn build_s3_if_needed(src: &Location, dst: &Location) -> Option<S3ObjectSt
 enum ObjectOutcome {
     Written(String),
     NothingKept,
-    Copied(String),
+    Copied(String, CopyReason),
     Skipped,
     DryRun,
+}
+
+/// Which of the two independent fail-open policies forwarded an object
+/// verbatim: `behavior.on_parse_error` or `behavior.on_unrecognized_object`.
+#[derive(Clone, Copy)]
+enum CopyReason {
+    Unparsed,
+    Unrecognized,
+}
+
+impl CopyReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unparsed => "did not parse",
+            Self::Unrecognized => "unrecognized shape",
+        }
+    }
 }
 
 /// Rejects a relative key that would escape the destination root once joined to
@@ -749,11 +766,12 @@ impl Filterer {
                 }
             }
             Mode::Buffer => {
+                // `None` when the fetch itself failed: `copy_unparsable` then
+                // re-reads the source rather than writing a payload this arm
+                // invented, which would truncate the destination to zero bytes.
                 let (bytes, result) = match self.buffer_eval(src_key).await {
-                    Ok(pair) => pair,
-                    // `fetch_capped` never fails to parse anything, so the copy
-                    // policy below cannot apply here.
-                    Err(e) => (Bytes::new(), Err(e)),
+                    Ok((bytes, evaluated)) => (Some(bytes), evaluated),
+                    Err(e) => (None, Err(e)),
                 };
                 match result {
                     // The same retry `Pipeline::process_object` performs:
@@ -773,7 +791,7 @@ impl Filterer {
                         }
                     }
                     Err(e) if self.copies_unparsable(&e) => {
-                        self.copy_unparsable(src_key, dst_key, Some(bytes), &e, dry_run)
+                        self.copy_unparsable(src_key, dst_key, bytes, &e, dry_run)
                             .await
                     }
                     Err(e) => Err(e.into()),
@@ -793,7 +811,7 @@ impl Filterer {
                                 }
                                 Outcome::NothingKept => ObjectOutcome::NothingKept,
                                 Outcome::Unrecognized => {
-                                    self.unrecognized(src_key, dst_key, Some(bytes)).await?
+                                    self.unrecognized(src_key, dst_key, bytes).await?
                                 }
                                 Outcome::Written(None) => {
                                     unreachable!(
@@ -928,7 +946,7 @@ impl Filterer {
             Some(b) => self.put(dst_key, b).await?,
             None => self.stream_copy(src_key, dst_key).await?,
         };
-        Ok(ObjectOutcome::Copied(at))
+        Ok(ObjectOutcome::Copied(at, CopyReason::Unparsed))
     }
 
     /// `behavior.on_unrecognized_object` for an object that parsed as JSON but
@@ -949,7 +967,7 @@ impl Filterer {
                     Some(b) => self.put(dst_key, b).await?,
                     None => self.stream_copy(src_key, dst_key).await?,
                 };
-                Ok(ObjectOutcome::Copied(at))
+                Ok(ObjectOutcome::Copied(at, CopyReason::Unrecognized))
             }
             OnUnrecognizedObject::Skip => {
                 self.metrics.add_unrecognized_objects(1);
@@ -1066,9 +1084,9 @@ async fn cmd_filter(
                 fully_dropped += 1;
                 println!("  {label} -> (all records dropped, nothing written)");
             }
-            Ok(ObjectOutcome::Copied(at)) => {
+            Ok(ObjectOutcome::Copied(at, why)) => {
                 copied += 1;
-                println!("  {label} -> {at} (unrecognized shape, copied verbatim)");
+                println!("  {label} -> {at} ({}, copied verbatim)", why.label());
             }
             Ok(ObjectOutcome::Skipped) => {
                 skipped += 1;

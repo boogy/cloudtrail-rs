@@ -11,13 +11,7 @@
 
 **Filter AWS CloudTrail logs in flight — before they reach your SIEM.**
 
-`cloudtrail-rs` reads a `.json.gz` CloudTrail object, drops the noisy `Records`
-entries that match a configured exclusion rule, and writes the survivors to a
-destination bucket with the same `gzip({"Records":[...]})` envelope. Filtering
-CloudTrail at the source cuts SIEM ingest cost and noise without touching the
-source of truth. It ships as **four independent Lambda binaries** (one per trigger
-topology) plus a **local/offline CLI**, built on a hexagonal core with
-`#![forbid(unsafe_code)]` in every crate.
+`cloudtrail-rs` reads a `.json.gz` CloudTrail object, drops the noisy `Records` entries that match a configured exclusion rule, and writes the survivors to a destination bucket with the same `gzip({"Records":[...]})` envelope. Filtering CloudTrail at the source cuts SIEM ingest cost and noise without touching the source of truth. It ships as **four independent Lambda binaries** (one per trigger topology) plus a **local/offline CLI**, built on a hexagonal core with `#![forbid(unsafe_code)]` in every crate.
 
 ```mermaid
 flowchart LR
@@ -41,12 +35,7 @@ flowchart LR
 
 ## How it works
 
-A CloudTrail record is **dropped** when it matches any exclusion rule; a rule
-matches when **all** of its conditions match (AND within a rule, OR across rules).
-Survivors are re-packed into the same gzip envelope and written to the destination
-bucket. Configuration comes from an optional settings file overlaid by `CT_*`
-environment variables (env wins); rules come from a separate YAML document loaded
-from `file://`, `s3://`, or `ssm://`.
+A CloudTrail record is **dropped** when it matches any exclusion rule; a rule matches when **all** of its conditions match (AND within a rule, OR across rules). Survivors are re-packed into the same gzip envelope and written to the destination bucket. Configuration comes from an optional settings file overlaid by `CT_*` environment variables (env wins); rules come from a separate YAML document loaded from `file://`, `s3://`, or `ssm://`.
 
 ```yaml
 # rules.yaml — drop the matching (noisy) records, keep the rest
@@ -59,13 +48,11 @@ rules:
         regex: "^eks\\.amazonaws\\.com$"
 ```
 
-See [Rules](docs/rules.md) for the schema and the `always`-bucket optimization,
-and [Configuration](docs/configuration.md) for the full `CT_*` reference.
+See [Rules](docs/rules.md) for the schema and the `always`-bucket optimization, and [Configuration](docs/configuration.md) for the full `CT_*` reference.
 
 ## Performance
 
-Filtering a record costs **~1.5 µs**, or about **680k records/s** on one core —
-roughly **790 MB/s** of decompressed CloudTrail JSON.
+Filtering a record costs **~1.5 µs**, or about **680k records/s** on one core — roughly **790 MB/s** of decompressed CloudTrail JSON.
 
 | Path                                      | per record | records/s | throughput   |
 | ----------------------------------------- | ---------- | --------- | ------------ |
@@ -74,34 +61,16 @@ roughly **790 MB/s** of decompressed CloudTrail JSON.
 
 Two things get it there, and they compound:
 
-**Only the fields a rule reads are parsed.** The ruleset's field paths are compiled
-into a trie that drives the JSON deserializer, so untouched subtrees are skipped
-rather than materialized — **2.16×** faster than parsing each record into a
-`serde_json::Value` first (2.1–2.3× across runs). The win scales with how much
-of a record your rules ignore, which for CloudTrail is most of it. One caveat: a
-single `[*]` wildcard anywhere in the ruleset disables projection for **every**
-record, because a wildcard can reach any element; see [Rules](docs/rules.md).
+**Only the fields a rule reads are parsed.** The ruleset's field paths are compiled into a trie that drives the JSON deserializer, so untouched subtrees are skipped rather than materialized — **2.16×** faster than parsing each record into a `serde_json::Value` first (2.1–2.3× across runs). The win scales with how much of a record your rules ignore, which for CloudTrail is most of it. One caveat: a single `[*]` wildcard anywhere in the ruleset disables projection for **every** record, because a wildcard can reach any element; see [Rules](docs/rules.md).
 
-**Only rules that could match are evaluated.** The two-dimensional index on
-`eventSource`/`eventName` is **2.13×** faster than testing every rule linearly
-(330 µs vs 155 µs per 500 records). What the index removes is the per-rule
-_condition_ work — regex execution, path resolution, set lookups. What remains is
-a two-bit test per rule per record, so the residual cost still tracks the total
-rule count, not the matching count; it is just several orders of magnitude cheaper
-per rule. Rules that constrain neither field land in an `always` bucket whose
-conditions are evaluated against every record — `cloudtrail-rs validate` reports
-them, and `--max-unindexed <PERCENT>` will fail CI when too many accumulate.
+**Only rules that could match are evaluated.** The two-dimensional index on `eventSource`/`eventName` is **2.13×** faster than testing every rule linearly (330 µs vs 155 µs per 500 records). What the index removes is the per-rule _condition_ work — regex execution, path resolution, set lookups. What remains is a two-bit test per rule per record, so the residual cost still tracks the total rule count, not the matching count; it is just several orders of magnitude cheaper per rule. Rules that constrain neither field land in an `always` bucket whose conditions are evaluated against every record — `cloudtrail-rs validate` reports them, and `--max-unindexed <PERCENT>` will fail CI when too many accumulate.
 
 <details>
 <summary>Methodology</summary>
 
-`cargo bench --features testing --bench filter` ([source](crates/core/benches/filter.rs)),
-Criterion, three runs, medians reported. Apple M4 Max, rustc 1.97.1.
+`cargo bench --features testing --bench filter` ([source](crates/core/benches/filter.rs)), Criterion, three runs, medians reported. Apple M4 Max, rustc 1.97.1.
 
-Benchmarks were built at the shipped artifacts' optimization level, not the default
-one: `cargo bench` inherits `profile.release`, which is deliberately lean
-(`opt-level = 1`) for fast CI smoke builds, while released binaries use `profile.dist`
-(`opt-level = 3`, thin LTO). Reproduce with:
+Benchmarks were built at the shipped artifacts' optimization level, not the default one: `cargo bench` inherits `profile.release`, which is deliberately lean (`opt-level = 1`) for fast CI smoke builds, while released binaries use `profile.dist` (`opt-level = 3`, thin LTO). Reproduce with:
 
 ```sh
 CARGO_PROFILE_BENCH_OPT_LEVEL=3 CARGO_PROFILE_BENCH_LTO=thin \
@@ -109,20 +78,11 @@ CARGO_PROFILE_BENCH_CODEGEN_UNITS=16 \
 cargo bench --features testing --bench filter
 ```
 
-A plain `cargo bench` reports roughly 20% slower across the board and is not
-representative of a deployed Lambda.
+A plain `cargo bench` reports roughly 20% slower across the board and is not representative of a deployed Lambda.
 
-The workload is 500 records from `testing::corpus` (570 KiB, mean 1168 B/record) —
-realistic CloudTrail events, deliberately including values serde would re-render
-differently — against [`examples/rules.example.yaml`](examples/rules.example.yaml).
-Run-to-run spread reached ~9% on the projected-parse path; treat the ratios as
-approximate and the absolute numbers as specific to this machine.
+The workload is 500 records from `testing::corpus` (570 KiB, mean 1168 B/record) — realistic CloudTrail events, deliberately including values serde would re-render differently — against [`examples/rules.example.yaml`](examples/rules.example.yaml). Run-to-run spread reached ~9% on the projected-parse path; treat the ratios as approximate and the absolute numbers as specific to this machine.
 
-**This measures the filter core only.** It excludes gzip decompression, S3 I/O, and
-Lambda cold start, which dominate wall-clock time in a real deployment. It is a
-guard against per-record regressions, not a prediction of end-to-end throughput. For
-the per-object picture, including what gzip costs relative to filtering, see
-[what an object costs](docs/architecture.md#what-an-object-costs).
+**This measures the filter core only.** It excludes gzip decompression, S3 I/O, and Lambda cold start, which dominate wall-clock time in a real deployment. It is a guard against per-record regressions, not a prediction of end-to-end throughput. For the per-object picture, including what gzip costs relative to filtering, see [what an object costs](docs/architecture.md#what-an-object-costs).
 
 </details>
 
@@ -142,18 +102,14 @@ mkdir -p in out && cp your-cloudtrail-*.json.gz in/
 ./target/release/cloudtrail-rs filter in/ out/ --rules examples/rules.example.yaml
 ```
 
-Validate a ruleset (and see which rules aren't index-optimized), or dry-run a rule
-against a real sample:
+Validate a ruleset (and see which rules aren't index-optimized), or dry-run a rule against a real sample:
 
 ```sh
 ./target/release/cloudtrail-rs validate examples/rules.example.yaml
 ./target/release/cloudtrail-rs test examples/rules.example.yaml sample.json.gz
 ```
 
-See the [CLI reference](docs/cli.md) for `validate` / `validate-settings` /
-`test` / `filter`. `validate-settings` runs a settings document through the same
-checks the Lambdas run at cold start, so a value that would panic mid-invocation
-is caught before it ships.
+See the [CLI reference](docs/cli.md) for `validate` / `validate-settings` / `test` / `filter`. `validate-settings` runs a settings document through the same checks the Lambdas run at cold start, so a value that would panic mid-invocation is caught before it ships.
 
 ## Trigger topologies
 
@@ -170,10 +126,7 @@ Details, IAM policies, and rollout guidance live in [Deployment](docs/deployment
 
 ## Container images
 
-Minimal distroless images are published to **GHCR** and **Docker Hub** for each
-module (`lambda-s3`, `lambda-sns`, `lambda-sqs`, `lambda-eventbridge`, `cli`), as
-multi-arch manifests (`arm64` + `amd64`), tagged `<module>-<version>` (immutable)
-and `<module>-latest`:
+Minimal distroless images are published to **GHCR** and **Docker Hub** for each module (`lambda-s3`, `lambda-sns`, `lambda-sqs`, `lambda-eventbridge`, `cli`), as multi-arch manifests (`arm64` + `amd64`), tagged `<module>-<version>` (immutable) and `<module>-latest`:
 
 ```sh
 docker pull ghcr.io/boogy/cloudtrail-rs:lambda-s3-latest
@@ -193,9 +146,7 @@ Full docs live in [`docs/`](docs/README.md).
 | [CLI](docs/cli.md)                     | `validate` / `validate-settings` / `test` / `filter` reference with examples.         |
 | [Development](docs/development.md)     | Commands, Makefile targets, MiniStack tests, CI, the release pipeline.                |
 
-> ⚠️ **SQS users:** `ReportBatchItemFailures` must be enabled on the event source
-> mapping, or a partial batch failure becomes **silent, unrecoverable data
-> loss**. See [Deployment → SQS](docs/deployment.md#sqs-reportbatchitemfailures-is-not-optional).
+> ⚠️ **SQS users:** `ReportBatchItemFailures` must be enabled on the event source mapping, or a partial batch failure becomes **silent, unrecoverable data loss**. See [Deployment → SQS](docs/deployment.md#sqs-reportbatchitemfailures-is-not-optional).
 
 ## License
 

@@ -16,6 +16,7 @@
 
 use std::io::{self, Read, Write};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -32,7 +33,7 @@ use tokio::sync::mpsc;
 
 use super::{Outcome, RecordTally};
 use crate::config::Processing;
-use crate::error::CoreError;
+use crate::error::{CoreError, StoreError};
 use crate::filter::{Decision, Engine};
 use crate::metrics::Metrics;
 use crate::model::PutMeta;
@@ -70,6 +71,9 @@ enum FinishKind {
 enum ParseFailure {
     Gzip(String),
     Json(String),
+    /// The input body itself failed to read. Indistinguishable from a corrupt
+    /// member once `serde_json` has wrapped it, hence the out-of-band flag.
+    Transport(String),
 }
 
 /// Reads an `mpsc::Receiver<ByteMsg>` synchronously, letting the blocking
@@ -77,6 +81,7 @@ enum ParseFailure {
 struct ChannelSyncRead {
     rx: mpsc::Receiver<ByteMsg>,
     pending: Bytes,
+    transport_error: Arc<OnceLock<String>>,
 }
 
 impl ChannelSyncRead {
@@ -84,6 +89,7 @@ impl ChannelSyncRead {
         Self {
             rx,
             pending: Bytes::new(),
+            transport_error: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -106,7 +112,10 @@ impl Read for ChannelSyncRead {
             }
             match self.rx.blocking_recv() {
                 Some(Ok(bytes)) => self.pending = bytes,
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => {
+                    let _ = self.transport_error.set(e.to_string());
+                    return Err(e);
+                }
                 None => return Ok(0),
             }
         }
@@ -336,6 +345,7 @@ impl<'de> Visitor<'de> for EnvelopeVisitor<'_> {
 /// `buffer.rs`) over `reader`, streaming `Records` elements over `tx`. Touches
 /// only owned channel endpoints, satisfying `spawn_blocking`'s `'static` bound.
 fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
+    let transport_error = Arc::clone(&reader.transport_error);
     let gz = MultiGzDecoder::new(reader);
     let mut deserializer = serde_json::Deserializer::from_reader(gz);
     let parsed = deserializer.deserialize_any(EnvelopeVisitor { tx: &tx });
@@ -352,13 +362,14 @@ fn extract_records(reader: ChannelSyncRead, tx: mpsc::Sender<StreamMsg>) {
     let finish = match result {
         Ok(true) => FinishKind::RecordsFound,
         Ok(false) => FinishKind::Unrecognized,
-        Err(e) => {
-            if e.is_io() {
-                FinishKind::Error(ParseFailure::Gzip(e.to_string()))
-            } else {
-                FinishKind::Error(ParseFailure::Json(e.to_string()))
-            }
-        }
+        // The transport check precedes `is_io()`: a failed `GetObject` body
+        // reaches `serde_json` as an io error indistinguishable from a corrupt
+        // gzip member, and `Gzip` is a class `on_parse_error: copy` fails open on.
+        Err(e) => match transport_error.get() {
+            Some(msg) => FinishKind::Error(ParseFailure::Transport(msg.clone())),
+            None if e.is_io() => FinishKind::Error(ParseFailure::Gzip(e.to_string())),
+            None => FinishKind::Error(ParseFailure::Json(e.to_string())),
+        },
     };
     let _ = tx.blocking_send(StreamMsg::Finished(finish));
 }
@@ -541,6 +552,11 @@ pub async fn stream_run(
                 Err(match failure {
                     ParseFailure::Gzip(msg) => CoreError::Gzip(msg),
                     ParseFailure::Json(msg) => CoreError::Json(msg),
+                    // Buffer mode raises the same variant for the same failure
+                    // (`fetch_with_missing_policy`), so both modes retry.
+                    ParseFailure::Transport(msg) => CoreError::Store(StoreError::Backend(format!(
+                        "reading source object: {msg}"
+                    ))),
                 })
             }
         }
@@ -1000,6 +1016,67 @@ rules:
 
         assert!(matches!(outcome, Outcome::NothingKept), "got {outcome:?}");
         assert!(!store.contains("bucket", "dest"));
+    }
+
+    /// An `AsyncRead` that delivers `prefix` and then fails, standing in for a
+    /// connection reset or a throttle part-way through `GetObject`'s body.
+    struct TruncatingReader {
+        prefix: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for TruncatingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.prefix.position() as usize == this.prefix.get_ref().len() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "connection reset by peer",
+                )));
+            }
+            Pin::new(&mut this.prefix).poll_read(cx, buf)
+        }
+    }
+
+    /// Falsifiable: classify this as `Gzip` and `on_parse_error: copy` fails
+    /// open on a transient S3 read, copying the unfiltered source verbatim.
+    #[tokio::test]
+    async fn a_read_failure_mid_body_is_a_store_error_not_a_parse_failure() {
+        let (body, _) = {
+            let body = br#"{"Records":[{"eventName":"ConsoleLogin"}]}"#.to_vec();
+            (gzip_bytes(&body), ())
+        };
+        // Enough bytes to get past the gzip header, then the reset.
+        let prefix = body[..body.len() / 2].to_vec();
+        let store = InMemoryStore::new();
+        let metrics = Metrics::default();
+        let cfg = Processing::default();
+
+        let err = stream_run(
+            Box::new(TruncatingReader {
+                prefix: std::io::Cursor::new(prefix),
+            }),
+            &no_op_engine(),
+            &cfg,
+            &metrics,
+            &store,
+            "bucket",
+            "dest",
+        )
+        .await
+        .expect_err("a reset mid-body must fail the object");
+
+        assert!(
+            matches!(err, CoreError::Store(StoreError::Backend(_))),
+            "got {err:?}"
+        );
+        assert!(
+            !err.is_unparsable_source(),
+            "a transport failure must never fail open"
+        );
     }
 
     /// An `AsyncRead` recording the size of every chunk `read()` filled and the

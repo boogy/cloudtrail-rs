@@ -30,9 +30,12 @@ use cloudtrail_rs_core::config::{
     Behavior, ConfigStore, Destination, Observability, Processing, Rules, Settings, Source, Sqs,
 };
 use cloudtrail_rs_core::decode::s3::S3EventDecoder;
+use cloudtrail_rs_core::error::StoreError;
 use cloudtrail_rs_core::filter::Engine;
 use cloudtrail_rs_core::metrics::{Metrics, NoopMetricsSink};
+use cloudtrail_rs_core::model::PutMeta;
 use cloudtrail_rs_core::pipeline::Pipeline;
+use cloudtrail_rs_core::ports::ObjectStore;
 
 const ENDPOINT: &str = "http://localhost:4566";
 const SRC_BUCKET: &str = "ct-ministack-src";
@@ -507,4 +510,283 @@ async fn concurrent_objects_all_land_correctly_in_real_s3() {
             "{key} must decompress to exactly the surviving Records"
         );
     }
+}
+
+/// Wraps the real `S3ObjectStore` and cuts the first `get_stream` body short,
+/// standing in for the connection reset or throttle that ends a real
+/// `GetObject` part-way through. Every other call is passed straight through.
+struct ResetFirstGetStream {
+    inner: S3ObjectStore,
+    reset: std::sync::atomic::AtomicBool,
+}
+
+impl ResetFirstGetStream {
+    fn new(inner: S3ObjectStore) -> Self {
+        Self {
+            inner,
+            reset: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// Yields `prefix`, then fails instead of reporting EOF.
+struct ResettingReader {
+    prefix: std::io::Cursor<Vec<u8>>,
+}
+
+impl tokio::io::AsyncRead for ResettingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let remaining = self.prefix.get_ref().len() - self.prefix.position() as usize;
+        if remaining == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )));
+        }
+        let take = remaining.min(buf.remaining());
+        let start = self.prefix.position() as usize;
+        let chunk = self.prefix.get_ref()[start..start + take].to_vec();
+        self.prefix.set_position((start + take) as u64);
+        buf.put_slice(&chunk);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ResetFirstGetStream {
+    async fn get(&self, b: &str, k: &str) -> Result<bytes::Bytes, StoreError> {
+        self.inner.get(b, k).await
+    }
+
+    async fn get_stream(
+        &self,
+        b: &str,
+        k: &str,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, StoreError> {
+        let reader = self.inner.get_stream(b, k).await?;
+        if self.reset.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(reader);
+        }
+        let mut all = Vec::new();
+        let mut reader = reader;
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut all)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        all.truncate(all.len() / 2);
+        Ok(Box::new(ResettingReader {
+            prefix: std::io::Cursor::new(all),
+        }))
+    }
+
+    async fn put(
+        &self,
+        b: &str,
+        k: &str,
+        body: bytes::Bytes,
+        meta: PutMeta,
+    ) -> Result<(), StoreError> {
+        self.inner.put(b, k, body, meta).await
+    }
+
+    async fn put_stream(
+        &self,
+        b: &str,
+        k: &str,
+        body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        meta: PutMeta,
+    ) -> Result<(), StoreError> {
+        self.inner.put_stream(b, k, body, meta).await
+    }
+}
+
+async fn dest_missing(s3: &aws_sdk_s3::Client, key: &str) -> bool {
+    s3.head_object()
+        .bucket(DEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .is_err()
+}
+
+/// Falsifiable: classify the reset as `CoreError::Gzip` and `on_parse_error:
+/// copy` fails open, landing the full unfiltered source — `Decrypt` included —
+/// in the destination bucket.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn a_reset_mid_body_never_fails_open_against_real_s3() {
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let key = "ministack-tests/reset/cloudtrail.json.gz";
+    let (body, _) = cloudtrail_body(20_000);
+    let gzipped = gzip_bytes(&body, 6);
+
+    s3.put_object()
+        .bucket(SRC_BUCKET)
+        .key(key)
+        .body(gzipped.clone().into())
+        .send()
+        .await
+        .expect("seed source object");
+    let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+    let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+    settings.processing.stream_threshold_bytes = 50_000;
+    settings.behavior.on_parse_error = cloudtrail_rs_core::config::OnParseError::Copy;
+
+    let metrics = Arc::new(Metrics::default());
+    let cfg_store = Arc::new(ConfigStore::new(
+        Arc::new(SsmConfigSource::from_client(ssm.clone(), RULES_PARAM)),
+        Duration::from_secs(300),
+        compile_engine(),
+        metrics.clone(),
+    ));
+    cfg_store.prime().await;
+    let pipeline = Pipeline::new(
+        Arc::new(settings),
+        Arc::new(S3EventDecoder::new()),
+        Arc::new(ResetFirstGetStream::new(S3ObjectStore::from_client(
+            s3.clone(),
+        ))),
+        cfg_store,
+        metrics.clone(),
+        Arc::new(NoopMetricsSink),
+    );
+
+    let payload = s3_event_payload(SRC_BUCKET, key, gzipped.len() as u64);
+    let outcome = pipeline.handle(&payload).await;
+    let failed = match outcome {
+        Ok(o) => !o.failed_ack_ids.is_empty(),
+        Err(_) => true,
+    };
+    assert!(
+        failed,
+        "a reset mid-body must surface as a retryable failure"
+    );
+    assert!(
+        dest_missing(&s3, key).await,
+        "nothing may land at the destination for an object that never read fully"
+    );
+    assert_eq!(
+        metrics.snapshot_and_reset().objects_copied_unparsed,
+        0,
+        "a transport failure is not a parse failure"
+    );
+}
+
+/// The other half of the same policy: a source object that really is corrupt
+/// must still be forwarded verbatim.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn a_genuinely_corrupt_object_still_fails_open_through_real_s3() {
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let key = "ministack-tests/corrupt/cloudtrail.json.gz";
+    let (body, _) = cloudtrail_body(20_000);
+    let full = gzip_bytes(&body, 6);
+    let corrupt = full[..full.len() / 2].to_vec();
+
+    s3.put_object()
+        .bucket(SRC_BUCKET)
+        .key(key)
+        .body(corrupt.clone().into())
+        .send()
+        .await
+        .expect("seed source object");
+    let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+    let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+    settings.processing.stream_threshold_bytes = 50_000;
+    settings.behavior.on_parse_error = cloudtrail_rs_core::config::OnParseError::Copy;
+    let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+    let payload = s3_event_payload(SRC_BUCKET, key, corrupt.len() as u64);
+    let outcome = pipeline
+        .handle(&payload)
+        .await
+        .expect("on_parse_error: copy must absorb a corrupt object");
+    assert!(outcome.failed_ack_ids.is_empty());
+
+    assert_eq!(
+        dest_bytes(&s3, key).await,
+        corrupt,
+        "the copy must be the source bytes verbatim"
+    );
+}
+
+/// Realistic CloudTrail records — the shapes `testing::corpus` keeps verbatim —
+/// through real S3 in both modes, which must agree byte for byte after
+/// decompression.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn the_realistic_corpus_round_trips_identically_in_both_modes() {
+    use cloudtrail_rs_core::config::ProcessingMode;
+    use cloudtrail_rs_core::testing::corpus;
+
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let bodies = corpus::scale_records(4_000);
+    let body = corpus::envelope_of(&bodies).into_bytes();
+    let survivors: Vec<&String> = bodies
+        .iter()
+        .filter(|r| !r.contains(r#""eventName":"Decrypt""#))
+        .collect();
+    assert!(
+        !survivors.is_empty() && survivors.len() < bodies.len(),
+        "the corpus must contain both kept and dropped records"
+    );
+    let expected = corpus::envelope_of(&survivors).into_bytes();
+    let gzipped = gzip_bytes(&body, 6);
+    assert!(gzipped.len() > 50_000, "fixture must clear the threshold");
+
+    let mut written = Vec::new();
+    for mode in [ProcessingMode::Buffer, ProcessingMode::Stream] {
+        let key = format!("ministack-tests/corpus-{mode:?}/cloudtrail.json.gz");
+        s3.put_object()
+            .bucket(SRC_BUCKET)
+            .key(&key)
+            .body(gzipped.clone().into())
+            .send()
+            .await
+            .expect("seed source object");
+
+        let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+        settings.processing.mode = mode;
+        settings.processing.stream_threshold_bytes = 50_000;
+        let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+        let payload = s3_event_payload(SRC_BUCKET, &key, gzipped.len() as u64);
+        let outcome = pipeline
+            .handle(&payload)
+            .await
+            .expect("pipeline.handle must succeed");
+        assert!(outcome.failed_ack_ids.is_empty());
+
+        let got = gunzip(&dest_bytes(&s3, &key).await);
+        assert_eq!(got, expected, "{mode:?} must emit exactly the survivors");
+        written.push(got);
+    }
+
+    assert_eq!(written[0], written[1]);
 }
