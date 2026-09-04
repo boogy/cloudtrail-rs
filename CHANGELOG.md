@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-04
+
+### Fixed
+
+- **`on_parse_error: copy` no longer fails open when the source object's body fails to read.** In stream mode a `GetObject` body that died part-way through reached `serde_json` as an io error, which was classified as `CoreError::Gzip` because a corrupt gzip member surfaces the same way. `Gzip` is a class the policy fails open on, so a transient S3 reset was treated as a permanently unparsable object and the **unfiltered** source was copied to the destination — publishing every record the exclusion rules dropped, counted as an `ObjectsCopiedUnparsed` success rather than retried. Buffer mode already raised `CoreError::Store` for the same failure, so the two modes disagreed on failure classification. The read failure is now carried out of band and classified as `CoreError::Store`, so the object is re-driven. Objects that genuinely will not parse are unaffected.
+- **The CLI no longer writes a zero-byte destination object when the fetch itself fails.** `copy_unparsable` was handed a manufactured empty payload; it now re-reads the source as a stream.
+- **The CLI names the policy that actually forwarded an object.** Copies made by `behavior.on_parse_error` were printed as `(unrecognized shape, copied verbatim)`, attributing them to `behavior.on_unrecognized_object` while the metrics recorded them correctly.
+
 ## [0.6.1] - 2026-09-04
 
 ### Fixed
@@ -209,7 +217,8 @@ A workspace-wide test-coverage audit, prioritising anything that could lose a Cl
 - Release pipeline: multi-arch musl + native darwin builds, `checksums.txt`, cosign keyless signing, build-provenance attestation, multi-arch container images to GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...v0.5.0
