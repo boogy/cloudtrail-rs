@@ -16,24 +16,16 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*`
-dependencies by design — the hexagonal boundary is enforced by the crate graph,
-not just convention.
+Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*` dependencies by design — the hexagonal boundary is enforced by the crate graph, not just convention.
 
-Two suites carry more weight than the rest and are worth running deliberately
-when you touch the processing path:
+Two suites carry more weight than the rest and are worth running deliberately when you touch the processing path:
 
 ```sh
 cargo test -p cloudtrail-rs-core --all-features --test mode_parity
 cargo test -p cloudtrail-rs-core --all-features metrics
 ```
 
-`mode_parity` is the buffer-vs-stream equivalence harness: the mode is chosen by
-object **size**, so the two must agree on survivors, output bytes, failure
-classification and every counter, or an object changes meaning at
-`stream_threshold_bytes`. Each case asserts both reconciliation identities from
-[Metrics](metrics.md). **Any change to `process/buffer.rs` or `process/stream.rs`
-belongs in that file as a new case**, not only in the module's own unit tests.
+`mode_parity` is the buffer-vs-stream equivalence harness: the mode is chosen by object **size**, so the two must agree on survivors, output bytes, failure classification and every counter, or an object changes meaning at `stream_threshold_bytes`. Each case asserts both reconciliation identities from [Metrics](metrics.md). **Any change to `process/buffer.rs` or `process/stream.rs` belongs in that file as a new case**, not only in the module's own unit tests.
 
 First-time setup installs every dev/release tool and the musl cross-targets:
 
@@ -74,9 +66,7 @@ make install-tools
 
 ## Integration tests (MiniStack)
 
-`crates/aws` and other crates have `#[ignore]`d tests that exercise the real AWS
-SDK calls against [MiniStack](https://github.com/ministack-org/ministack) (a local
-S3/SSM-compatible stack) instead of mocks. Bring it up first:
+`crates/aws` and other crates have `#[ignore]`d tests that exercise the real AWS SDK calls against [MiniStack](https://github.com/ministack-org/ministack) (a local S3/SSM-compatible stack) instead of mocks. Bring it up first:
 
 ```sh
 docker compose -f docker-compose.test.yml up -d
@@ -89,39 +79,19 @@ cargo test --workspace -- --ignored
 `.github/workflows/ci.yml` runs on every PR and push to `main`. Parallel jobs:
 
 - **lint** — `cargo fmt --check` + `cargo clippy … -D warnings` on one runner.
-- **test** — one instrumented `cargo llvm-cov` job that counts BOTH unit and
-  MiniStack coverage: it starts MiniStack, runs two `--no-report` passes (unit,
-  then `-- --ignored`), and merges a coverage summary (testkit scaffolding
-  excluded). The spawned `bootstrap-<mod>` bins are instrumented, so the lambda
-  `main.rs` roots and the ring HTTP client count instead of reading as 0%.
-- **build** — static-musl `cargo build --workspace --release` on both arches
-  (`x86_64` on `ubuntu-latest`, `aarch64` on the GitHub-hosted arm64 runner),
-  the real release artifact path — no zig, no cross-linker. This is where the
-  musl / `ring`-vs-`aws-lc-rs` breakage surfaces.
-- **security** — `cargo audit` + `cargo deny check` + Trivy filesystem scan
-  (advisory, `continue-on-error`).
+- **test** — one instrumented `cargo llvm-cov` job that counts BOTH unit and MiniStack coverage: it starts MiniStack, runs two `--no-report` passes (unit, then `-- --ignored`), and merges a coverage summary (testkit scaffolding excluded). The spawned `bootstrap-<mod>` bins are instrumented, so the lambda `main.rs` roots and the ring HTTP client count instead of reading as 0%.
+- **build** — static-musl `cargo build --workspace --release` on both arches (`x86_64` on `ubuntu-latest`, `aarch64` on the GitHub-hosted arm64 runner), the real release artifact path — no zig, no cross-linker. This is where the musl / `ring`-vs-`aws-lc-rs` breakage surfaces.
+- **security** — `cargo audit` + `cargo deny check` + Trivy filesystem scan (advisory, `continue-on-error`).
 
-`.github/workflows/codeql.yml` runs CodeQL (`language: rust`, `build-mode: none`)
-on push/PR/weekly. `cargo-audit`/`cargo-deny` in CI are the reliable backstop.
+`.github/workflows/codeql.yml` runs CodeQL (`language: rust`, `build-mode: none`) on push/PR/weekly. `cargo-audit`/`cargo-deny` in CI are the reliable backstop.
 
 ## Versioning
 
-There is exactly **one** version, `[workspace.package] version` in the root
-`Cargo.toml`; all eight crates inherit it with `version.workspace = true`. It is
-not a publishing version — nothing is published (`publish = false`) and every
-internal dependency is a path dependency — it exists so cargo's view of the tree
-matches the artifacts.
+There is exactly **one** version, `[workspace.package] version` in the root `Cargo.toml`; all eight crates inherit it with `version.workspace = true`. It is not a publishing version — nothing is published (`publish = false`) and every internal dependency is a path dependency — it exists so cargo's view of the tree matches the artifacts.
 
-What actually ships is the **git tag**: `release.yml` passes `$GITHUB_REF_NAME`
-as `CLOUDTRAIL_RS_VERSION`, and [`crates/core/build.rs`](../crates/core/build.rs)
-bakes it into every binary (`core::build_info::VERSION`, logged at cold start and
-printed by `cloudtrail-rs --version`).
+What actually ships is the **git tag**: `release.yml` passes `$GITHUB_REF_NAME` as `CLOUDTRAIL_RS_VERSION`, and [`crates/core/build.rs`](../crates/core/build.rs) bakes it into every binary (`core::build_info::VERSION`, logged at cold start and printed by `cloudtrail-rs --version`).
 
-`make version-check` is what keeps the two from drifting. It fails if any crate
-carries its own version, and — given a `TAG` (or a tag on `HEAD`) — if that tag
-disagrees with the workspace version. It runs in release.yml's `setup` job, which
-every other job `needs`, so a mismatched tag fails the release before a single
-binary is built.
+`make version-check` is what keeps the two from drifting. It fails if any crate carries its own version, and — given a `TAG` (or a tag on `HEAD`) — if that tag disagrees with the workspace version. It runs in release.yml's `setup` job, which every other job `needs`, so a mismatched tag fails the release before a single binary is built.
 
 ## Release process
 
@@ -136,33 +106,18 @@ make tag                       # tags v1.2.3 on merged main
 git push origin v1.2.3
 ```
 
-`make bump` refuses non-semver input, runs `version-check` on the result, and
-prints those next steps. Skipping it is not a silent mistake: the tag push fails
-in `setup`. The `Cargo.lock` refresh matters — release builds use
-`cargo build --locked`, which errors on a stale lockfile.
+`make bump` refuses non-semver input, runs `version-check` on the result, and prints those next steps. Skipping it is not a silent mistake: the tag push fails in `setup`. The `Cargo.lock` refresh matters — release builds use `cargo build --locked`, which errors on a stale lockfile.
 
 ### Why the PR and the `main` checkout are not optional
 
-GitHub generates the release's **"What's Changed"** section from the pull
-requests merged inside the tag's commit range (`generate_release_notes: true`,
-grouped by [`.github/release.yml`](../.github/release.yml)). Two things make that
-list come out empty, and both are procedural rather than configuration:
+GitHub generates the release's **"What's Changed"** section from the pull requests merged inside the tag's commit range (`generate_release_notes: true`, grouped by [`.github/release.yml`](../.github/release.yml)). Two things make that list come out empty, and both are procedural rather than configuration:
 
-- **Tagging a branch.** v0.2.0 was tagged on `fix/aws-config-ring-http-client`
-  before the squash-merge, so its range held eleven un-merged commits and zero
-  merged PRs. The release shipped with nothing but a Full Changelog link.
-- **Pushing straight to `main`.** A commit that never had a PR has nothing to
-  list, however good its message is.
+- **Tagging a branch.** v0.2.0 was tagged on `fix/aws-config-ring-http-client` before the squash-merge, so its range held eleven un-merged commits and zero merged PRs. The release shipped with nothing but a Full Changelog link.
+- **Pushing straight to `main`.** A commit that never had a PR has nothing to list, however good its message is.
 
-`make tag` enforces the first: it refuses to run off `main`, on a dirty tree, or
-when local `main` has drifted from `origin/main`. The second is a habit —
-everything lands by PR, and [`pr-label.yml`](../.github/workflows/pr-label.yml)
-labels each one from its conventional-commit title so it files under the right
-heading instead of "Other Changes".
+`make tag` enforces the first: it refuses to run off `main`, on a dirty tree, or when local `main` has drifted from `origin/main`. The second is a habit — everything lands by PR, and [`pr-label.yml`](../.github/workflows/pr-label.yml) labels each one from its conventional-commit title so it files under the right heading instead of "Other Changes".
 
-Everything after the tag is automated by
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub
-Actions, no goreleaser and no zig.
+Everything after the tag is automated by [`.github/workflows/release.yml`](../.github/workflows/release.yml) — plain GitHub Actions, no goreleaser and no zig.
 
 ```mermaid
 flowchart TD
@@ -186,39 +141,13 @@ flowchart TD
 
 Details:
 
-- **build** — a 2-entry matrix builds every static-musl binary on its **native-arch
-  runner** (`x86_64-unknown-linux-musl` on `ubuntu-latest`,
-  `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`). No cross-linker: `musl-tools`
-  supplies `musl-gcc` for `ring`'s C sources and rustc links musl self-contained.
-  Each lambda crate builds a uniquely-named bin (`bootstrap-<mod>`) — avoiding an
-  output-path collision under a `--workspace` build — which is then installed as
-  `bootstrap` for the archive and image context. Uploads the release archives and
-  the raw per-arch binaries.
-- **build-macos** — the CLI's Apple Silicon (`aarch64-apple-darwin`) binary for the
-  Homebrew cask, built on a **native `macos-14` runner** so `Security`/`CoreFoundation`
-  link against the real Xcode SDK. This replaces the old zigbuild darwin
-  cross-compile that failed for lack of a macOS SDK. Intel Macs are not targeted.
-- **Arches** — `aarch64-unknown-linux-musl` + `x86_64-unknown-linux-musl` for all
-  four lambdas and the CLI, plus `aarch64-apple-darwin` for the CLI (Homebrew only).
-- **release** — merges every arch's archives (linux musl + darwin), writes one
-  `checksums.txt`, cosign
-  keyless `sign-blob`s it, then `softprops/action-gh-release` creates the GitHub
-  Release with auto-generated notes (merged PRs since the previous tag + a Full
-  Changelog link, like goreleaser's `changelog: use: github`); `prerelease` is set
-  when the tag contains `-`. Provenance is attested over the archives + checksums.
-- **images** — one multi-arch image per module. `docker buildx` stitches both
-  arches from the pre-built binaries via the COPY-only
-  [`docker/Dockerfile.lambda`](../docker/Dockerfile.lambda) on
-  `gcr.io/distroless/static-debian13` (no QEMU), pushes `<module>-<version>` and
-  `<module>-latest` (latest only on non-prerelease) to GHCR + Docker Hub, and cosign
-  signs the manifest by digest.
-- **homebrew** — renders the CLI cask from the darwin archive and pushes it to
-  `github.com/<owner>/homebrew-tap` (`brew install <owner>/tap/cloudtrail-rs`), using
-  the `HOMEBREW_TAP_TOKEN` PAT since the default `GITHUB_TOKEN` can't push to another
-  repo. Skipped on prereleases so an `-rc` tag never moves the tap.
-- **Supply chain** — cosign keyless (needs `id-token: write`) for the checksums and
-  the image manifests; `attest-build-provenance` for the archive artifacts; Trivy
-  scans each module image and fails on HIGH/CRITICAL.
+- **build** — a 2-entry matrix builds every static-musl binary on its **native-arch runner** (`x86_64-unknown-linux-musl` on `ubuntu-latest`, `aarch64-unknown-linux-musl` on `ubuntu-24.04-arm`). No cross-linker: `musl-tools` supplies `musl-gcc` for `ring`'s C sources and rustc links musl self-contained. Each lambda crate builds a uniquely-named bin (`bootstrap-<mod>`) — avoiding an output-path collision under a `--workspace` build — which is then installed as `bootstrap` for the archive and image context. Uploads the release archives and the raw per-arch binaries.
+- **build-macos** — the CLI's Apple Silicon (`aarch64-apple-darwin`) binary for the Homebrew cask, built on a **native `macos-14` runner** so `Security`/`CoreFoundation` link against the real Xcode SDK. This replaces the old zigbuild darwin cross-compile that failed for lack of a macOS SDK. Intel Macs are not targeted.
+- **Arches** — `aarch64-unknown-linux-musl` + `x86_64-unknown-linux-musl` for all four lambdas and the CLI, plus `aarch64-apple-darwin` for the CLI (Homebrew only).
+- **release** — merges every arch's archives (linux musl + darwin), writes one `checksums.txt`, cosign keyless `sign-blob`s it, then `softprops/action-gh-release` creates the GitHub Release with auto-generated notes (merged PRs since the previous tag + a Full Changelog link, like goreleaser's `changelog: use: github`); `prerelease` is set when the tag contains `-`. Provenance is attested over the archives + checksums.
+- **images** — one multi-arch image per module. `docker buildx` stitches both arches from the pre-built binaries via the COPY-only [`docker/Dockerfile.lambda`](../docker/Dockerfile.lambda) on `gcr.io/distroless/static-debian13` (no QEMU), pushes `<module>-<version>` and `<module>-latest` (latest only on non-prerelease) to GHCR + Docker Hub, and cosign signs the manifest by digest.
+- **homebrew** — renders the CLI cask from the darwin archive and pushes it to `github.com/<owner>/homebrew-tap` (`brew install <owner>/tap/cloudtrail-rs`), using the `HOMEBREW_TAP_TOKEN` PAT since the default `GITHUB_TOKEN` can't push to another repo. Skipped on prereleases so an `-rc` tag never moves the tap.
+- **Supply chain** — cosign keyless (needs `id-token: write`) for the checksums and the image manifests; `attest-build-provenance` for the archive artifacts; Trivy scans each module image and fails on HIGH/CRITICAL.
 
 Dry-run a release build locally before tagging (per target):
 
@@ -229,8 +158,7 @@ make release-musl                             # MUSL_TARGET overrides the target
 
 ### Docker Hub namespace
 
-GHCR uses `${{ github.repository_owner }}` (lowercased) so a fork stays correct.
-The Docker Hub namespace comes from the `DOCKER_HUB_USER` secret.
+GHCR uses `${{ github.repository_owner }}` (lowercased) so a fork stays correct. The Docker Hub namespace comes from the `DOCKER_HUB_USER` secret.
 
 ## Required repo secrets
 
@@ -240,18 +168,14 @@ The Docker Hub namespace comes from the `DOCKER_HUB_USER` secret.
 | `DOCKER_HUB_TOKEN`   | Docker Hub access token.                                 |
 | `HOMEBREW_TAP_TOKEN` | PAT (repo scope on `homebrew-tap`) to push the CLI cask. |
 
-GHCR needs no extra secret beyond the automatic `GITHUB_TOKEN`. Cosign keyless
-signing and build-provenance attestation use the workflow's OIDC identity
-(`id-token: write`) — no long-lived signing key to manage.
+GHCR needs no extra secret beyond the automatic `GITHUB_TOKEN`. Cosign keyless signing and build-provenance attestation use the workflow's OIDC identity (`id-token: write`) — no long-lived signing key to manage.
 
 ## Contributing
 
 1. Branch off `main`.
 2. `make ci` must be green (`fmt-check` + `clippy` + `test` + `audit`).
 3. If you touch rules/config behavior, run `make validate` and `make sample`.
-4. If you touch a processing mode, add a case to `mode_parity.rs`; if you touch
-   a metric, prove the new behavior fails without your change before claiming
-   the test guards it.
+4. If you touch a processing mode, add a case to `mode_parity.rs`; if you touch a metric, prove the new behavior fails without your change before claiming the test guards it.
 5. Keep `#![forbid(unsafe_code)]` intact and `core` free of `aws-sdk-*` deps.
 6. Open a PR; CI gates the same checks plus CodeQL and the security scan.
 

@@ -6,9 +6,7 @@
   "account": "111122223333",
   "time": "2021-11-12T00:00:00Z",
   "region": "ca-central-1",
-  "resources": [
-    "arn:aws:s3:::amzn-s3-demo-bucket1"
-  ],
+  "resources": ["arn:aws:s3:::amzn-s3-demo-bucket1"],
   "detail": {
     "version": "0",
     "event-version": "1.1",

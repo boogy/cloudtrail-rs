@@ -1,19 +1,12 @@
 # cloudtrail-rs documentation
 
-`cloudtrail-rs` filters CloudTrail S3 logs in flight: read a `.json.gz`
-CloudTrail object, drop noisy `Records` entries that match a configured exclusion
-rule, write the survivors to a destination bucket with the same
-`gzip({"Records":[...]})` envelope. It ships as four independent Lambda binaries
-(one per trigger topology) plus a local/offline CLI, built on a hexagonal core.
+`cloudtrail-rs` filters CloudTrail S3 logs in flight: read a `.json.gz` CloudTrail object, drop noisy `Records` entries that match a configured exclusion rule, write the survivors to a destination bucket with the same `gzip({"Records":[...]})` envelope. It ships as four independent Lambda binaries (one per trigger topology) plus a local/offline CLI, built on a hexagonal core.
 
 ## Start here
 
-- **New to the project?** Read [Architecture](architecture.md), then
-  [Deployment](deployment.md).
-- **Configuring a deployment?** [Configuration](configuration.md) +
-  [Rules](rules.md).
-- **Operating one?** [Metrics](metrics.md) — what to alarm on so a silent
-  failure cannot stay silent.
+- **New to the project?** Read [Architecture](architecture.md), then [Deployment](deployment.md).
+- **Configuring a deployment?** [Configuration](configuration.md) + [Rules](rules.md).
+- **Operating one?** [Metrics](metrics.md) — what to alarm on so a silent failure cannot stay silent.
 - **Working locally?** [CLI](cli.md) + [Development](development.md).
 
 ## Contents

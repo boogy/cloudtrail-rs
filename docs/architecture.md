@@ -1,9 +1,6 @@
 # Architecture
 
-`cloudtrail-rs` is a **hexagonal (ports-and-adapters)** system. All filtering
-logic lives in a pure core crate with no AWS dependency; the AWS world reaches
-it only through a small set of object-safe traits (ports). Each deployable is a
-thin composition root that wires concrete adapters into the core.
+`cloudtrail-rs` is a **hexagonal (ports-and-adapters)** system. All filtering logic lives in a pure core crate with no AWS dependency; the AWS world reaches it only through a small set of object-safe traits (ports). Each deployable is a thin composition root that wires concrete adapters into the core.
 
 - [The crate graph](#the-crate-graph)
 - [Ports](#ports)
@@ -47,8 +44,7 @@ flowchart LR
     CLI["cloudtrail-rs CLI<br/>(crates/cli)"] -.->|"validate / test / filter,<br/>same Engine + buffer_run"| ENGINE
 ```
 
-Adding a new event source is one new `EventDecoder` behind one new Cargo feature
-and one new bin — **zero changes to `core`**.
+Adding a new event source is one new `EventDecoder` behind one new Cargo feature and one new bin — **zero changes to `core`**.
 
 | Crate                                                            | Role                                                                                                                                                  |
 | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -60,14 +56,11 @@ and one new bin — **zero changes to `core`**.
 | `crates/lambda-eventbridge` (`cloudtrail-rs-lambda-eventbridge`) | Composition root, S3 → EventBridge → Lambda trigger, feature `decode-eventbridge`.                                                                    |
 | `crates/cli` (`cloudtrail-rs`)                                   | Offline CLI: `validate`, `validate-settings`, `test`, `filter`. Depends on `core` **and** `aws` (so a rules/config `uri` can be `ssm://` or `s3://`). |
 
-Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*`
-dependencies by design — the hexagonal boundary is enforced by the crate graph,
-not just convention.
+Every crate is `#![forbid(unsafe_code)]`; `core` has zero `aws-sdk-*` dependencies by design — the hexagonal boundary is enforced by the crate graph, not just convention.
 
 ## Ports
 
-The core defines four ports as object-safe traits. The Pipeline holds
-`Arc<dyn Port>` instances and never knows which concrete adapter is behind them.
+The core defines four ports as object-safe traits. The Pipeline holds `Arc<dyn Port>` instances and never knows which concrete adapter is behind them.
 
 ```mermaid
 flowchart TB
@@ -107,9 +100,7 @@ flowchart TB
 
 ## The per-record hot path
 
-The per-record hot path is **pure computation with no trait dispatch**. Dispatch
-happens once per object (`ObjectStore`) or once per invocation (`ConfigSource`,
-`MetricsSink`), never per record.
+The per-record hot path is **pure computation with no trait dispatch**. Dispatch happens once per object (`ObjectStore`) or once per invocation (`ConfigSource`, `MetricsSink`), never per record.
 
 ```mermaid
 sequenceDiagram
@@ -139,8 +130,7 @@ sequenceDiagram
 
 ### Three evaluators, one production path
 
-`Engine` exposes three evaluators. Only the last one filters records in
-production; the other two exist so the fast one can be checked.
+`Engine` exposes three evaluators. Only the last one filters records in production; the other two exist so the fast one can be checked.
 
 | Evaluator                 | Input          | Rule index | Projected parse | Used by                                       |
 | ------------------------- | -------------- | ---------- | --------------- | --------------------------------------------- |
@@ -148,34 +138,17 @@ production; the other two exist so the fast one can be checked.
 | `evaluate(&Value)`        | parsed `Value` | yes        | no              | `cloudtrail-rs test`                          |
 | `evaluate_raw(&str)`      | raw JSON text  | yes        | yes             | **production** — `process::buffer` / `stream` |
 
-Each rung adds exactly **one** optimization, which is the point: when they
-disagree, the disagreement localizes the defect. `evaluate_linear` vs `evaluate`
-isolates the rule index; `evaluate` vs `evaluate_raw` isolates the projection.
-A single fast path that returned a wrong answer would say nothing about which
-optimization broke.
+Each rung adds exactly **one** optimization, which is the point: when they disagree, the disagreement localizes the defect. `evaluate_linear` vs `evaluate` isolates the rule index; `evaluate` vs `evaluate_raw` isolates the projection. A single fast path that returned a wrong answer would say nothing about which optimization broke.
 
-`evaluate_linear` is the **oracle**. Having neither an index nor a projection, it
-cannot fail in the ways the optimized paths can — index over-exclusion or
-projection mis-capture. That matters more here than in most systems: an
-over-excluding index silently drops records that should have been kept, which for
-an audit-log filter means destroyed evidence that nothing downstream would notice.
-`crates/core/tests/oracle.rs` enforces three-way agreement over the corpus,
-generated records, and a proptest.
+`evaluate_linear` is the **oracle**. Having neither an index nor a projection, it cannot fail in the ways the optimized paths can — index over-exclusion or projection mis-capture. That matters more here than in most systems: an over-excluding index silently drops records that should have been kept, which for an audit-log filter means destroyed evidence that nothing downstream would notice. `crates/core/tests/oracle.rs` enforces three-way agreement over the corpus, generated records, and a proptest.
 
-They are also the **benchmark controls**. `benches/filter.rs` measures all three,
-so a change can be attributed to the optimization it targeted rather than to the
-machine: when path interning cut `evaluate_raw` by ~39%, `evaluate` and
-`evaluate_linear` stayed flat, which is what made the result credible.
+They are also the **benchmark controls**. `benches/filter.rs` measures all three, so a change can be attributed to the optimization it targeted rather than to the machine: when path interning cut `evaluate_raw` by ~39%, `evaluate` and `evaluate_linear` stayed flat, which is what made the result credible.
 
-`evaluate_raw` returns `Result` because it parses; it must return `Err` exactly
-when `serde_json::from_str::<Value>` would, since an unparseable record is
-**kept**. It falls back to a full parse when any rule uses a `[*]` path — see
-the wildcard cliff in [rules.md](rules.md#tuning-a-ruleset-for-speed).
+`evaluate_raw` returns `Result` because it parses; it must return `Err` exactly when `serde_json::from_str::<Value>` would, since an unparseable record is **kept**. It falls back to a full parse when any rule uses a `[*]` path — see the wildcard cliff in [rules.md](rules.md#tuning-a-ruleset-for-speed).
 
 ## Processing modes: buffer vs stream
 
-`CT_PROCESSING_MODE` selects how each object is processed. `auto` (default)
-switches to streaming above `CT_STREAM_THRESHOLD_BYTES` (8 MiB default).
+`CT_PROCESSING_MODE` selects how each object is processed. `auto` (default) switches to streaming above `CT_STREAM_THRESHOLD_BYTES` (8 MiB default).
 
 ```mermaid
 flowchart TD
@@ -189,17 +162,12 @@ flowchart TD
     STR --> OUT
 ```
 
-- **buffer** — reads the whole object into memory and decompresses it. Guarded
-  by `CT_MAX_OBJECT_BYTES` (128 MiB default) on both sides: the fetch stops one
-  byte past the cap, and the decompressed body is capped again. Used by the
-  CLI's `filter`/`test` as well.
-- **stream** — constant memory; writes the destination with S3 multipart uploads
-  of `CT_MULTIPART_PART_BYTES` (8 MiB default) each.
+- **buffer** — reads the whole object into memory and decompresses it. Guarded by `CT_MAX_OBJECT_BYTES` (128 MiB default) on both sides: the fetch stops one byte past the cap, and the decompressed body is capped again. Used by the CLI's `filter`/`test` as well.
+- **stream** — constant memory; writes the destination with S3 multipart uploads of `CT_MULTIPART_PART_BYTES` (8 MiB default) each.
 
 ### What an object costs
 
-One 4.5 MB / 4,000-record object, `rust_backend` (miniz_oxide) at level 6,
-`--release`:
+One 4.5 MB / 4,000-record object, `rust_backend` (miniz_oxide) at level 6, `--release`:
 
 | Stage                      | Time         |
 | -------------------------- | ------------ |
@@ -208,59 +176,27 @@ One 4.5 MB / 4,000-record object, `rust_backend` (miniz_oxide) at level 6,
 | gzip decompress            | 2.46 ms      |
 | e2e `buffer_run`           | **17.36 ms** |
 
-**Compression, not filtering, is the dominant stage** — it costs more than twice
-what evaluating all 4,000 records against the ruleset does. Any optimisation that
-does not touch compression is bounded by what is left.
+**Compression, not filtering, is the dominant stage** — it costs more than twice what evaluating all 4,000 records against the ruleset does. Any optimisation that does not touch compression is bounded by what is left.
 
-The rows were measured independently and deliberately carry no percentage column:
-they do not sum to the e2e figure, because the compress row compresses the whole
-body while the pipeline compresses only the survivors. Read them as relative
-stage costs, not as a decomposition of the 17.36 ms.
+The rows were measured independently and deliberately carry no percentage column: they do not sum to the e2e figure, because the compress row compresses the whole body while the pipeline compresses only the survivors. Read them as relative stage costs, not as a decomposition of the 17.36 ms.
 
-Peak memory in buffer mode is about two object-sized buffers — the decompressed
-object stays resident for the whole of `buffer_run` (survivors borrow from it),
-plus the one assembled body. At the `max_object_bytes` default that is ≈256 MB.
+Peak memory in buffer mode is about two object-sized buffers — the decompressed object stays resident for the whole of `buffer_run` (survivors borrow from it), plus the one assembled body. At the `max_object_bytes` default that is ≈256 MB.
 
-These figures come from a 4,000-record object with realistic entropy that is
-**not checked into the repo**, so unlike the [README's per-record
-benchmarks](../README.md#performance) they are not reproducible with a repo
-command. Treat them as one machine's stage profile, not as a specification.
+These figures come from a 4,000-record object with realistic entropy that is **not checked into the repo**, so unlike the [README's per-record benchmarks](../README.md#performance) they are not reproducible with a repo command. Treat them as one machine's stage profile, not as a specification.
 
 ### Parity is an invariant, not a coincidence
 
-The mode an object takes is decided by its **size**, which has nothing to do
-with its contents. So the two modes must agree on everything that is not memory
-usage — the same bytes in must produce the same survivors, the same compressed
-output, the same failure classification, and the same counters — or an object
-silently changes meaning at `stream_threshold_bytes`.
+The mode an object takes is decided by its **size**, which has nothing to do with its contents. So the two modes must agree on everything that is not memory usage — the same bytes in must produce the same survivors, the same compressed output, the same failure classification, and the same counters — or an object silently changes meaning at `stream_threshold_bytes`.
 
-`crates/core/tests/mode_parity.rs` runs every case through both modes and
-asserts exactly that, including both reconciliation identities from
-[Metrics](metrics.md). Three consequences worth knowing when changing either
-module:
+`crates/core/tests/mode_parity.rs` runs every case through both modes and asserts exactly that, including both reconciliation identities from [Metrics](metrics.md). Three consequences worth knowing when changing either module:
 
-- **Nothing is published until the object's fate is decided.** Buffer mode gets
-  this for free — it classifies the whole object before touching a counter.
-  Stream mode has to defer: record counters are tallied locally and committed as
-  one unit only once the object has succeeded, because a failed object is
-  re-driven and re-evaluated whole.
-- **Integrity is verified before the output commits.** `Deserializer::end()`
-  runs before the stream is reported finished, so a truncated gzip trailer or a
-  second concatenated envelope fails the object instead of committing a short
-  one. Decompression is always `MultiGzDecoder`, never `GzDecoder`.
-- **A stream-mode failure aborts the upload by failing the reader.** The error
-  is sent into the output channel, so `put_stream`'s body reader errors, and the
-  adapter issues `AbortMultipartUpload` rather than `CompleteMultipartUpload`.
-  Dropping the channel instead would look like a clean EOF and commit a
-  truncated object — which is why no error path may simply return.
+- **Nothing is published until the object's fate is decided.** Buffer mode gets this for free — it classifies the whole object before touching a counter. Stream mode has to defer: record counters are tallied locally and committed as one unit only once the object has succeeded, because a failed object is re-driven and re-evaluated whole.
+- **Integrity is verified before the output commits.** `Deserializer::end()` runs before the stream is reported finished, so a truncated gzip trailer or a second concatenated envelope fails the object instead of committing a short one. Decompression is always `MultiGzDecoder`, never `GzDecoder`.
+- **A stream-mode failure aborts the upload by failing the reader.** The error is sent into the output channel, so `put_stream`'s body reader errors, and the adapter issues `AbortMultipartUpload` rather than `CompleteMultipartUpload`. Dropping the channel instead would look like a clean EOF and commit a truncated object — which is why no error path may simply return.
 
 ## Cold start and init-once
 
-Rust has no `init()` phase like Go, but Lambda gives the same window: everything
-in `main()` before `lambda_runtime::run(...)` runs **once per container**, on a
-full-vCPU burst, and is skipped on every warm invocation after that (and under
-provisioned concurrency, essentially never runs again for the container's
-lifetime).
+Rust has no `init()` phase like Go, but Lambda gives the same window: everything in `main()` before `lambda_runtime::run(...)` runs **once per container**, on a full-vCPU burst, and is skipped on every warm invocation after that (and under provisioned concurrency, essentially never runs again for the container's lifetime).
 
 ```mermaid
 sequenceDiagram
@@ -286,41 +222,22 @@ sequenceDiagram
 
 What `main` does in that window, in order:
 
-1. `init_tracing()` — sets up the `tracing_subscriber` JSON registry (must happen
-   exactly once; re-initializing per-invocation panics or double-logs).
+1. `init_tracing()` — sets up the `tracing_subscriber` JSON registry (must happen exactly once; re-initializing per-invocation panics or double-logs).
 2. `Settings::load()` — parses `SETTINGS_URI` (if any) plus every `CT_*` env var, once.
 3. `aws_config::load_defaults(...)` — resolves the credential chain once.
-4. `S3ObjectStore::new(&sdk_conf)` — builds the S3 client and its TLS connection
-   pool (rustls/ring handshake cost paid once, not per object).
+4. `S3ObjectStore::new(&sdk_conf)` — builds the S3 client and its TLS connection pool (rustls/ring handshake cost paid once, not per object).
 5. The one compiled-in `EventDecoder` is constructed.
 6. The `ConfigSource` matching `rules.uri`'s scheme is built.
 7. `Metrics::default()` — process-lived atomic counters, held across invocations by `Arc`.
 8. The `MetricsSink` (`EmfMetricsSink` or `NoopMetricsSink`) is built from `observability.metrics`.
-9. `ConfigStore::new(...)` then `cfg_store.prime().await` — fetches, parses, and
-   **compiles every regex plus the rule index** exactly once, and seeds the TTL
-   clock. `prime()` never panics or returns an error even on failure — it records
-   `ConfigLoadErrors` and lets the first invocation's `on_config_error` policy
-   handle it. Only a _settings_ load failure is fatal at this stage (a bad
-   `SETTINGS_URI` is a deployment error, not a transient one).
+9. `ConfigStore::new(...)` then `cfg_store.prime().await` — fetches, parses, and **compiles every regex plus the rule index** exactly once, and seeds the TTL clock. `prime()` never panics or returns an error even on failure — it records `ConfigLoadErrors` and lets the first invocation's `on_config_error` policy handle it. Only a _settings_ load failure is fatal at this stage (a bad `SETTINGS_URI` is a deployment error, not a transient one).
 10. `Pipeline::new(...)` wires all of the above into one `Arc<Pipeline>`.
 
-Regex compilation across ~80 patterns is the single largest init line item; the
-TLS handshake and the rules fetch are next — together tens to a couple hundred
-milliseconds. `ColdStart: 1` is emitted (an `AtomicBool` flipped on the first
-`handle()` call) so a cold start is visible in p99 latency instead of being
-confused with a genuinely large object.
+Regex compilation across ~80 patterns is the single largest init line item; the TLS handshake and the rules fetch are next — together tens to a couple hundred milliseconds. `ColdStart: 1` is emitted (an `AtomicBool` flipped on the first `handle()` call) so a cold start is visible in p99 latency instead of being confused with a genuinely large object.
 
-> **Hard rule:** every adapter (`ObjectStore`, `ConfigSource`, decoder,
-> `MetricsSink`) is constructed in `main`, during init — **never** inside the
-> handler closure. The closure passed to `service_fn` captures only
-> `pipeline.clone()` (an `Arc` clone). A `::new(` call for any port
-> implementation inside that closure is a bug: it would silently repeat regex
-> compilation, credential resolution, or client construction on every single
-> invocation instead of once per container.
+> **Hard rule:** every adapter (`ObjectStore`, `ConfigSource`, decoder, `MetricsSink`) is constructed in `main`, during init — **never** inside the handler closure. The closure passed to `service_fn` captures only `pipeline.clone()` (an `Arc` clone). A `::new(` call for any port implementation inside that closure is a bug: it would silently repeat regex compilation, credential resolution, or client construction on every single invocation instead of once per container.
 
-Provisioned concurrency pays for itself precisely when cold-start latency (not
-average latency) is what you're bounding — e.g. a strict per-invocation SLA —
-since it keeps containers pre-initialized past the point this section describes.
+Provisioned concurrency pays for itself precisely when cold-start latency (not average latency) is what you're bounding — e.g. a strict per-invocation SLA — since it keeps containers pre-initialized past the point this section describes.
 
 ---
 

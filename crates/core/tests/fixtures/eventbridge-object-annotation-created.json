@@ -6,9 +6,7 @@
   "account": "111122223333",
   "time": "2025-03-15T00:00:00Z",
   "region": "us-east-1",
-  "resources": [
-    "arn:aws:s3:::amzn-s3-demo-bucket1"
-  ],
+  "resources": ["arn:aws:s3:::amzn-s3-demo-bucket1"],
   "detail": {
     "version": "0",
     "event-version": "1.1",
