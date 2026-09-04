@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-04
+
 ### Fixed
 - **`on_parse_error: copy` no longer fails open on failures that are not the
   source object's fault.** It keyed off `CoreError::Gzip`/`Json`, but the
@@ -709,7 +711,8 @@ processing.stream_threshold_bytes`; `processing.multipart_part_bytes` must
   GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.3.0...v0.4.0
