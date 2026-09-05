@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.6.3] - 2026-09-05
 
+### Changed
+
+- **Every dependency refreshed to its latest published version.** 60 crates moved, including `aws-config` 1.11 -> 1.12, `aws-sdk-s3` 1.144 -> 1.145, `aws-smithy-runtime-api` 1.15 -> 1.16, `aws-types` 1.5 -> 1.6, `lambda_runtime` 1.3 -> 1.4, `hyper` 1.11.0 -> 1.11.1, `rustls-webpki` 0.103.13 -> 0.103.15 and `futures` 0.3.33 -> 0.3.34. No manifest constraint needed widening — every direct dependency's requirement already admitted its latest release, and none has published a newer incompatible major. The TLS backend is unchanged: `ring` 0.17.14, with `aws-lc-rs`/`aws-lc-sys` still absent from the lockfile and still banned by `deny.toml`.
+- **`taiki-e/install-action` re-pinned** from v2.87.2 to v2.87.6 (`7b8d4719`). A pinned SHA that has fallen behind is still an unpatched dependency; the remaining thirteen action pins were each verified to be their upstream's current release.
+
 ### Fixed
 
 - **A 0-byte object no longer fails the whole invocation.** `S3ObjectStore::put_stream` errored when the body read EOF on its first read, because a multipart upload cannot express a zero-byte object: `CompleteMultipartUpload` rejects a zero-part upload. Every stream-mode path that copies a source object verbatim reaches it — `behavior.on_config_error: open` and `behavior.on_parse_error: copy` — so an empty `.json.gz` in the source bucket became a poison pill that was re-driven to the DLQ instead of being copied. The upload is now aborted and the object written with a plain `PutObject`, matching what buffer mode and the CLI's local store already did for the same input.
