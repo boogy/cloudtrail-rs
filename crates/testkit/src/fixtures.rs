@@ -150,6 +150,48 @@ pub fn sqs_event_with_sns_body(
     })
 }
 
+/// An SQS event whose message bodies are supplied verbatim — for driving a
+/// Lambda with bodies a live MiniStack produced rather than ones a test wrote.
+/// The envelope around them is Lambda's, not S3's, so it stays hand-built.
+pub fn sqs_event_from_bodies(bodies: &[String]) -> serde_json::Value {
+    let records: Vec<_> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| {
+            serde_json::json!({
+                "messageId": format!("m-{i}"),
+                "receiptHandle": "receipt",
+                "body": body,
+                "attributes": {},
+                "messageAttributes": {},
+                "eventSource": "aws:sqs"
+            })
+        })
+        .collect();
+    serde_json::json!({ "Records": records })
+}
+
+/// An SNS event whose `Sns.Message` values are supplied verbatim. MiniStack
+/// cannot subscribe a Lambda to a topic, so a real S3 notification is read off
+/// an SQS subscription and re-wrapped in the envelope Lambda would deliver.
+pub fn sns_event_from_messages(messages: &[String]) -> serde_json::Value {
+    let records: Vec<_> = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "EventSource": "aws:sns",
+                "Sns": {
+                    "Type": "Notification",
+                    "MessageId": "sns-message-id",
+                    "TopicArn": "arn:aws:sns:us-east-1:000000000000:ct",
+                    "Message": message,
+                }
+            })
+        })
+        .collect();
+    serde_json::json!({ "Records": records })
+}
+
 /// An SNS event whose `Message` is an embedded S3 notification.
 pub fn sns_event(bucket: &str, key: &str, size: u64) -> serde_json::Value {
     serde_json::json!({

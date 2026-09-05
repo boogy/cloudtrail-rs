@@ -101,11 +101,6 @@ async fn golden_sqs_payload_filters_and_writes_survivors() {
     );
 }
 
-/// Fix 5(a): end-to-end proof that a missing object still reaches
-/// `batchItemFailures` — the first message's referenced object was never
-/// seeded in the store (`on_missing_object: error`), the second message's
-/// object was. Only the first message's id may appear in `failed_ack_ids`,
-/// and the second message's object must still land at the destination.
 #[tokio::test]
 async fn missing_object_fails_only_its_own_message_and_lets_the_sibling_through() {
     let src = Arc::new(StaticConfigSource::new(
@@ -159,9 +154,6 @@ async fn missing_object_fails_only_its_own_message_and_lets_the_sibling_through(
     );
 }
 
-/// Fix 5(b): end-to-end proof that an undecodable message body (Fix 1)
-/// reaches `batchItemFailures` rather than being silently dropped and
-/// acked clean.
 /// A batch that decodes to zero messages would be acked whole; a payload
 /// without `Records` is malformed, so the invocation must fail instead.
 #[tokio::test]
