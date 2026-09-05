@@ -54,6 +54,8 @@ pub struct PutMeta {
 pub enum VersionTag {
     Etag(String),
     Version(i64),
+    /// Nanoseconds since the Unix epoch — whole seconds cannot distinguish
+    /// two writes within the same second, which pins a stale config.
     Mtime(u64),
     None,
 }

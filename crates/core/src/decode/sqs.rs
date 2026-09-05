@@ -27,7 +27,9 @@ impl SqsEventDecoder {
 
 #[derive(Debug, Deserialize)]
 struct SqsEvent {
-    #[serde(rename = "Records", default)]
+    /// No `#[serde(default)]`: a payload without `Records` is a failure, not a
+    /// silently acked empty batch.
+    #[serde(rename = "Records")]
     records: Vec<SqsRecord>,
 }
 
@@ -270,6 +272,18 @@ mod tests {
         let decoder = SqsEventDecoder::new(SqsBodyFormat::Auto);
         let items = decoder.decode(br#"{"Records":[]}"#).unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn valid_json_without_a_records_array_is_a_decode_error_not_an_empty_batch() {
+        let decoder = SqsEventDecoder::new(SqsBodyFormat::Auto);
+        let err = decoder
+            .decode(br#"{"Type":"Notification","Message":"something else entirely"}"#)
+            .expect_err("a payload with no Records array must not ack as zero messages");
+        assert!(
+            err.to_string().contains("Records"),
+            "the error must name the missing field, got: {err}"
+        );
     }
 
     #[test]

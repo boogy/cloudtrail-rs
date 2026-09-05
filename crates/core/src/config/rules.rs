@@ -269,7 +269,10 @@ impl RuleSet {
         let parts: Vec<String> = ["eventSource", "eventName"]
             .into_iter()
             .filter_map(|field| {
-                let m = matches.iter().find(|m| !m.negate && m.field == field)?;
+                let m = matches
+                    .iter()
+                    .find(|m| !m.negate && m.field == field)
+                    .or_else(|| matches.iter().find(|m| m.field == field))?;
                 // Display, never Debug: the pattern must appear verbatim so a
                 // user can find it in their YAML.
                 let described = match &m.op {
@@ -631,6 +634,42 @@ rules:
         assert_eq!(
             rs.index_key_description(0).as_deref(),
             Some("eventSource any_of [\"kms.amazonaws.com\", \"ec2.amazonaws.com\"]")
+        );
+    }
+
+    #[test]
+    fn describes_a_negated_index_field_and_prefers_the_plain_one() {
+        let only_negated = br#"
+version: 2.0.0
+rules:
+  - name: Negated only
+    matches:
+      - field: eventSource
+        equals: "kms.amazonaws.com"
+        negate: true
+"#;
+        let rs = RuleSet::parse(only_negated).expect("must parse");
+        assert_eq!(
+            rs.index_key_description(0).as_deref(),
+            Some(r#"eventSource negated equals "kms.amazonaws.com""#)
+        );
+
+        let both = br#"
+version: 2.0.0
+rules:
+  - name: Both
+    matches:
+      - field: eventSource
+        equals: "ec2.amazonaws.com"
+        negate: true
+      - field: eventSource
+        equals: "kms.amazonaws.com"
+"#;
+        let rs = RuleSet::parse(both).expect("must parse");
+        assert_eq!(
+            rs.index_key_description(0).as_deref(),
+            Some(r#"eventSource equals "kms.amazonaws.com""#),
+            "the non-negated condition is the one indexing uses"
         );
     }
 

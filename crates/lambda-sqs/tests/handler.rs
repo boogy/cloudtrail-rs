@@ -101,11 +101,6 @@ async fn golden_sqs_payload_filters_and_writes_survivors() {
     );
 }
 
-/// Fix 5(a): end-to-end proof that a missing object still reaches
-/// `batchItemFailures` — the first message's referenced object was never
-/// seeded in the store (`on_missing_object: error`), the second message's
-/// object was. Only the first message's id may appear in `failed_ack_ids`,
-/// and the second message's object must still land at the destination.
 #[tokio::test]
 async fn missing_object_fails_only_its_own_message_and_lets_the_sibling_through() {
     let src = Arc::new(StaticConfigSource::new(
@@ -159,9 +154,43 @@ async fn missing_object_fails_only_its_own_message_and_lets_the_sibling_through(
     );
 }
 
-/// Fix 5(b): end-to-end proof that an undecodable message body (Fix 1)
-/// reaches `batchItemFailures` rather than being silently dropped and
-/// acked clean.
+/// A batch that decodes to zero messages would be acked whole; a payload
+/// without `Records` is malformed, so the invocation must fail instead.
+#[tokio::test]
+async fn an_sqs_payload_without_records_fails_the_invocation_instead_of_acking_it() {
+    let src = Arc::new(StaticConfigSource::new(
+        b"version: 1.0.0\nrules: []\n".to_vec(),
+        VersionTag::Version(1),
+    ));
+    let metrics = Arc::new(Metrics::default());
+    let cfg_store = Arc::new(ConfigStore::new(
+        src,
+        Duration::from_secs(300),
+        Arc::new(|b: &[u8]| Ok(Arc::new(Engine::new(RuleSet::parse(b)?)?))),
+        metrics.clone(),
+    ));
+    cfg_store.prime().await;
+
+    let cfg = settings();
+    let pipeline = Pipeline::new(
+        Arc::new(cfg.clone()),
+        Arc::new(SqsEventDecoder::new(cfg.sqs.body_format)),
+        Arc::new(InMemoryStore::new()),
+        cfg_store,
+        metrics,
+        Arc::new(RecordingSink::new()),
+    );
+
+    let err = pipeline
+        .handle(br#"{"Type":"Notification","Message":"not an SQS batch"}"#)
+        .await
+        .expect_err("a payload with no Records must not be a successful empty batch");
+    assert!(
+        err.to_string().contains("Records"),
+        "the error must name the missing field, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn undecodable_message_body_fails_only_its_own_message() {
     let src = Arc::new(StaticConfigSource::new(

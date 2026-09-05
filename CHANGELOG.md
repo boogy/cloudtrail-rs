@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-05
+
+### Changed
+
+- **Every dependency refreshed to its latest published version.** 60 crates moved, including `aws-config` 1.11 -> 1.12, `aws-sdk-s3` 1.144 -> 1.145, `aws-smithy-runtime-api` 1.15 -> 1.16, `aws-types` 1.5 -> 1.6, `lambda_runtime` 1.3 -> 1.4, `hyper` 1.11.0 -> 1.11.1, `rustls-webpki` 0.103.13 -> 0.103.15 and `futures` 0.3.33 -> 0.3.34. No manifest constraint needed widening — every direct dependency's requirement already admitted its latest release, and none has published a newer incompatible major. The TLS backend is unchanged: `ring` 0.17.14, with `aws-lc-rs`/`aws-lc-sys` still absent from the lockfile and still banned by `deny.toml`.
+- **`taiki-e/install-action` re-pinned** from v2.87.2 to v2.87.6 (`7b8d4719`). A pinned SHA that has fallen behind is still an unpatched dependency; the remaining thirteen action pins were each verified to be their upstream's current release.
+
+### Fixed
+
+- **A 0-byte object no longer fails the whole invocation.** `S3ObjectStore::put_stream` errored when the body read EOF on its first read, because a multipart upload cannot express a zero-byte object: `CompleteMultipartUpload` rejects a zero-part upload. Every stream-mode path that copies a source object verbatim reaches it — `behavior.on_config_error: open` and `behavior.on_parse_error: copy` — so an empty `.json.gz` in the source bucket became a poison pill that was re-driven to the DLQ instead of being copied. The upload is now aborted and the object written with a plain `PutObject`, matching what buffer mode and the CLI's local store already did for the same input.
+- **An SQS or SNS payload without a `Records` array is a decode error, not an empty batch.** Both decoders declared `#[serde(default)]` on the field, so any JSON object at all decoded to zero messages: the invocation succeeded, wrote nothing, emitted no error, no log and no metric, and — on SQS — acked the whole batch. The S3 decoder already rejected such a payload for exactly this reason. The invocation now fails and the batch is retried.
+- **`VersionTag::Mtime` carries nanoseconds, not whole seconds.** `ConfigStore` refetches only when the tag changes, so two rewrites of a `file://` ruleset inside the same second produced the same tag and the first ruleset stayed cached for the life of the process — no race required, just a redeploy that rewrote the file quickly.
+- **`FileConfigSource::fetch` stats before it reads.** Reading first and stamping the mtime afterwards let a write that landed between the two label stale bytes with the new file's version, so every later revalidation matched and the stale ruleset was pinned until the process restarted. The bytes now carry the older mtime, and the next revalidation refetches.
+- **Stream mode's header-write failure path aborts the upload.** It was the one early return that dropped the output channel without first sending an error into it; a clean EOF at zero bytes is what `put_stream` commits, so it would have landed an empty object at the destination key rather than failing the object. `write_all` into a `Vec` does not fail today, so this restores the invariant rather than fixing an observed failure, and no test can force it without an injectable writer.
+- **`cli validate` describes a rule narrowed only by a negated `eventSource`/`eventName`.** `index_key_description` skipped negated conditions, so such a rule was reported as having no indexable condition at all — true of the index, false of the rule. It now names the negated condition that could not be reduced to literals, and still prefers the plain condition when a rule has both.
+
+### Testing
+
+- **A real 0-byte object through a real S3 API, in both modes.** `an_empty_source_object_fails_open_to_a_zero_byte_destination_object` drives an empty source object through `Pipeline::handle` against MiniStack under `buffer` and `stream`, so the one input multipart cannot express is covered by the buffer/stream parity claim. MiniStack, unlike real S3, accepts a zero-part `CompleteMultipartUpload`, so the destination object existing proves nothing on its own; the test asserts the destination ETag carries no `-<part count>` suffix, which is what distinguishes the fix's `PutObject` from the multipart path. Reverting the fix fails it.
+- Every fix above except the stream-mode header-write path — which is unreachable today, as that entry says — is pinned by a test proven to fail with the fix reverted: the MiniStack ETag assertion above, an invocation-level SQS test that a payload without `Records` errors rather than acking the batch, and two `FileConfigSource` tests that pin the mtime with `File::set_modified` so neither the machine's speed nor the filesystem's timestamp granularity decides the result.
+- **Six tests drive the four Lambda binaries with notifications MiniStack actually produced**, rather than payloads the tests hand-wrote: an S3 event notification (`bootstrap-s3`), the same notification delivered through a real SQS queue and through a real SNS topic in `CT_SQS_BODY_FORMAT=sns` (`bootstrap-sqs`), an SNS-published notification (`bootstrap-sns`), and an `Object Created` event routed by a real EventBridge rule (`bootstrap-eventbridge`). Each asserts the filtered object landed in the destination bucket byte-for-byte; the SQS ones additionally assert `{"batchItemFailures": []}`, so a real `s3:TestEvent` is proven to ack rather than poison the queue. Re-applying a notification configuration is what re-emits `s3:TestEvent`, so the TestEvent arrives on every run and not only the first. Proven falsifiable: neutralising the `s3:TestEvent` guard in the S3 decoder fails four of the six, and renaming `detail-type` and the `s3` detail field fails the other two.
+- **Two tests cover the SSM config source against a real parameter store**: a `SecureString` ruleset is decrypted before it is parsed (an undecrypted read returns `ENCRYPTED:<base64>`, which does not parse), and a parameter version bump reloads the ruleset rather than serving the cached one. Proven falsifiable by flipping `with_decryption` to `false` and by forcing `ConfigStore`'s version-equal branch.
+- **MiniStack fidelity gaps that shaped the above, verified on the live container:** it emits S3 notification object keys verbatim where real S3 form-urlencodes them, so keys in these tests stay encoding-neutral and no encoding claim is built on it; it does not apply SSE-KMS bucket default encryption, so such a test would be vacuous; and it can neither subscribe a Lambda to an SNS topic nor invoke a Lambda, so each notification is read off an SQS subscription and re-wrapped in the envelope Lambda would deliver — the `Sns.Message` and SQS `body`, the only parts the decoders read, are what the services actually published. Its SQS receive is destructive, so each test owns its bucket and queue and purges before triggering.
+
 ## [0.6.2] - 2026-09-04
 
 ### Fixed
@@ -217,7 +241,8 @@ A workspace-wide test-coverage audit, prioritising anything that could lose a Cl
 - Release pipeline: multi-arch musl + native darwin builds, `checksums.txt`, cosign keyless signing, build-provenance attestation, multi-arch container images to GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...v0.6.0

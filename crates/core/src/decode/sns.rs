@@ -26,7 +26,9 @@ impl Default for SnsEventDecoder {
 
 #[derive(Debug, Deserialize)]
 struct SnsNotification {
-    #[serde(rename = "Records", default)]
+    /// No `#[serde(default)]`: a payload without `Records` is a failure, not
+    /// zero objects.
+    #[serde(rename = "Records")]
     records: Vec<SnsRecordEnvelope>,
 }
 
@@ -119,6 +121,18 @@ mod tests {
         let decoder = SnsEventDecoder::new();
         let items = decoder.decode(br#"{"Records":[]}"#).unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn valid_json_without_a_records_array_is_a_decode_error_not_zero_objects() {
+        let decoder = SnsEventDecoder::new();
+        let err = decoder
+            .decode(br#"{"Type":"Notification","Message":"something else entirely"}"#)
+            .expect_err("a payload with no Records array must not decode to zero objects");
+        assert!(
+            err.to_string().contains("Records"),
+            "the error must name the missing field, got: {err}"
+        );
     }
 
     #[test]

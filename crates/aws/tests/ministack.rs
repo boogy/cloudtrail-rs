@@ -32,9 +32,11 @@ use cloudtrail_rs_core::config::{
 use cloudtrail_rs_core::decode::s3::S3EventDecoder;
 use cloudtrail_rs_core::error::StoreError;
 use cloudtrail_rs_core::filter::Engine;
+use cloudtrail_rs_core::filter::engine::Decision;
 use cloudtrail_rs_core::metrics::{Metrics, NoopMetricsSink};
 use cloudtrail_rs_core::model::PutMeta;
 use cloudtrail_rs_core::pipeline::Pipeline;
+use cloudtrail_rs_core::ports::ConfigSource;
 use cloudtrail_rs_core::ports::ObjectStore;
 
 const ENDPOINT: &str = "http://localhost:4566";
@@ -244,6 +246,20 @@ async fn dest_bytes(s3: &aws_sdk_s3::Client, key: &str) -> Vec<u8> {
         .expect("reading destination body")
         .into_bytes()
         .to_vec()
+}
+
+/// The destination object's ETag. A multipart-written object's ends in
+/// `-<part count>`; a `PutObject`-written one is a bare MD5.
+async fn dest_etag(s3: &aws_sdk_s3::Client, key: &str) -> String {
+    s3.head_object()
+        .bucket(DEST_BUCKET)
+        .key(key)
+        .send()
+        .await
+        .expect("destination object must exist")
+        .e_tag()
+        .expect("HeadObject response must carry an ETag")
+        .to_string()
 }
 
 fn base_settings(dest_bucket: &str, rules_uri: String) -> Settings {
@@ -729,6 +745,62 @@ async fn a_genuinely_corrupt_object_still_fails_open_through_real_s3() {
     );
 }
 
+/// A 0-byte source object is the one input multipart cannot express: the
+/// fail-open copy must still land it, not fail the invocation.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn an_empty_source_object_fails_open_to_a_zero_byte_destination_object() {
+    use cloudtrail_rs_core::config::ProcessingMode;
+
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let key = "ministack-tests/empty/cloudtrail.json.gz";
+    s3.put_object()
+        .bucket(SRC_BUCKET)
+        .key(key)
+        .body(Vec::new().into())
+        .send()
+        .await
+        .expect("seed empty source object");
+    let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+    for mode in [ProcessingMode::Buffer, ProcessingMode::Stream] {
+        let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+        let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+        settings.processing.mode = mode;
+        settings.behavior.on_parse_error = cloudtrail_rs_core::config::OnParseError::Copy;
+        let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+        let payload = s3_event_payload(SRC_BUCKET, key, 0);
+        let outcome = pipeline
+            .handle(&payload)
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: copy must absorb an empty object: {e:?}"));
+        assert!(outcome.failed_ack_ids.is_empty(), "{mode:?}");
+
+        assert!(
+            dest_bytes(&s3, key).await.is_empty(),
+            "{mode:?}: the copy of an empty source must be an empty destination object"
+        );
+        // Emptiness alone cannot fail: MiniStack, unlike real S3, accepts a
+        // zero-part CompleteMultipartUpload and lands a 0-byte object for it.
+        // Its ETag carries the `-0` part-count suffix, so only the absence of
+        // a suffix proves `PutObject` — the fix — wrote this object.
+        let etag = dest_etag(&s3, key).await;
+        assert!(
+            !etag.trim_matches('"').contains('-'),
+            "{mode:?}: destination ETag {etag} has a multipart suffix, so multipart wrote it"
+        );
+    }
+}
+
 /// Realistic CloudTrail records — the shapes `testing::corpus` keeps verbatim —
 /// through real S3 in both modes, which must agree byte for byte after
 /// decompression.
@@ -789,4 +861,90 @@ async fn the_realistic_corpus_round_trips_identically_in_both_modes() {
     }
 
     assert_eq!(written[0], written[1]);
+}
+
+// ---- SSM ---------------------------------------------------------------
+
+const SECURE_PARAM: &str = "/cloudtrail-rs-tests/secure-rules";
+const RELOAD_PARAM: &str = "/cloudtrail-rs-tests/reload-rules";
+
+const DROP_CONSOLE_LOGIN_RULES: &str = r#"
+version: 1.0.0
+rules:
+  - name: Drop ConsoleLogin
+    matches:
+      - field_name: eventName
+        regex: "^ConsoleLogin$"
+"#;
+
+async fn put_secure(client: &aws_sdk_ssm::Client, name: &str, value: &str) -> i64 {
+    client
+        .put_parameter()
+        .name(name)
+        .value(value)
+        .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+        .overwrite(true)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("put_parameter({name}) failed: {e:?}"))
+        .version()
+}
+
+fn drops(engine: &Engine, event_name: &str) -> bool {
+    let decision = engine
+        .evaluate_raw(&record_json(0, event_name))
+        .expect("the fixture record is valid JSON");
+    !matches!(decision, Decision::Keep)
+}
+
+/// Falsifiable: read without `with_decryption`, a `SecureString` comes back as
+/// its ciphertext blob, which is not a ruleset and does not parse.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn a_secure_string_ruleset_is_decrypted_before_it_is_parsed() {
+    let conf = ministack_sdk_config();
+    let ssm = ssm_client(&conf);
+    put_secure(&ssm, SECURE_PARAM, DROP_DECRYPT_RULES).await;
+
+    let src = SsmConfigSource::from_client(ssm, SECURE_PARAM);
+    let (bytes, _) = src.fetch().await.expect("fetching a SecureString");
+
+    let rules = RuleSet::parse(&bytes).expect("an undecrypted parameter would not parse");
+    let engine = Engine::new(rules).expect("compiling the decrypted ruleset");
+    assert!(drops(&engine, "Decrypt"));
+}
+
+/// Falsifiable: `ConfigStore::refresh` refetches only when the version tag
+/// changes, so a source that reported a constant version would keep serving
+/// the first ruleset for the life of the process.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn a_parameter_version_bump_reloads_the_ruleset() {
+    let conf = ministack_sdk_config();
+    let ssm = ssm_client(&conf);
+    let first_version = put_secure(&ssm, RELOAD_PARAM, DROP_DECRYPT_RULES).await;
+
+    let store = ConfigStore::new(
+        Arc::new(SsmConfigSource::from_client(ssm.clone(), RELOAD_PARAM)),
+        // Zero TTL: every `get` revalidates, so the test observes the version
+        // check rather than the TTL clock.
+        Duration::from_secs(0),
+        compile_engine(),
+        Arc::new(Metrics::default()),
+    );
+    store.prime().await;
+
+    let before = store.get().await.expect("primed store must hold an engine");
+    assert!(drops(&before, "Decrypt"));
+    assert!(!drops(&before, "ConsoleLogin"));
+
+    let second_version = put_secure(&ssm, RELOAD_PARAM, DROP_CONSOLE_LOGIN_RULES).await;
+    assert_ne!(
+        first_version, second_version,
+        "SSM must bump the version on overwrite, or there is nothing to detect"
+    );
+
+    let after = store.get().await.expect("store must still hold an engine");
+    assert!(drops(&after, "ConsoleLogin"));
+    assert!(!drops(&after, "Decrypt"));
 }

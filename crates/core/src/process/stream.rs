@@ -416,6 +416,10 @@ pub async fn stream_run(
     let processing = async move {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::new(cfg.gzip_level));
         if let Err(e) = encoder.write_all(b"{\"Records\":[") {
+            // Dropping `out_tx` alone is a clean EOF, which `put_stream` commits.
+            let _ = out_tx
+                .send(Err(io::Error::other("aborting: gzip write failed")))
+                .await;
             return Err(CoreError::Internal(e.to_string()));
         }
 

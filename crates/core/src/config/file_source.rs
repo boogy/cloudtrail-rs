@@ -25,19 +25,26 @@ impl FileConfigSource {
     /// Stats the file (no read) and returns its mtime as a `VersionTag`, so a
     /// `ConfigStore` past its TTL can skip the read+parse+compile when the
     /// file is untouched.
+    ///
+    /// Nanoseconds, not seconds: `ConfigStore` refetches only when the tag
+    /// changes, so a whole-second tag pins the ruleset a process already
+    /// cached against every later rewrite within that same second.
     fn mtime(&self) -> Result<VersionTag, ConfigError> {
         let meta = std::fs::metadata(&self.path)
             .map_err(|e| ConfigError::Source(format!("failed to stat {:?}: {e}", self.path)))?;
         let modified = meta
             .modified()
             .map_err(|e| ConfigError::Source(format!("no mtime for {:?}: {e}", self.path)))?;
-        let secs = modified
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| {
-                ConfigError::Source(format!("mtime before epoch for {:?}: {e}", self.path))
-            })?
-            .as_secs();
-        Ok(VersionTag::Mtime(secs))
+        let since_epoch = modified.duration_since(UNIX_EPOCH).map_err(|e| {
+            ConfigError::Source(format!("mtime before epoch for {:?}: {e}", self.path))
+        })?;
+        // Saturating: an mtime past year 2554 overflows the tag rather than
+        // panicking a Lambda built with `panic = "abort"`.
+        let nanos = since_epoch
+            .as_secs()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::from(since_epoch.subsec_nanos()));
+        Ok(VersionTag::Mtime(nanos))
     }
 }
 
@@ -48,9 +55,12 @@ impl ConfigSource for FileConfigSource {
     }
 
     async fn fetch(&self) -> Result<(Vec<u8>, VersionTag), ConfigError> {
+        // Stat first: a write racing the read then leaves the bytes tagged
+        // with the older mtime, so the next revalidation refetches instead of
+        // pinning stale content forever.
+        let version = self.mtime()?;
         let bytes = std::fs::read(&self.path)
             .map_err(|e| ConfigError::Source(format!("failed to read {:?}: {e}", self.path)))?;
-        let version = self.mtime()?;
         Ok((bytes, version))
     }
 }
@@ -70,6 +80,17 @@ mod tests {
             "cloudtrail-rs-file-source-test-{}-{label}-{n}",
             std::process::id()
         ))
+    }
+
+    /// Pins the mtime so a precision test does not depend on how fast the
+    /// test machine runs, nor on the filesystem's own timestamp granularity.
+    fn set_mtime(path: &std::path::Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -96,6 +117,60 @@ mod tests {
         let version = src.version().await.expect("version must succeed");
 
         assert_eq!(version, fetch_version);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Falsifiable: with a whole-second tag both writes land on the same
+    /// version, `ConfigStore::refresh` takes its `new_version ==
+    /// cached_version` branch, and the first ruleset stays cached for the life
+    /// of the process.
+    #[tokio::test]
+    async fn two_writes_in_the_same_second_get_different_versions() {
+        let path = temp_path("same-second");
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        std::fs::write(&path, b"a: 1\n").unwrap();
+        set_mtime(&path, base);
+        let src = FileConfigSource::new(&path);
+        let (_, first) = src.fetch().await.expect("fetch must succeed");
+
+        std::fs::write(&path, b"a: 2\n").unwrap();
+        set_mtime(&path, base + std::time::Duration::from_millis(500));
+        let second = src.version().await.expect("version must succeed");
+
+        assert_ne!(
+            first, second,
+            "a rewrite 500ms later must change the version tag"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Falsifiable: read first and the bytes carry the *newer* mtime, so the
+    /// next revalidation matches and the content read before the write is
+    /// pinned. Stat first and they carry the older one, which no longer
+    /// matches.
+    #[tokio::test]
+    async fn fetch_tags_bytes_with_the_mtime_they_were_read_at_or_older() {
+        let path = temp_path("stat-order");
+        let base = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        std::fs::write(&path, b"a: 1\n").unwrap();
+        set_mtime(&path, base);
+        let src = FileConfigSource::new(&path);
+        let (bytes, version) = src.fetch().await.expect("fetch must succeed");
+        assert_eq!(bytes, b"a: 1\n");
+
+        // Stands in for a write that lands between `fetch`'s stat and its read.
+        std::fs::write(&path, b"a: 2\n").unwrap();
+        set_mtime(&path, base + std::time::Duration::from_millis(500));
+
+        assert_ne!(
+            src.version().await.expect("version must succeed"),
+            version,
+            "bytes tagged with the newer mtime would pin the pre-write content"
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
