@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-05
+
 ### Fixed
 
 - **A 0-byte object no longer fails the whole invocation.** `S3ObjectStore::put_stream` errored when the body read EOF on its first read, because a multipart upload cannot express a zero-byte object: `CompleteMultipartUpload` rejects a zero-part upload. Every stream-mode path that copies a source object verbatim reaches it — `behavior.on_config_error: open` and `behavior.on_parse_error: copy` — so an empty `.json.gz` in the source bucket became a poison pill that was re-driven to the DLQ instead of being copied. The upload is now aborted and the object written with a plain `PutObject`, matching what buffer mode and the CLI's local store already did for the same input.
@@ -234,7 +236,8 @@ A workspace-wide test-coverage audit, prioritising anything that could lose a Cl
 - Release pipeline: multi-arch musl + native darwin builds, `checksums.txt`, cosign keyless signing, build-provenance attestation, multi-arch container images to GHCR + Docker Hub, Trivy image scans, and a published Homebrew cask.
 - MiniStack integration tests for the S3/SSM adapters.
 
-[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/boogy/cloudtrail-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/boogy/cloudtrail-rs/compare/v0.5.0...v0.6.0
