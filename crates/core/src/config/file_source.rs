@@ -48,9 +48,12 @@ impl ConfigSource for FileConfigSource {
     }
 
     async fn fetch(&self) -> Result<(Vec<u8>, VersionTag), ConfigError> {
+        // Stat first: a write racing the read then leaves the bytes tagged
+        // with the older mtime, so the next revalidation refetches instead of
+        // pinning stale content forever.
+        let version = self.mtime()?;
         let bytes = std::fs::read(&self.path)
             .map_err(|e| ConfigError::Source(format!("failed to read {:?}: {e}", self.path)))?;
-        let version = self.mtime()?;
         Ok((bytes, version))
     }
 }

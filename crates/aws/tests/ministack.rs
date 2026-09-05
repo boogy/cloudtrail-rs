@@ -729,6 +729,53 @@ async fn a_genuinely_corrupt_object_still_fails_open_through_real_s3() {
     );
 }
 
+/// A 0-byte source object is the one input multipart cannot express: the
+/// fail-open copy must still land it, not fail the invocation.
+#[tokio::test]
+#[ignore = "requires MiniStack up on :4566 (docker-compose.test.yml); run with --ignored"]
+async fn an_empty_source_object_fails_open_to_a_zero_byte_destination_object() {
+    use cloudtrail_rs_core::config::ProcessingMode;
+
+    let conf = ministack_sdk_config();
+    let s3 = s3_client(&conf);
+    let ssm = ssm_client(&conf);
+
+    ensure_bucket(&s3, SRC_BUCKET).await;
+    ensure_bucket(&s3, DEST_BUCKET).await;
+    ensure_rules_param(&ssm, RULES_PARAM, DROP_DECRYPT_RULES).await;
+
+    let key = "ministack-tests/empty/cloudtrail.json.gz";
+    s3.put_object()
+        .bucket(SRC_BUCKET)
+        .key(key)
+        .body(Vec::new().into())
+        .send()
+        .await
+        .expect("seed empty source object");
+    let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+    for mode in [ProcessingMode::Buffer, ProcessingMode::Stream] {
+        let _ = s3.delete_object().bucket(DEST_BUCKET).key(key).send().await;
+
+        let mut settings = base_settings(DEST_BUCKET, format!("ssm://{RULES_PARAM}"));
+        settings.processing.mode = mode;
+        settings.behavior.on_parse_error = cloudtrail_rs_core::config::OnParseError::Copy;
+        let pipeline = ministack_pipeline(&s3, &ssm, settings).await;
+
+        let payload = s3_event_payload(SRC_BUCKET, key, 0);
+        let outcome = pipeline
+            .handle(&payload)
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: copy must absorb an empty object: {e:?}"));
+        assert!(outcome.failed_ack_ids.is_empty(), "{mode:?}");
+
+        assert!(
+            dest_bytes(&s3, key).await.is_empty(),
+            "{mode:?}: the copy of an empty source must be an empty destination object"
+        );
+    }
+}
+
 /// Realistic CloudTrail records — the shapes `testing::corpus` keeps verbatim —
 /// through real S3 in both modes, which must agree byte for byte after
 /// decompression.

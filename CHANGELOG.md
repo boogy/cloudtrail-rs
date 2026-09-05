@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A 0-byte object no longer fails the whole invocation.** `S3ObjectStore::put_stream` errored when the body read EOF on its first read, because a multipart upload cannot express a zero-byte object: `CompleteMultipartUpload` rejects a zero-part upload. Every stream-mode path that copies a source object verbatim reaches it — `behavior.on_config_error: open` and `behavior.on_parse_error: copy` — so an empty `.json.gz` in the source bucket became a poison pill that was re-driven to the DLQ instead of being copied. The upload is now aborted and the object written with a plain `PutObject`, matching what buffer mode and the CLI's local store already did for the same input.
+- **An SQS or SNS payload without a `Records` array is a decode error, not an empty batch.** Both decoders declared `#[serde(default)]` on the field, so any JSON object at all decoded to zero messages: the invocation succeeded, wrote nothing, emitted no error, no log and no metric, and — on SQS — acked the whole batch. The S3 decoder already rejected such a payload for exactly this reason. The invocation now fails and the batch is retried.
+- **`FileConfigSource::fetch` stats before it reads.** Reading first and stamping the mtime afterwards let a write that landed between the two label stale bytes with the new file's version, so every later revalidation matched and the stale ruleset was pinned until the process restarted. The bytes now carry the older mtime, and the next revalidation refetches.
+- **`cli validate` describes a rule narrowed only by a negated `eventSource`/`eventName`.** `index_key_description` skipped negated conditions, so such a rule was reported as having no indexable condition at all — true of the index, false of the rule. It now names the negated condition that could not be reduced to literals, and still prefers the plain condition when a rule has both.
+
+### Testing
+
+- **A real 0-byte object through real S3, in both modes.** `an_empty_source_object_fails_open_to_a_zero_byte_destination_object` drives an empty source object through `Pipeline::handle` against MiniStack under `buffer` and `stream`, so the one input multipart cannot express is covered by the buffer/stream parity claim. Reverting the fix fails it against real S3, not only against mocks.
+- Each of the fixes above is pinned by a test proven to fail with the fix reverted, including an invocation-level SQS test that a payload without `Records` errors rather than acking the batch.
+
 ## [0.6.2] - 2026-09-04
 
 ### Fixed
